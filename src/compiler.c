@@ -22,6 +22,7 @@
  */
 
 // project
+#include "escape.h"
 #include "value.h"
 // depend
 #include "lauxhlib.h"
@@ -68,12 +69,44 @@ static int ntos_lua(lua_State *L)
     return 1;
 }
 
+/* escape_text: OWASP 5 chars. */
+static int esct_lua(lua_State *L)
+{
+    size_t slen    = 0;
+    const char *s  = luaL_checklstring(L, 1, &slen);
+    buf_t out;
+    if (buf_init(&out) != 0) {
+        return luaL_error(L, "out of memory");
+    }
+    escape_text(s, slen, &out);
+    lua_pushlstring(L, out.data, out.len);
+    buf_free(&out);
+    return 1;
+}
+
+/* escape_attr: 4 chars, double-quoted context. */
+static int esca_lua(lua_State *L)
+{
+    size_t slen    = 0;
+    const char *s  = luaL_checklstring(L, 1, &slen);
+    buf_t out;
+    if (buf_init(&out) != 0) {
+        return luaL_error(L, "out of memory");
+    }
+    escape_attr(s, slen, &out);
+    lua_pushlstring(L, out.data, out.len);
+    buf_free(&out);
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
         {"version",   version_lua  },
         {"yyjson_ok", yyjson_ok_lua},
         {"ntos",      ntos_lua     },
+        {"esct",      esct_lua     },
+        {"esca",      esca_lua     },
         {NULL,        NULL         },
     };
 
