@@ -1,0 +1,6 @@
+[submodule "deps/yyjson"]
+	path = deps/yyjson
+	url = https://github.com/mah0x211/yyjson.git
+[submodule "deps/lexbor"]
+	path = deps/lexbor
+	url = https://github.com/mah0x211/lexbor.git
