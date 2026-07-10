@@ -43,6 +43,7 @@ build = {
         ["reflow.compiler"] = {
             sources = {
                 "src/compiler.c",
+                "src/value.c",
                 "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
