@@ -21,6 +21,8 @@
  *
  */
 
+// project
+#include "value.h"
 // depend
 #include "lauxhlib.h"
 #include "lua_errno.h"
@@ -56,11 +58,22 @@ static int yyjson_ok_lua(lua_State *L)
     return 1;
 }
 
+/* number_to_string: JS String(n)-compatible formatting (verified). */
+static int ntos_lua(lua_State *L)
+{
+    double n   = luaL_checknumber(L, 1);
+    char buf[64];
+    size_t len = number_to_string(n, buf);
+    lua_pushlstring(L, buf, len);
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
         {"version",   version_lua  },
         {"yyjson_ok", yyjson_ok_lua},
+        {"ntos",      ntos_lua     },
         {NULL,        NULL         },
     };
 
