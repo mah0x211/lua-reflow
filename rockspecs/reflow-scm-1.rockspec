@@ -45,6 +45,9 @@ build = {
                 "src/compiler.c",
                 "src/value.c",
                 "src/escape.c",
+                "src/snippet.c",
+                "src/error.c",
+                "src/arena.c",
                 "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
