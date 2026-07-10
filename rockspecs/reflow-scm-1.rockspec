@@ -44,6 +44,7 @@ build = {
             sources = {
                 "src/compiler.c",
                 "src/value.c",
+                "src/escape.c",
                 "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
