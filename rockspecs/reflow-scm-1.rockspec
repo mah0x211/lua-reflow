@@ -48,6 +48,7 @@ build = {
                 "src/snippet.c",
                 "src/error.c",
                 "src/arena.c",
+                "src/json5.c",
                 "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
