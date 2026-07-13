@@ -10,7 +10,7 @@
 #include <stddef.h>
 #include "buf.h"
 
-/* escape_text: OWASP 5 chars (& < > " '). Port of js-reflow/src/escape.js. */
+/* escape_text: OWASP 5 chars (& < > " '). */
 int escape_text(const char *src, size_t len, buf_t *out);
 
 /* escape_attr: 4 chars (& < > "), double-quoted attribute context. */
