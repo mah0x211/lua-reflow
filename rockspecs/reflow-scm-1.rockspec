@@ -52,6 +52,7 @@ build = {
                 "src/compile_arena.c",
                 "src/scope.c",
                 "src/ir.c",
+                "src/directives.c",
                 "src/expr/parse.c",
                 "src/expr/eval.c",
                 "deps/yyjson/src/yyjson.c",
