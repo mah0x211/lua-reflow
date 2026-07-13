@@ -30,6 +30,7 @@
 // system
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -89,6 +90,8 @@ reflow_value *directives_parse_data(compile_arena *arena, lua_State *L,
                                     const char *value, size_t len,
                                     reflow_error *err)
 {
+    (void)arena;
+    (void)L;
     reflow_error jerr = {0};
     reflow_value *rv = json5_parse_data(value, len, rarena, &jerr);
     if (!rv) {
@@ -179,10 +182,10 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
             char ch = *p;
             if (ch == '"' || ch == '\'') {
                 char *nm = dup_str(arena, L, name_start, name_len);
-                p = (const char *)skip_string_lit(src, (size_t)(p - src),
-                                                   len, nm, err);
-                p = src + p;  /* convert back to pointer */
+                size_t new_pos = skip_string_lit(src, (size_t)(p - src),
+                                                 len, nm, err);
                 if (err->message) return result;
+                p = src + new_pos;
                 continue;
             }
             if (ch == '{' || ch == '[' || ch == '(') { depth++; p++; continue; }
