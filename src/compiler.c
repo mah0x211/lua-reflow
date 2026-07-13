@@ -24,6 +24,7 @@
 // project
 #include "arena.h"
 #include "compile_arena.h"
+#include "directives.h"
 #include "escape.h"
 #include "expr/eval.h"
 #include "expr/parse.h"
@@ -193,6 +194,181 @@ static int eval_expr_lua(lua_State *L)
     return 1;
 }
 
+/* directives_parse_data: test hook — parse an x-data value.
+ * returns: table of scopes, or nil + error message */
+static int dir_parse_data_lua(lua_State *L)
+{
+    size_t vlen = 0;
+    const char *value = luaL_checklstring(L, 1, &vlen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    char     abuf[65536];
+    arena_t  rarena;
+    arena_init(&rarena, abuf, sizeof(abuf));
+    reflow_error err = {0};
+
+    reflow_value *rv = directives_parse_data(carena, L, &rarena,
+                                             value, vlen, &err);
+    lua_pop(L, 1); /* remove carena */
+    if (!rv) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        return 2;
+    }
+    rv_to_lua(L, rv);
+    return 1;
+}
+
+/* directives_parse_with: test hook.
+ * returns: array of binding-name strings, or nil + error message */
+static int dir_parse_with_lua(lua_State *L)
+{
+    size_t vlen = 0;
+    const char *value = luaL_checklstring(L, 1, &vlen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    reflow_error err = {0};
+    ir_with_result r = directives_parse_with(carena, L, value, vlen, &err);
+    lua_pop(L, 1);
+
+    if (err.message) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message);
+        return 2;
+    }
+    lua_createtable(L, (int)r.n, 0);
+    for (size_t i = 0; i < r.n; i++) {
+        lua_pushstring(L, r.bindings[i].name);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    return 1;
+}
+
+/* directives_parse_for: test hook.
+ * returns: table {var, start, stop, step}, or nil + error message */
+static int dir_parse_for_lua(lua_State *L)
+{
+    size_t vlen = 0;
+    const char *value = luaL_checklstring(L, 1, &vlen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    reflow_error err = {0};
+    ir_for_spec *spec = directives_parse_for(carena, L, value, vlen, &err);
+    lua_pop(L, 1);
+
+    if (!spec) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        return 2;
+    }
+    lua_createtable(L, 0, 4);
+    lua_pushstring(L, spec->var_name);
+    lua_setfield(L, -2, "var");
+    lua_pushnumber(L, spec->start);
+    lua_setfield(L, -2, "start");
+    lua_pushnumber(L, spec->stop);
+    lua_setfield(L, -2, "stop");
+    lua_pushnumber(L, spec->step);
+    lua_setfield(L, -2, "step");
+    return 1;
+}
+
+/* directives_parse_each: test hook.
+ * returns: table {item, index, has_collection}, or nil + error message */
+static int dir_parse_each_lua(lua_State *L)
+{
+    size_t vlen = 0;
+    const char *value = luaL_checklstring(L, 1, &vlen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    reflow_error err = {0};
+    ir_each_spec *spec = directives_parse_each(carena, L, value, vlen, &err);
+    lua_pop(L, 1);
+
+    if (!spec) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        return 2;
+    }
+    lua_createtable(L, 0, 3);
+    lua_pushstring(L, spec->item_name);
+    lua_setfield(L, -2, "item");
+    if (spec->index_name) {
+        lua_pushstring(L, spec->index_name);
+        lua_setfield(L, -2, "index");
+    }
+    lua_pushboolean(L, spec->collection != NULL);
+    lua_setfield(L, -2, "has_collection");
+    return 1;
+}
+
+/* directives_parse_expr: test hook — parse an expression-valued directive.
+ * args: value, directive_name.  returns: "ok" or nil + error. */
+static int dir_parse_expr_lua(lua_State *L)
+{
+    size_t vlen = 0, nlen = 0;
+    const char *value = luaL_checklstring(L, 1, &vlen);
+    const char *name  = luaL_checklstring(L, 2, &nlen);
+    (void)nlen;
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    reflow_error err = {0};
+    expr_node *node = directives_parse_expr(carena, L, value, vlen,
+                                            name, &err);
+    lua_pop(L, 1);
+
+    if (!node) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        return 2;
+    }
+    lua_pushliteral(L, "ok");
+    return 1;
+}
+
+/* directives_assert_empty: test hook.
+ * args: value (nil or string), directive_name.  returns: "ok" or nil + err. */
+static int dir_assert_empty_lua(lua_State *L)
+{
+    const char *value = NULL;
+    size_t vlen = 0;
+    if (!lua_isnoneornil(L, 1)) {
+        value = luaL_checklstring(L, 1, &vlen);
+    }
+    const char *name = luaL_checkstring(L, 2);
+
+    reflow_error err = {0};
+    if (directives_assert_empty(value, vlen, name, &err) != 0) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "value not empty");
+        return 2;
+    }
+    lua_pushliteral(L, "ok");
+    return 1;
+}
+
+/* directives_is_known: test hook. */
+static int dir_is_known_lua(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    lua_pushboolean(L, directives_is_known(name));
+    return 1;
+}
+
+/* directives_group: test hook.  Returns the single-letter group char, or nil. */
+static int dir_group_lua(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    char g = directives_group(name);
+    if (g == 0) {
+        lua_pushnil(L);
+    } else {
+        char buf[2] = { g, '\0' };
+        lua_pushstring(L, buf);
+    }
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
@@ -203,6 +379,14 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"esca",      esca_lua     },
         {"parse_expr", parse_expr_lua },
         {"eval_expr",  eval_expr_lua  },
+        {"dir_parse_data",   dir_parse_data_lua  },
+        {"dir_parse_with",   dir_parse_with_lua  },
+        {"dir_parse_for",    dir_parse_for_lua   },
+        {"dir_parse_each",   dir_parse_each_lua  },
+        {"dir_parse_expr",   dir_parse_expr_lua  },
+        {"dir_assert_empty", dir_assert_empty_lua},
+        {"dir_is_known",     dir_is_known_lua    },
+        {"dir_group",        dir_group_lua       },
         {NULL,         NULL           },
     };
 
