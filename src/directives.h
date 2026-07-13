@@ -26,6 +26,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include "arena.h"
 #include "compile_arena.h"
 #include "error.h"
 #include "ir.h"
