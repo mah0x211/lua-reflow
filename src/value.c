@@ -254,6 +254,18 @@ int rv_is_array(const reflow_value *v)
     return v->tag == RV_ARRAY;
 }
 
+reflow_value *rv_object_get(reflow_value *obj, const char *key, size_t key_len)
+{
+    if (obj->tag != RV_OBJECT) return NULL;
+    for (size_t i = 0; i < obj->object.len; i++) {
+        rv_prop *p = &obj->object.props[i];
+        if (p->key_len == key_len &&
+            memcmp(p->key, key, key_len) == 0)
+            return &p->value;
+    }
+    return NULL;
+}
+
 /* --- scalar constructors --- */
 
 reflow_value rv_number(double n)

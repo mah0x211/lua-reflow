@@ -22,9 +22,13 @@
  */
 
 // project
+#include "arena.h"
 #include "compile_arena.h"
 #include "escape.h"
+#include "expr/eval.h"
 #include "expr/parse.h"
+#include "json5.h"
+#include "scope.h"
 #include "value.h"
 // depend
 #include "lauxhlib.h"
@@ -127,6 +131,68 @@ static int parse_expr_lua(lua_State *L)
     return 1;
 }
 
+/* eval_expr: test hook — parse + evaluate an expression against JSON data.
+ * args: expr_str, data_json, helpers_tbl?
+ * returns: result value, or nil + error message */
+static int eval_expr_lua(lua_State *L)
+{
+    size_t expr_len = 0, data_len = 0;
+    const char *expr_str = luaL_checklstring(L, 1, &expr_len);
+    const char *data_str = luaL_checklstring(L, 2, &data_len);
+
+    /* 1. Parse expression (compile_arena; may throw OOM) */
+    compile_arena *carena = compile_arena_new(L, 4096);
+    reflow_error  err = {0};
+    expr_node    *node = expr_parse(carena, L, expr_str, expr_len, &err);
+    lua_pop(L, 1);  /* remove carena */
+
+    if (!node) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        return 2;
+    }
+
+    /* 2. Parse JSON data (render-scope arena) */
+    char     arena_buf[65536];
+    arena_t  rarena;
+    arena_init(&rarena, arena_buf, sizeof(arena_buf));
+
+    reflow_value *globals = json5_parse(data_str, data_len, &rarena, &err);
+    if (!globals) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "json error");
+        return 2;
+    }
+
+    /* 3. Set up helpers (after OOM-prone code) */
+    int helpers_ref = LUA_NOREF;
+    if (lua_istable(L, 3)) {
+        lua_pushvalue(L, 3);
+        helpers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    }
+
+    /* 4. Evaluate */
+    scope_env env;
+    scope_env_init(&env, globals);
+    scope_push_frame(&env, SCOPE_FRAME_DATA, globals);
+    reflow_value result = expr_eval(node, &env, L, helpers_ref,
+                                    &rarena, &err);
+
+    /* 5. Clean up helpers ref */
+    if (helpers_ref != LUA_NOREF)
+        luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+
+    if (err.message) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message);
+        return 2;
+    }
+
+    /* 6. Return result as Lua value */
+    rv_to_lua(L, &result);
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
@@ -136,7 +202,8 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"esct",      esct_lua     },
         {"esca",      esca_lua     },
         {"parse_expr", parse_expr_lua },
-        {NULL,        NULL         },
+        {"eval_expr",  eval_expr_lua  },
+        {NULL,         NULL           },
     };
 
     lua_errno_loadlib(L);

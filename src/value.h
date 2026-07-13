@@ -84,6 +84,12 @@ int rv_compare(const reflow_value *a, const reflow_value *b);
 int rv_is_array(const reflow_value *v);
 
 /*
+ * Look up a property by key on an RV_OBJECT.
+ * Returns pointer to the value, or NULL if not found / not an object.
+ */
+reflow_value *rv_object_get(reflow_value *obj, const char *key, size_t key_len);
+
+/*
  * String(v)-compatible serialization into `out` (caller ensures >= 32 bytes).
  * Returns the length written. null/undefined/array/object write nothing and
  * return 0 (caller decides omit/empty per x-text/x-bind).
