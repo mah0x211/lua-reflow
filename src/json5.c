@@ -77,21 +77,12 @@ static reflow_value *convert_val(yyjson_val *v, arena_t *arena)
         rv->object.cap = max;
         rv->object.len = 0;
 
-        const char *key;
-        size_t klen;
         yyjson_obj_iter iter;
-        yyjson_obj_iter_init(v, &iter);
-        while ((key = yyjson_obj_iter_get_val(
-                    (yyjson_val *)yyjson_obj_iter_next(&iter)))) {
-            /* This is wrong — need to iterate key/value pairs properly */
-            break;
-        }
-        /* Proper iteration */
         yyjson_obj_iter_init(v, &iter);
         yyjson_val *key_val;
         while ((key_val = yyjson_obj_iter_next(&iter))) {
-            klen = yyjson_get_len(key_val);
-            key  = yyjson_get_str(key_val);
+            size_t klen     = yyjson_get_len(key_val);
+            const char *key = yyjson_get_str(key_val);
             yyjson_val *val = yyjson_obj_iter_get_val(key_val);
 
             char *kdst = (char *)arena_alloc(arena, klen + 1);
@@ -118,15 +109,22 @@ static reflow_value *convert_val(yyjson_val *v, arena_t *arena)
 
 /* --- public API --- */
 
+/* Static buffer for yyjson error messages (single-threaded Lua, no leak). */
+static char g_json5_err[256];
+
 reflow_value *json5_parse(const char *src, size_t len,
                           arena_t *arena, reflow_error *err)
 {
-    yyjson_read_err rerr;
-    yyjson_doc *doc = yyjson_read(src, len, YYJSON_READ_JSON5);
+    yyjson_read_err rerr = {0};
+    yyjson_doc *doc = yyjson_read_opts((char *)src, len, YYJSON_READ_JSON5,
+                                       NULL, &rerr);
     if (doc == NULL) {
         if (err) {
-            err->type    = "ReflowRuntimeError";
-            err->message = "failed to parse JSON5";
+            err->type = "ReflowRuntimeError";
+            snprintf(g_json5_err, sizeof(g_json5_err),
+                     "failed to parse JSON5: %s (at position %zu)",
+                     rerr.msg ? rerr.msg : "unknown error", rerr.pos);
+            err->message = g_json5_err;
         }
         return NULL;
     }
