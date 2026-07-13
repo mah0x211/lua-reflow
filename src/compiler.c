@@ -22,7 +22,9 @@
  */
 
 // project
+#include "compile_arena.h"
 #include "escape.h"
+#include "expr/parse.h"
 #include "value.h"
 // depend
 #include "lauxhlib.h"
@@ -99,6 +101,32 @@ static int esca_lua(lua_State *L)
     return 1;
 }
 
+/* parse_expr: test hook — parse an expression string.
+ * Returns "ok" on success, or nil + error message on failure. */
+static int parse_expr_lua(lua_State *L)
+{
+    size_t slen    = 0;
+    const char *src = luaL_checklstring(L, 1, &slen);
+
+    /* Create arena (userdata pushed onto stack) */
+    compile_arena *arena = compile_arena_new(L, 4096);
+
+    reflow_error err;
+    memset(&err, 0, sizeof(err));
+
+    expr_node *node = expr_parse(arena, L, src, slen, &err);
+    /* Pop arena regardless (AST lives in arena; test hook discards it) */
+    lua_pop(L, 1);
+
+    if (!node) {
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        return 2;
+    }
+    lua_pushliteral(L, "ok");
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
@@ -107,6 +135,7 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"ntos",      ntos_lua     },
         {"esct",      esct_lua     },
         {"esca",      esca_lua     },
+        {"parse_expr", parse_expr_lua },
         {NULL,        NULL         },
     };
 
