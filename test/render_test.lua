@@ -10,8 +10,11 @@ end
 
 -- ===== plain HTML round-trip =====
 
-function testcase.plain_text()
-    assert.equal(R('hello'), 'hello')
+function testcase.plain_text_at_root_dropped()
+    -- Text and comments that sit at the top level (outside any element)
+    -- do not reach the output — matches html-rewriter-wasm behaviour.
+    assert.equal(R('hello'), '')
+    assert.equal(R('a\n<b>x</b>\nc'), '<b>x</b>')
 end
 
 function testcase.plain_element()

@@ -204,7 +204,12 @@ for _, name in ipairs(list_dir(FIXTURE_ROOT .. '/valid')) do
             if not r.ok then
                 error(('render failed: %s'):format(r.err))
             end
-            assert.equal(r.output, r.expected,
+            -- js-reflow's own fixture runner trims trailing whitespace on
+            -- both sides before comparing, because the expected.html files
+            -- carry a POSIX trailing newline while the renderer's output
+            -- does not. Do the same.
+            local function trim(s) return (s:gsub('^%s+', ''):gsub('%s+$', '')) end
+            assert.equal(trim(r.output), trim(r.expected),
                 ('%s output diverged'):format(name))
         end
     end
