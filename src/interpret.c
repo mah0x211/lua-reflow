@@ -694,8 +694,23 @@ static render_result render_node(render_ctx *rc, const ir_node *node)
 {
     switch (node->type) {
     case IR_ROOT:
-        return render_children(rc, node->root.children,
-                               node->root.n_children);
+        /*
+         * html-rewriter-wasm — the JS reference — only fires text and
+         * comment events for content inside a user-encountered element.
+         * Text and comments that sit at the top level of the document
+         * (before, between, or after root elements) never reach the
+         * output. Mirror that by rendering only element / chain children
+         * of IR_ROOT.
+         */
+        for (size_t i = 0; i < node->root.n_children; i++) {
+            const ir_node *child = node->root.children[i];
+            if (child->type != IR_ELEMENT && child->type != IR_CHAIN) {
+                continue;
+            }
+            render_result rr = render_node(rc, child);
+            if (rr != RR_OK) return rr;
+        }
+        return RR_OK;
     case IR_ELEMENT:
         return render_element(rc, node);
     case IR_CHAIN:
