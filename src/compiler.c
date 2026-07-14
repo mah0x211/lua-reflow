@@ -34,7 +34,11 @@
 #include "parser.h"
 #include "renderer.h"
 #include "scope.h"
+#include "selector/cache.h"
+#include "selector/index.h"
+#include "selector/match.h"
 #include "selector/parse.h"
+#include "selector/resolve.h"
 #include "value.h"
 // depend
 #include "lauxhlib.h"
@@ -869,6 +873,337 @@ static void ir_to_lua(lua_State *L, const ir_node *node)
  *   prefix defaults to "x-"
  *   helpers may be an array of names or a set (t[name] = true)
  * Returns nil + error message on failure. */
+/* build_selector_index: test hook — compile HTML, build the selector
+ * index, and return { root, index } where index describes the buckets
+ * and the element annotations. Uses element `order` (1-based) as a
+ * stable identifier the test can cross-reference against the walked
+ * IR. */
+static int build_selector_index_lua(lua_State *L)
+{
+    size_t      hlen = 0;
+    const char *html = luaL_checklstring(L, 1, &hlen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    int            carena_stack_pos = lua_gettop(L);
+
+    reflow_error err = {0};
+    ir_node *root = compile_template(carena, L, NULL, html, hlen,
+                                     "x-", 2, NULL, 0, &err);
+    if (root == NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "compile error");
+        return 2;
+    }
+    sel_index *idx = sel_build_index(carena, L, root);
+    if (idx == NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushliteral(L, "index build failed");
+        return 2;
+    }
+
+    /* {
+     *   annotations = { [order] = { tag, depth, parent, chainBranch,
+     *                               matchBranch, id, class, attrs } },
+     *   byId, byClass, byTag, byAttrName = { key = { order, ... }, ... },
+     *   includes = { order, ... },
+     *   all = { order, ... },
+     * } */
+    lua_newtable(L);
+
+    lua_newtable(L);
+    for (size_t i = 0; i < idx->n_all; i++) {
+        const ir_node *el = idx->all[i];
+        lua_newtable(L);
+        lua_pushinteger(L, (lua_Integer)el->element.order);
+        lua_setfield(L, -2, "order");
+        lua_pushstring(L, el->element.tag_name ? el->element.tag_name : "");
+        lua_setfield(L, -2, "tag");
+        lua_pushinteger(L, (lua_Integer)el->element.depth);
+        lua_setfield(L, -2, "depth");
+        if (el->element.parent != NULL) {
+            lua_pushinteger(L,
+                (lua_Integer)el->element.parent->element.order);
+            lua_setfield(L, -2, "parent");
+        }
+        if (el->element.is_chain_branch) {
+            lua_pushinteger(L,
+                (lua_Integer)el->element.chain_branch);
+            lua_setfield(L, -2, "chainBranch");
+        }
+        if (el->element.is_match_branch) {
+            lua_pushinteger(L,
+                (lua_Integer)el->element.match_branch);
+            lua_setfield(L, -2, "matchBranch");
+        }
+        lua_rawseti(L, -2, (int)el->element.order);
+    }
+    lua_setfield(L, -2, "annotations");
+
+    struct {
+        const char       *field;
+        const sel_bucket *bucket;
+    } bs[] = {
+        {"byId",       &idx->by_id},
+        {"byClass",    &idx->by_class},
+        {"byTag",      &idx->by_tag},
+        {"byAttrName", &idx->by_attr_name},
+    };
+    for (size_t bi = 0; bi < sizeof(bs) / sizeof(bs[0]); bi++) {
+        lua_newtable(L);
+        const sel_bucket *b = bs[bi].bucket;
+        for (size_t i = 0; i < b->n_keys; i++) {
+            lua_createtable(L, (int)b->keys[i].count, 0);
+            for (size_t j = 0; j < b->keys[i].count; j++) {
+                const ir_node *el = b->entries[b->keys[i].offset + j];
+                lua_pushinteger(L, (lua_Integer)el->element.order);
+                lua_rawseti(L, -2, (int)(j + 1));
+            }
+            lua_pushlstring(L, b->keys[i].key, b->keys[i].key_len);
+            lua_insert(L, -2);
+            lua_settable(L, -3);
+        }
+        lua_setfield(L, -2, bs[bi].field);
+    }
+
+    lua_createtable(L, (int)idx->n_includes, 0);
+    for (size_t i = 0; i < idx->n_includes; i++) {
+        lua_pushinteger(L,
+            (lua_Integer)idx->includes[i]->element.order);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "includes");
+
+    lua_createtable(L, (int)idx->n_all, 0);
+    for (size_t i = 0; i < idx->n_all; i++) {
+        lua_pushinteger(L, (lua_Integer)idx->all[i]->element.order);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "all");
+
+    /* Drop arena — the table is now self-contained in Lua state. */
+    lua_remove(L, carena_stack_pos);
+    return 1;
+}
+
+/* resolve_selector: test hook — compile HTML, build index, parse the
+ * selector, and return the ordered candidate list as { order, positional }
+ * entries. On selector parse or resolve failure, returns nil + an error
+ * table with type/reason/feature/message/position.
+ */
+static int resolve_selector_lua(lua_State *L)
+{
+    size_t      hlen = 0;
+    const char *html = luaL_checklstring(L, 1, &hlen);
+    size_t      slen = 0;
+    const char *src  = luaL_checklstring(L, 2, &slen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    int            carena_stack_pos = lua_gettop(L);
+
+    reflow_error err = {0};
+    ir_node *root = compile_template(carena, L, NULL, html, hlen,
+                                     "x-", 2, NULL, 0, &err);
+    if (root == NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "compile error");
+        return 2;
+    }
+    sel_index *idx = sel_build_index(carena, L, root);
+    if (idx == NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushliteral(L, "index build failed");
+        return 2;
+    }
+    sel_compiled *sel = selector_parse(carena, L, src, slen, &err);
+    if (sel == NULL) {
+        goto push_err_table;
+    }
+    memset(&err, 0, sizeof(err));
+    sel_candidates *cands = sel_resolve(carena, L, idx, sel, &err);
+    if (cands == NULL) {
+push_err_table:
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_newtable(L);
+        lua_pushstring(L, err.type ? err.type : "ReflowSelectorError");
+        lua_setfield(L, -2, "type");
+        lua_pushstring(L, err.message ? err.message : "resolve error");
+        lua_setfield(L, -2, "message");
+        if (err.reason) {
+            lua_pushstring(L, err.reason);
+            lua_setfield(L, -2, "reason");
+        }
+        if (err.feature) {
+            lua_pushstring(L, err.feature);
+            lua_setfield(L, -2, "feature");
+        }
+        if (err.position > 0) {
+            lua_pushinteger(L, (lua_Integer)err.position);
+            lua_setfield(L, -2, "position");
+        }
+        return 2;
+    }
+
+    lua_createtable(L, (int)cands->count, 0);
+    for (size_t i = 0; i < cands->count; i++) {
+        const sel_candidate *c = &cands->items[i];
+        lua_newtable(L);
+        lua_pushinteger(L, (lua_Integer)c->element->element.order);
+        lua_setfield(L, -2, "order");
+        lua_pushstring(L, c->element->element.tag_name
+                       ? c->element->element.tag_name : "");
+        lua_setfield(L, -2, "tag");
+        if (c->n_positional > 0) {
+            static const char *NAMES[] = {
+                "first-child", "last-child", "only-child",
+                "first-of-type", "last-of-type", "only-of-type",
+                "nth-child", "nth-last-child",
+                "nth-of-type", "nth-last-of-type",
+            };
+            lua_createtable(L, (int)c->n_positional, 0);
+            for (size_t j = 0; j < c->n_positional; j++) {
+                lua_newtable(L);
+                lua_pushstring(L, NAMES[c->positional[j].name]);
+                lua_setfield(L, -2, "name");
+                if (c->positional[j].name >= SEL_PSEUDO_NTH_CHILD) {
+                    lua_pushinteger(L, (lua_Integer)c->positional[j].n);
+                    lua_setfield(L, -2, "n");
+                }
+                lua_rawseti(L, -2, (int)(j + 1));
+            }
+            lua_setfield(L, -2, "positional");
+        }
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_remove(L, carena_stack_pos);
+    return 1;
+}
+
+/* selector_cache_new: test hook — create a bounded LRU cache and expose
+ * it via a small closure API.  The closure is a table of methods that
+ * captures the cache userdata in an upvalue so tests can drive the LRU
+ * behaviour without exposing the raw C struct. */
+static int sel_cache_resolve_lua(lua_State *L)
+{
+    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
+    size_t     slen = 0;
+    const char *src = luaL_checklstring(L, 1, &slen);
+    reflow_error err = {0};
+    const sel_compiled *sel = sel_cache_resolve(c, L, src, slen, &err);
+    if (sel == NULL) {
+        lua_pushnil(L);
+        lua_newtable(L);
+        lua_pushstring(L, err.type ? err.type : "ReflowSelectorError");
+        lua_setfield(L, -2, "type");
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        lua_setfield(L, -2, "message");
+        if (err.reason) {
+            lua_pushstring(L, err.reason);
+            lua_setfield(L, -2, "reason");
+        }
+        return 2;
+    }
+    /* Return the source string as an identity token; tests compare
+     * identity by peek-ing before / after promotion.  We do not expose
+     * the C pointer directly. */
+    lua_pushlstring(L, sel->source, sel->source_len);
+    return 1;
+}
+
+static int sel_cache_peek_lua(lua_State *L)
+{
+    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
+    size_t      slen = 0;
+    const char *src  = luaL_checklstring(L, 1, &slen);
+    const sel_compiled *sel = sel_cache_peek(c, src, slen);
+    if (sel == NULL) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_pushlstring(L, sel->source, sel->source_len);
+    return 1;
+}
+
+static int sel_cache_size_lua(lua_State *L)
+{
+    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
+    lua_pushinteger(L, (lua_Integer)sel_cache_size(c));
+    return 1;
+}
+
+static int sel_cache_max_size_lua(lua_State *L)
+{
+    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
+    lua_pushinteger(L, (lua_Integer)sel_cache_max_size(c));
+    return 1;
+}
+
+static int sel_cache_clear_lua(lua_State *L)
+{
+    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
+    sel_cache_clear(c);
+    return 0;
+}
+
+static int selector_cache_new_lua(lua_State *L)
+{
+    lua_Integer max_size = luaL_optinteger(L, 1, 128);
+    if (max_size < 0) {
+        return luaL_error(L,
+                          "selectorCacheSize must be a non-negative integer");
+    }
+    sel_cache *c = sel_cache_new(L, (size_t)max_size);
+    /* Wrap the raw cache userdata in a boxed pointer so the closure
+     * upvalue holds a stable reference while the wrapping userdata (on
+     * the stack) is kept alive via an uservalue link. */
+    sel_cache **box = (sel_cache **)lua_newuserdata(L, sizeof(*box));
+    *box = c;
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 502
+    lua_pushvalue(L, -2);          /* the sel_cache userdata */
+    lua_setuservalue(L, -2);       /* box.uservalue = cache */
+#else
+    /* Lua 5.1: keep the anchor via an environment table. */
+    lua_newtable(L);
+    lua_pushvalue(L, -3);
+    lua_rawseti(L, -2, 1);
+    lua_setfenv(L, -2);
+#endif
+    lua_remove(L, -2);             /* drop the raw cache userdata */
+
+    /* Build the method table with box as an upvalue for each function. */
+    lua_newtable(L);
+    struct {
+        const char   *name;
+        lua_CFunction fn;
+    } methods[] = {
+        {"resolve",   sel_cache_resolve_lua},
+        {"peek",      sel_cache_peek_lua},
+        {"size",      sel_cache_size_lua},
+        {"max_size",  sel_cache_max_size_lua},
+        {"clear",     sel_cache_clear_lua},
+        {NULL, NULL},
+    };
+    for (int i = 0; methods[i].name != NULL; i++) {
+        lua_pushvalue(L, -2);       /* box */
+        lua_pushcclosure(L, methods[i].fn, 1);
+        lua_setfield(L, -2, methods[i].name);
+    }
+    /* Anchor the box on the returned table so the table's lifetime
+     * keeps the cache alive. */
+    lua_pushvalue(L, -2);
+    lua_setfield(L, -2, "_box");
+    lua_remove(L, -2);              /* drop the box off the stack */
+    return 1;
+}
+
+/* ============================================================ */
+/* compile_template test hook — dumps the IR tree as a table    */
+/* ============================================================ */
+
 static int compile_template_lua(lua_State *L)
 {
     size_t hlen = 0;
@@ -1116,6 +1451,9 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"dir_group",        dir_group_lua       },
         {"parse_html",       parse_html_lua      },
         {"parse_selector",   parse_selector_lua  },
+        {"build_selector_index", build_selector_index_lua},
+        {"resolve_selector",     resolve_selector_lua},
+        {"selector_cache_new",   selector_cache_new_lua},
         {"compile_template", compile_template_lua},
         {"render",           render_lua          },
         /* State-based public API (used by lua/reflow.lua). */

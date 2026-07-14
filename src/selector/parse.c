@@ -260,7 +260,8 @@ static const char *arena_strdup(compile_arena *a, lua_State *L,
     return dst;
 }
 
-/* Read an identifier; returns 0 and fills *start/*len. Errors otherwise. */
+/* Read an identifier; returns 0 and fills out_start / out_len.
+ * Errors otherwise. */
 static int read_ident(parser_t *p, const char **out_start, size_t *out_len)
 {
     if (!is_ident_start(p_peek(p))) {
