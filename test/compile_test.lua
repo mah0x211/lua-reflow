@@ -68,15 +68,16 @@ function testcase.regular_attrs()
     assert.equal(div.attrs[2][2], 'b')
 end
 
-function testcase.x_attrs_stored_raw()
-    -- SAX-to-tree pass does NOT split directives yet; every attr is on element.attrs.
+function testcase.x_attrs_moved_to_directives()
+    -- Directive integration splits x-* out of attrs; only regular attrs remain
+    -- on element.attrs; x-* attributes reach element.directives.
     local ir = assert(compiler.compile_template(
         '<div x-if="$.ok" class="a">x</div>'))
     local div = ir.children[1]
-    assert.equal(#div.attrs, 2)
-    assert.equal(div.attrs[1][1], 'x-if')
-    assert.equal(div.attrs[1][2], '$.ok')
-    assert.equal(div.attrs[2][1], 'class')
+    assert.equal(#div.attrs, 1)
+    assert.equal(div.attrs[1][1], 'class')
+    assert.equal(div.attrs[1][2], 'a')
+    assert.is_true(div.directives.if_expr)
 end
 
 function testcase.attr_without_value()

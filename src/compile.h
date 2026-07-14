@@ -33,8 +33,12 @@
  * Compile an HTML template into an IR tree.
  *
  * Runs the SAX parser (parser.c) over `html` and builds an IR forest whose
- * root is IR_ROOT. Every attribute — including x-* directives — is stored
- * verbatim on the produced element nodes for later processing.
+ * root is IR_ROOT. Attributes are split by `prefix` (typically "x-"):
+ * regular attributes stay on element.attrs verbatim, while known x-*
+ * directives are parsed by the directives module and stored on
+ * element.directives. Helper references are validated against the
+ * `helper_names` set (array of C strings) and unknown x-* directives are
+ * rejected.
  *
  * All IR memory is allocated from `arena`; the caller keeps the arena alive
  * for as long as the returned tree must be usable.
@@ -43,6 +47,8 @@
  */
 ir_node *compile_template(compile_arena *arena, lua_State *L,
                           const char *html, size_t html_len,
+                          const char *prefix, size_t prefix_len,
+                          const char **helper_names, size_t n_helpers,
                           reflow_error *err);
 
 #endif /* REFLOW_COMPILE_H */

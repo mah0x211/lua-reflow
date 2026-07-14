@@ -544,7 +544,7 @@ static void ir_to_lua(lua_State *L, const ir_node *node)
         return;
 
     case IR_ELEMENT:
-        lua_createtable(L, 0, 6);
+        lua_createtable(L, 0, 7);
         lua_pushliteral(L, "element");
         lua_setfield(L, -2, "type");
         lua_pushstring(L, node->element.tag_name);
@@ -563,6 +563,102 @@ static void ir_to_lua(lua_State *L, const ir_node *node)
             lua_rawseti(L, -2, (int)(i + 1));
         }
         lua_setfield(L, -2, "attrs");
+        /* directives — summary form for testing */
+        {
+            const ir_directives *d = &node->element.directives;
+            lua_createtable(L, 0, 16);
+            if (d->data_raw) {
+                lua_pushlstring(L, d->data_raw, d->data_raw_len);
+                lua_setfield(L, -2, "data_raw");
+            }
+            if (d->with_bindings) {
+                lua_createtable(L, (int)d->n_with, 0);
+                for (size_t i = 0; i < d->n_with; i++) {
+                    lua_pushstring(L, d->with_bindings[i].name);
+                    lua_rawseti(L, -2, (int)(i + 1));
+                }
+                lua_setfield(L, -2, "with");
+            }
+            if (d->text_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "text");
+            }
+            if (d->html_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "html");
+            }
+            if (d->include_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "include");
+            }
+            if (d->for_spec) {
+                lua_createtable(L, 0, 4);
+                lua_pushstring(L, d->for_spec->var_name);
+                lua_setfield(L, -2, "var");
+                lua_pushnumber(L, d->for_spec->start);
+                lua_setfield(L, -2, "start");
+                lua_pushnumber(L, d->for_spec->stop);
+                lua_setfield(L, -2, "stop");
+                lua_pushnumber(L, d->for_spec->step);
+                lua_setfield(L, -2, "step");
+                lua_setfield(L, -2, "for_spec");
+            }
+            if (d->each_spec) {
+                lua_createtable(L, 0, 2);
+                lua_pushstring(L, d->each_spec->item_name);
+                lua_setfield(L, -2, "item");
+                if (d->each_spec->index_name) {
+                    lua_pushstring(L, d->each_spec->index_name);
+                    lua_setfield(L, -2, "index");
+                }
+                lua_setfield(L, -2, "each_spec");
+            }
+            if (d->if_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "if_expr");
+            }
+            if (d->elseif_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "elseif_expr");
+            }
+            if (d->else_mark) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "else_mark");
+            }
+            if (d->match_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "match_expr");
+            }
+            if (d->case_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "case_expr");
+            }
+            if (d->nocase_mark) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "nocase_mark");
+            }
+            if (d->break_mark) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "break_mark");
+            }
+            if (d->break_if_expr) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "break_if_expr");
+            }
+            if (d->n_binds > 0) {
+                lua_createtable(L, (int)d->n_binds, 0);
+                for (size_t i = 0; i < d->n_binds; i++) {
+                    lua_pushstring(L, d->binds[i].attr_name);
+                    lua_rawseti(L, -2, (int)(i + 1));
+                }
+                lua_setfield(L, -2, "binds");
+            }
+            lua_setfield(L, -2, "directives");
+        }
+        if (node->element.invisible_marker) {
+            lua_pushboolean(L, 1);
+            lua_setfield(L, -2, "invisible_marker");
+        }
         ir_children_to_lua(L, node->element.children,
                            node->element.n_children);
         lua_setfield(L, -2, "children");
@@ -600,25 +696,100 @@ static void ir_to_lua(lua_State *L, const ir_node *node)
 }
 
 /* compile_template: test hook — compile HTML and return the IR tree
- * as nested Lua tables.  Returns nil + error message on failure. */
+ * as nested Lua tables.
+ * args: html [, opts]  where opts = { prefix?, helpers? }
+ *   prefix defaults to "x-"
+ *   helpers may be an array of names or a set (t[name] = true)
+ * Returns nil + error message on failure. */
 static int compile_template_lua(lua_State *L)
 {
     size_t hlen = 0;
     const char *html = luaL_checklstring(L, 1, &hlen);
 
+    const char *prefix = "x-";
+    size_t prefix_len = 2;
+    const char **helpers = NULL;
+    size_t n_helpers = 0;
+
     compile_arena *carena = compile_arena_new(L, 4096);
-    reflow_error err = {0};
-    ir_node *root = compile_template(carena, L, html, hlen, &err);
-    if (root == NULL) {
+    int carena_stack_pos = lua_gettop(L);
+
+    if (lua_istable(L, 2)) {
+        /* prefix */
+        lua_getfield(L, 2, "prefix");
+        if (lua_isstring(L, -1)) {
+            prefix = lua_tolstring(L, -1, &prefix_len);
+        }
         lua_pop(L, 1);
+        /* helpers: array or set */
+        lua_getfield(L, 2, "helpers");
+        if (lua_istable(L, -1)) {
+            /* Count entries: first try as array (ipairs), else pairs. */
+            size_t alen = 0;
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 502
+            alen = (size_t)lua_rawlen(L, -1);
+#else
+            alen = (size_t)lua_objlen(L, -1);
+#endif
+            if (alen > 0) {
+                helpers = (const char **)compile_arena_alloc(
+                    carena, L, alen * sizeof(const char *));
+                for (size_t i = 0; i < alen; i++) {
+                    lua_rawgeti(L, -1, (int)(i + 1));
+                    size_t nl = 0;
+                    const char *nm = luaL_checklstring(L, -1, &nl);
+                    char *dup = (char *)compile_arena_alloc(
+                        carena, L, nl + 1);
+                    memcpy(dup, nm, nl);
+                    dup[nl] = '\0';
+                    helpers[i] = dup;
+                    lua_pop(L, 1);
+                }
+                n_helpers = alen;
+            } else {
+                /* set form: t[name] = true */
+                lua_pushnil(L);
+                size_t cnt = 0;
+                while (lua_next(L, -2)) {
+                    cnt++;
+                    lua_pop(L, 1);
+                }
+                helpers = (const char **)compile_arena_alloc(
+                    carena, L, cnt * sizeof(const char *));
+                lua_pushnil(L);
+                size_t idx = 0;
+                while (lua_next(L, -2)) {
+                    size_t nl = 0;
+                    const char *nm = lua_tolstring(L, -2, &nl);
+                    char *dup = (char *)compile_arena_alloc(
+                        carena, L, nl + 1);
+                    memcpy(dup, nm, nl);
+                    dup[nl] = '\0';
+                    helpers[idx++] = dup;
+                    lua_pop(L, 1);
+                }
+                n_helpers = idx;
+            }
+        }
+        lua_pop(L, 1);
+    }
+
+    reflow_error err = {0};
+    ir_node *root = compile_template(carena, L,
+                                     html, hlen,
+                                     prefix, prefix_len,
+                                     helpers, n_helpers,
+                                     &err);
+    if (root == NULL) {
+        lua_settop(L, carena_stack_pos);
+        lua_pop(L, 1); /* remove carena */
         lua_pushnil(L);
         lua_pushstring(L, err.message ? err.message : "compile error");
         return 2;
     }
     ir_to_lua(L, root);
-    /* keep compile_arena alive as tree lives in it; we're returning
-     * a plain Lua table so the arena can be dropped after ir_to_lua. */
-    lua_remove(L, -2); /* remove carena userdata (now under result table) */
+    /* Result table now on top; drop the carena userdata beneath it. */
+    lua_remove(L, carena_stack_pos);
     return 1;
 }
 
