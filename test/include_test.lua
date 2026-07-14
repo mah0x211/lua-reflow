@@ -53,7 +53,7 @@ function testcase.include_not_found()
     r:compile('page', [[<div x-include="'missing'"></div>]])
     local ok, err = pcall(function() r:render('page') end)
     assert.is_false(ok)
-    assert.match(err, 'template "missing" not registered')
+    assert.match(err, 'template not found')
 end
 
 function testcase.include_cycle_direct()
@@ -61,7 +61,7 @@ function testcase.include_cycle_direct()
     r:compile('a', [[<div x-include="'a'"></div>]])
     local ok, err = pcall(function() r:render('a') end)
     assert.is_false(ok)
-    assert.match(err, 'cyclic include of "a"')
+    assert.match(err, 'include cycle detected')
 end
 
 function testcase.include_cycle_indirect()
@@ -70,7 +70,7 @@ function testcase.include_cycle_indirect()
     r:compile('b', [[<div x-include="'a'"></div>]])
     local ok, err = pcall(function() r:render('a') end)
     assert.is_false(ok)
-    assert.match(err, 'cyclic include')
+    assert.match(err, 'include cycle')
 end
 
 function testcase.include_depth_exceeded()
