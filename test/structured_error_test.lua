@@ -54,9 +54,12 @@ function testcase.render_include_not_found_reason()
     r:compile('t', '<div><span x-include="\'missing\'"></span></div>')
     local ok, err = pcall(function() r:render('t') end)
     assert.is_false(ok)
-    assert.equal(err.type, 'ReflowRuntimeError')
+    assert.equal(err.type, 'ReflowIncludeError')
+    assert.equal(err.reason, 'not_found')
+    assert.equal(err.requested, 'missing')
     assert.equal(err.templateName, 't')
     assert.equal(err.element, '<span>')
+    assert.equal(err.directive, 'x-include')
     assert.match(err.message, 'template not found')
 end
 
