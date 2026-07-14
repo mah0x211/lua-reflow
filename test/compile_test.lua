@@ -69,15 +69,16 @@ function testcase.regular_attrs()
 end
 
 function testcase.x_attrs_moved_to_directives()
-    -- Stage 2 splits directives out of attrs: only regular attrs remain
-    -- on element.attrs; x-* attributes reach element.directives.
+    -- Stage 2 splits directives out of attrs; stage 3 wraps x-if in a chain.
+    -- Use x-text instead of x-if to avoid the chain wrapping so we can
+    -- assert directly against the element.
     local ir = assert(compiler.compile_template(
-        '<div x-if="$.ok" class="a">x</div>'))
+        '<div x-text="$.name" class="a"></div>'))
     local div = ir.children[1]
     assert.equal(#div.attrs, 1)
     assert.equal(div.attrs[1][1], 'class')
     assert.equal(div.attrs[1][2], 'a')
-    assert.is_true(div.directives.if_expr)
+    assert.is_true(div.directives.text)
 end
 
 function testcase.attr_without_value()
