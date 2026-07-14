@@ -50,21 +50,26 @@ end
 
 function testcase.if_recorded()
     local ir = assert(C('<div x-if="$.ok">x</div>'))
-    assert.is_true(ir.children[1].directives.if_expr)
+    -- x-if triggers chain wrapping around the element
+    assert.equal(ir.children[1].type, 'chain')
 end
 
-function testcase.elseif_recorded()
-    local ir = assert(C('<div x-elseif="$.ok">x</div>'))
-    assert.is_true(ir.children[1].directives.elseif_expr)
+function testcase.elseif_recorded_in_chain()
+    local ir = assert(C(
+        '<div x-if="$.a">a</div><div x-elseif="$.b">b</div>'))
+    assert.equal(ir.children[1].type, 'chain')
+    assert.equal(ir.children[1].n_branches, 2)
 end
 
-function testcase.else_marker()
-    local ir = assert(C('<div x-else>x</div>'))
-    assert.is_true(ir.children[1].directives.else_mark)
+function testcase.else_marker_in_chain()
+    local ir = assert(C(
+        '<div x-if="$.a">a</div><div x-else>b</div>'))
+    assert.equal(ir.children[1].type, 'chain')
+    assert.equal(ir.children[1].n_branches, 2)
 end
 
 function testcase.else_with_value_rejected()
-    local r, err = C('<div x-else="x">y</div>')
+    local r, err = C('<div x-if="$.a">y</div><div x-else="x">z</div>')
     assert.is_nil(r)
     assert.match(err, 'must not have a value')
 end
@@ -72,18 +77,27 @@ end
 -- ===== x-match / case / nocase =====
 
 function testcase.match_recorded()
-    local ir = assert(C('<div x-match="$.x">c</div>'))
-    assert.is_true(ir.children[1].directives.match_expr)
+    local ir = assert(C(
+        '<div x-match="$.x"><span x-case="1">a</span></div>'))
+    -- x-match consumes its case children into directives.match; the
+    -- element itself remains at the top with cleared children.
+    local m = ir.children[1]
+    assert.equal(m.type, 'element')
+    assert.is_true(m.directives.match_expr)
 end
 
-function testcase.case_recorded()
-    local ir = assert(C('<div x-case="1">c</div>'))
-    assert.is_true(ir.children[1].directives.case_expr)
+function testcase.case_recorded_in_match()
+    local ir = assert(C(
+        '<div x-match="$.x"><span x-case="1">a</span></div>'))
+    -- inner case is not orphan (parent has x-match)
+    assert.equal(ir.children[1].type, 'element')
 end
 
-function testcase.nocase_marker()
-    local ir = assert(C('<div x-nocase>c</div>'))
-    assert.is_true(ir.children[1].directives.nocase_mark)
+function testcase.nocase_marker_in_match()
+    local ir = assert(C(
+        '<div x-match="$.x">' ..
+        '<span x-case="1">a</span><span x-nocase>fb</span></div>'))
+    assert.equal(ir.children[1].type, 'element')
 end
 
 -- ===== x-for =====
@@ -132,14 +146,18 @@ end
 
 -- ===== x-break / break-if =====
 
-function testcase.break_marker()
-    local ir = assert(C('<li x-break></li>'))
-    assert.is_true(ir.children[1].directives.break_mark)
+function testcase.break_marker_inside_loop()
+    local ir = assert(C(
+        '<ul x-each="v in $.a"><li x-break></li></ul>'))
+    local ul = ir.children[1]
+    assert.is_true(ul.children[1].directives.break_mark)
 end
 
-function testcase.break_if_recorded()
-    local ir = assert(C('<li x-break-if="$.done"></li>'))
-    assert.is_true(ir.children[1].directives.break_if_expr)
+function testcase.break_if_recorded_inside_loop()
+    local ir = assert(C(
+        '<ul x-each="v in $.a"><li x-break-if="$.done"></li></ul>'))
+    local ul = ir.children[1]
+    assert.is_true(ul.children[1].directives.break_if_expr)
 end
 
 -- ===== x-bind:<attr> =====
@@ -246,22 +264,27 @@ end
 
 -- ===== K-only invisible marker =====
 
-function testcase.k_only_marks_invisible()
-    local ir = assert(C('<li x-break></li>'))
-    assert.is_true(ir.children[1].invisible_marker)
+function testcase.k_only_marks_invisible_inside_loop()
+    local ir = assert(C(
+        '<ul x-each="v in $.a"><li x-break></li></ul>'))
+    local li = ir.children[1].children[1]
+    assert.is_true(li.invisible_marker)
 end
 
 function testcase.k_with_regular_attr_not_invisible()
-    local ir = assert(C('<li x-break class="a"></li>'))
+    local ir = assert(C(
+        '<ul x-each="v in $.a"><li x-break class="a"></li></ul>'))
     -- class="a" is a regular attr; invisibility requires zero regular attrs
-    assert.is_nil(ir.children[1].invisible_marker or nil)
+    local li = ir.children[1].children[1]
+    assert.is_nil(li.invisible_marker or nil)
 end
 
 -- ===== custom prefix =====
 
 function testcase.custom_prefix_data()
     local ir = assert(C('<div data-if="$.x">y</div>', { prefix = 'data-' }))
-    assert.is_true(ir.children[1].directives.if_expr)
+    -- data-if becomes a chain the same way x-if does
+    assert.equal(ir.children[1].type, 'chain')
 end
 
 -- ===== integration with SAX-to-tree output =====
