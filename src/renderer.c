@@ -98,6 +98,18 @@ static void push_reflow_error(lua_State *L, const reflow_error *err,
         lua_pushstring(L, err->requested);
         lua_setfield(L, -2, "requested");
     }
+    if (err->source != NULL) {
+        lua_pushstring(L, err->source);
+        lua_setfield(L, -2, "source");
+    }
+    if (err->position > 0) {
+        lua_pushinteger(L, (lua_Integer)err->position);
+        lua_setfield(L, -2, "position");
+    }
+    if (err->feature != NULL) {
+        lua_pushstring(L, err->feature);
+        lua_setfield(L, -2, "feature");
+    }
     luaL_getmetatable(L, REFLOW_ERROR_MT);
     lua_setmetatable(L, -2);
 }
