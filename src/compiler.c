@@ -23,6 +23,7 @@
 
 // project
 #include "arena.h"
+#include "compile.h"
 #include "compile_arena.h"
 #include "directives.h"
 #include "escape.h"
@@ -514,6 +515,113 @@ static int parse_html_lua(lua_State *L)
     return 1;
 }
 
+/* ============================================================ */
+/* compile_template test hook — dumps the IR tree as a table    */
+/* ============================================================ */
+
+static void ir_to_lua(lua_State *L, const ir_node *node);
+
+static void ir_children_to_lua(lua_State *L,
+                               struct ir_node * const *children,
+                               size_t n_children)
+{
+    lua_createtable(L, (int)n_children, 0);
+    for (size_t i = 0; i < n_children; i++) {
+        ir_to_lua(L, children[i]);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+}
+
+static void ir_to_lua(lua_State *L, const ir_node *node)
+{
+    switch (node->type) {
+    case IR_ROOT:
+        lua_createtable(L, 0, 2);
+        lua_pushliteral(L, "root");
+        lua_setfield(L, -2, "type");
+        ir_children_to_lua(L, node->root.children, node->root.n_children);
+        lua_setfield(L, -2, "children");
+        return;
+
+    case IR_ELEMENT:
+        lua_createtable(L, 0, 6);
+        lua_pushliteral(L, "element");
+        lua_setfield(L, -2, "type");
+        lua_pushstring(L, node->element.tag_name);
+        lua_setfield(L, -2, "tag");
+        lua_createtable(L, (int)node->element.n_attrs, 0);
+        for (size_t i = 0; i < node->element.n_attrs; i++) {
+            lua_createtable(L, 2, 0);
+            lua_pushstring(L, node->element.attrs[i].name);
+            lua_rawseti(L, -2, 1);
+            if (node->element.attrs[i].value != NULL) {
+                lua_pushstring(L, node->element.attrs[i].value);
+            } else {
+                lua_pushnil(L);
+            }
+            lua_rawseti(L, -2, 2);
+            lua_rawseti(L, -2, (int)(i + 1));
+        }
+        lua_setfield(L, -2, "attrs");
+        ir_children_to_lua(L, node->element.children,
+                           node->element.n_children);
+        lua_setfield(L, -2, "children");
+        lua_pushinteger(L, (lua_Integer)node->element.source_start);
+        lua_setfield(L, -2, "source_start");
+        lua_pushinteger(L, (lua_Integer)node->element.source_end);
+        lua_setfield(L, -2, "source_end");
+        return;
+
+    case IR_TEXT:
+        lua_createtable(L, 0, 2);
+        lua_pushliteral(L, "text");
+        lua_setfield(L, -2, "type");
+        lua_pushlstring(L, node->text.text, node->text.text_len);
+        lua_setfield(L, -2, "text");
+        return;
+
+    case IR_COMMENT:
+        lua_createtable(L, 0, 2);
+        lua_pushliteral(L, "comment");
+        lua_setfield(L, -2, "type");
+        lua_pushlstring(L, node->comment.text, node->comment.text_len);
+        lua_setfield(L, -2, "text");
+        return;
+
+    case IR_CHAIN:
+        /* Chains are produced by a later stage; represent minimally. */
+        lua_createtable(L, 0, 2);
+        lua_pushliteral(L, "chain");
+        lua_setfield(L, -2, "type");
+        lua_pushinteger(L, (lua_Integer)node->chain.n_branches);
+        lua_setfield(L, -2, "n_branches");
+        return;
+    }
+}
+
+/* compile_template: test hook — compile HTML and return the IR tree
+ * as nested Lua tables.  Returns nil + error message on failure. */
+static int compile_template_lua(lua_State *L)
+{
+    size_t hlen = 0;
+    const char *html = luaL_checklstring(L, 1, &hlen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    reflow_error err = {0};
+    ir_node *root = compile_template(carena, L, html, hlen, &err);
+    if (root == NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "compile error");
+        return 2;
+    }
+    ir_to_lua(L, root);
+    /* keep compile_arena alive as tree lives in it; we're returning
+     * a plain Lua table so the arena can be dropped after ir_to_lua. */
+    lua_remove(L, -2); /* remove carena userdata (now under result table) */
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
@@ -533,6 +641,7 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"dir_is_known",     dir_is_known_lua    },
         {"dir_group",        dir_group_lua       },
         {"parse_html",       parse_html_lua      },
+        {"compile_template", compile_template_lua},
         {NULL,         NULL           },
     };
 
