@@ -905,7 +905,7 @@ static int render_lua(lua_State *L)
     }
     reflow_error rerr = {0};
     int rc = interpret_render(&rarena, root, globals, L, helpers_ref,
-                              &out, &rerr);
+                              NULL, &out, &rerr);
     if (rc != 0) {
         buf_free(&out);
         arena_destroy(&rarena);

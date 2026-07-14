@@ -62,6 +62,11 @@ typedef struct {
     lua_State    *L;
     int           helpers_ref;
     reflow_error *err;
+    /* x-include state. */
+    const interpret_include_hooks *hooks;
+    const char *include_stack[64];
+    size_t      include_stack_len[64];
+    int         include_depth;
 } render_ctx;
 
 /* HTML5 void elements — never emit an end tag. */
@@ -352,11 +357,78 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
     } else if (d->html_expr != NULL) {
         rr = emit_html_content(rc, d->html_expr);
     } else if (d->include_expr != NULL) {
-        /* x-include is deferred to renderer.c which owns the template
-         * registry; stage 1-3 signal 'not supported here' explicitly. */
-        render_errorf(rc,
-            "x-include requires a template registry; use Reflow:render");
-        rr = RR_ERROR;
+        if (rc->hooks == NULL || rc->hooks->get_template == NULL) {
+            render_errorf(rc,
+                "x-include requires a template registry; use Reflow:render");
+            rr = RR_ERROR;
+        } else {
+            reflow_value nv;
+            rr = eval_expr(rc, d->include_expr, &nv);
+            if (rr == RR_OK) {
+                if (nv.tag != RV_STRING) {
+                    render_errorf(rc,
+                        "x-include: value must be a string, got %s",
+                        nv.tag == RV_NULL ? "null" :
+                        nv.tag == RV_UNDEFINED ? "undefined" :
+                        nv.tag == RV_NUMBER ? "number" :
+                        nv.tag == RV_BOOL ? "boolean" :
+                        nv.tag == RV_ARRAY ? "array" :
+                        nv.tag == RV_OBJECT ? "object" : "value");
+                    rr = RR_ERROR;
+                } else if (rc->include_depth >= rc->hooks->max_depth) {
+                    render_errorf(rc,
+                        "x-include: max include depth (%d) exceeded",
+                        rc->hooks->max_depth);
+                    rr = RR_ERROR;
+                } else {
+                    /* Cycle detection. */
+                    for (int i = 0; i < rc->include_depth; i++) {
+                        if (rc->include_stack_len[i] == nv.string.len &&
+                            memcmp(rc->include_stack[i], nv.string.data,
+                                   nv.string.len) == 0) {
+                            render_errorf(rc,
+                                "x-include: cyclic include of \"%.*s\"",
+                                (int)nv.string.len, nv.string.data);
+                            rr = RR_ERROR;
+                            break;
+                        }
+                    }
+                    if (rr == RR_OK) {
+                        reflow_error lerr = {0};
+                        const ir_node *inc_root =
+                            rc->hooks->get_template(rc->hooks->ud,
+                                                    nv.string.data,
+                                                    nv.string.len,
+                                                    &lerr);
+                        if (inc_root == NULL) {
+                            if (lerr.message != NULL) {
+                                render_errorf(rc, "%s", lerr.message);
+                            } else {
+                                render_errorf(rc,
+                                    "x-include: template \"%.*s\" not "
+                                    "registered",
+                                    (int)nv.string.len, nv.string.data);
+                            }
+                            rr = RR_ERROR;
+                        } else {
+                            /* Recurse with fresh scope: globals carry
+                             * through, all data / loop frames from the
+                             * outer template are hidden. */
+                            size_t saved_n = rc->env.n_frames;
+                            rc->env.n_frames = 0;
+                            rc->include_stack[rc->include_depth] =
+                                nv.string.data;
+                            rc->include_stack_len[rc->include_depth] =
+                                nv.string.len;
+                            rc->include_depth++;
+                            rr = render_node(rc, inc_root);
+                            rc->include_depth--;
+                            rc->env.n_frames = saved_n;
+                        }
+                    }
+                }
+            }
+        }
     } else if (d->match != NULL) {
         /* x-match: pick the first matching branch. */
         reflow_value mv;
@@ -594,15 +666,18 @@ int interpret_render(arena_t *arena,
                      reflow_value  *globals,
                      lua_State     *L,
                      int            helpers_ref,
+                     const interpret_include_hooks *hooks,
                      buf_t         *out,
                      reflow_error  *err)
 {
     render_ctx rc = {
-        .arena       = arena,
-        .out         = out,
-        .L           = L,
-        .helpers_ref = helpers_ref,
-        .err         = err,
+        .arena         = arena,
+        .out           = out,
+        .L             = L,
+        .helpers_ref   = helpers_ref,
+        .err           = err,
+        .hooks         = hooks,
+        .include_depth = 0,
     };
     scope_env_init(&rc.env, globals);
 
