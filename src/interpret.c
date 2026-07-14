@@ -153,6 +153,22 @@ static void render_error_populate(render_ctx *rc)
 
 static char g_render_err[512];
 
+/* Format an error with a specific type and populate location. */
+static void render_error_typed(render_ctx *rc, const char *type,
+                               const char *fmt, ...)
+{
+    if (rc->err == NULL || rc->err->message != NULL) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_render_err, sizeof(g_render_err), fmt, ap);
+    va_end(ap);
+    rc->err->type    = type;
+    rc->err->message = g_render_err;
+    render_error_populate(rc);
+}
+
 static void render_errorf(render_ctx *rc, const char *fmt, ...)
 {
     if (rc->err == NULL || rc->err->message != NULL) {
@@ -310,6 +326,7 @@ static render_result emit_text_content(render_ctx *rc, const expr_node *e)
     if (v.tag == RV_ARRAY || v.tag == RV_OBJECT) {
         render_errorf(rc, "x-text: value must be primitive, got %s",
                       v.tag == RV_ARRAY ? "array" : "object");
+        if (rc->err) rc->err->directive = "x-text";
         return RR_ERROR;
     }
     char scratch[64];
@@ -333,6 +350,7 @@ static render_result emit_html_content(render_ctx *rc, const expr_node *e)
                       v.tag == RV_OBJECT ? "object" :
                       v.tag == RV_NUMBER ? "number" :
                       v.tag == RV_BOOL ? "boolean" : "value");
+        if (rc->err) rc->err->directive = "x-html";
         return RR_ERROR;
     }
     return buf_put(rc->out, v.string.data, v.string.len) == 0
@@ -466,19 +484,24 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
             rr = eval_expr(rc, d->include_expr, &nv);
             if (rr == RR_OK) {
                 if (nv.tag != RV_STRING) {
-                    render_errorf(rc,
-                        "x-include: value must be a string, got %s",
+                    render_error_typed(rc, "ReflowIncludeError",
+                        "value must be a string, got %s",
                         nv.tag == RV_NULL ? "null" :
                         nv.tag == RV_UNDEFINED ? "undefined" :
                         nv.tag == RV_NUMBER ? "number" :
                         nv.tag == RV_BOOL ? "boolean" :
                         nv.tag == RV_ARRAY ? "array" :
                         nv.tag == RV_OBJECT ? "object" : "value");
+                    if (rc->err) rc->err->directive = "x-include";
                     rr = RR_ERROR;
                 } else if (rc->include_depth >= rc->hooks->max_depth) {
-                    render_errorf(rc,
-                        "x-include: max include depth (%d) exceeded",
+                    render_error_typed(rc, "ReflowIncludeError",
+                        "max include depth (%d) exceeded",
                         rc->hooks->max_depth);
+                    if (rc->err) {
+                        rc->err->directive = "x-include";
+                        rc->err->reason    = "depth_exceeded";
+                    }
                     rr = RR_ERROR;
                 } else {
                     /* Cycle detection. */
@@ -486,10 +509,13 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                         if (rc->include_stack_len[i] == nv.string.len &&
                             memcmp(rc->include_stack[i], nv.string.data,
                                    nv.string.len) == 0) {
-                            render_errorf(rc,
-                                "x-include: include cycle detected on "
-                                "\"%.*s\"",
+                            render_error_typed(rc, "ReflowIncludeError",
+                                "include cycle detected on \"%.*s\"",
                                 (int)nv.string.len, nv.string.data);
+                            if (rc->err) {
+                                rc->err->directive = "x-include";
+                                rc->err->reason    = "cycle";
+                            }
                             rr = RR_ERROR;
                             break;
                         }
@@ -509,10 +535,23 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                             if (lerr.message != NULL) {
                                 render_errorf(rc, "%s", lerr.message);
                             } else {
-                                render_errorf(rc,
-                                    "x-include: template not found: "
-                                    "\"%.*s\"",
+                                render_error_typed(rc, "ReflowIncludeError",
+                                    "template not found: \"%.*s\"",
                                     (int)nv.string.len, nv.string.data);
+                                if (rc->err) {
+                                    rc->err->directive = "x-include";
+                                    rc->err->reason    = "not_found";
+                                    /* Copy name into arena so caller
+                                     * lifetime is safe when raising. */
+                                    char *req = (char *)arena_alloc(
+                                        rc->arena, nv.string.len + 1);
+                                    if (req != NULL) {
+                                        memcpy(req, nv.string.data,
+                                               nv.string.len);
+                                        req[nv.string.len] = '\0';
+                                        rc->err->requested = req;
+                                    }
+                                }
                             }
                             rr = RR_ERROR;
                         } else {

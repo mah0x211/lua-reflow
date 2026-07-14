@@ -194,8 +194,11 @@ static lxb_html_token_t *on_token_cb(lxb_html_tokenizer_t *tkz,
 
     /* Compute source offsets: expose the outer `<...>` span rather than
      * lexbor's tag-name-only slice, so upstream snippet renderers see the
-     * exact HTML the user wrote. Close tags start 2 bytes earlier (`</`)
-     * and every tag ends one byte after `>`. */
+     * exact HTML the user wrote. lexbor's token->begin points just past
+     * the leading `<` (or `</`), so shift left by 1 or 2 depending on
+     * open/close. lexbor's token->end sits at the end of the tag NAME
+     * (before any attribute space or `>`), so scan forward to find the
+     * closing `>` and take one past it. */
     bool is_close = (token->type & LXB_HTML_TOKEN_TYPE_CLOSE) != 0;
     size_t bracket_prefix = is_close ? 2 : 1;
     size_t start_off = offset_of(ps, token->begin);
@@ -205,8 +208,11 @@ static lxb_html_token_t *on_token_cb(lxb_html_tokenizer_t *tkz,
         start_off = 0;
     }
     size_t end_off = offset_of(ps, token->end);
+    while (end_off < ps->src_len && ps->src_base[end_off] != '>') {
+        end_off++;
+    }
     if (end_off < ps->src_len) {
-        end_off += 1;
+        end_off += 1; /* one past `>` */
     }
 
     /* Explicit close tag. */
