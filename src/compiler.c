@@ -32,6 +32,7 @@
 #include "interpret.h"
 #include "json5.h"
 #include "parser.h"
+#include "renderer.h"
 #include "scope.h"
 #include "value.h"
 // depend
@@ -946,6 +947,13 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"parse_html",       parse_html_lua      },
         {"compile_template", compile_template_lua},
         {"render",           render_lua          },
+        /* State-based public API (used by lua/reflow.lua). */
+        {"state_new",        rf_state_new        },
+        {"state_add_helper", rf_state_add_helper },
+        {"state_compile",    rf_state_compile    },
+        {"state_render",     rf_state_render     },
+        {"state_clear",      rf_state_clear      },
+        {"state_templates",  rf_state_templates  },
         {NULL,         NULL           },
     };
 
