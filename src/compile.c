@@ -493,6 +493,277 @@ static bool is_k_only(ir_directives *d, size_t n_regular_attrs)
     return !has_other && n_regular_attrs == 0;
 }
 
+/* --- post-processing: chain consolidation, match branches, orphans --- */
+
+static bool node_is_ignorable(const ir_node *n)
+{
+    return ir_is_ignorable(n);
+}
+
+/* Replace `<if>` `[elseif]* [else]?` sibling sequences with IR_CHAIN nodes. */
+static int consolidate_chains(compile_ctx *cc, ir_node *parent)
+{
+    ir_node **children;
+    size_t   *n_children_p;
+    if (parent->type == IR_ROOT) {
+        children     = parent->root.children;
+        n_children_p = &parent->root.n_children;
+    } else if (parent->type == IR_ELEMENT) {
+        children     = parent->element.children;
+        n_children_p = &parent->element.n_children;
+    } else {
+        return 0;
+    }
+
+    size_t old_n = *n_children_p;
+    if (old_n == 0) return 0;
+
+    ir_node **out = (ir_node **)compile_arena_alloc(
+        cc->arena, cc->L, old_n * sizeof(ir_node *));
+    size_t out_n = 0;
+    size_t i = 0;
+    while (i < old_n) {
+        ir_node *child = children[i];
+        if (child->type != IR_ELEMENT ||
+            child->element.directives.if_expr == NULL) {
+            out[out_n++] = child;
+            i++;
+            continue;
+        }
+
+        /* Start of a chain. */
+        ir_branch *branches = (ir_branch *)compile_arena_alloc(
+            cc->arena, cc->L, sizeof(ir_branch) * (old_n - i));
+        size_t nb = 0;
+        branches[nb].cond = child->element.directives.if_expr;
+        branches[nb].node = child;
+        nb++;
+        size_t chain_end = child->element.source_end;
+
+        size_t j = i + 1;
+        size_t chain_consumed_up_to = j;
+        bool saw_else = false;
+
+        while (j < old_n) {
+            ir_node *sib = children[j];
+            if (node_is_ignorable(sib)) { j++; continue; }
+            if (sib->type != IR_ELEMENT) break;
+
+            const ir_directives *sd = &sib->element.directives;
+            if (sd->elseif_expr != NULL) {
+                if (saw_else) {
+                    compile_errorf(cc,
+                        "x-elseif after x-else is not allowed");
+                    return -1;
+                }
+                branches[nb].cond = sd->elseif_expr;
+                branches[nb].node = sib;
+                nb++;
+                chain_end = sib->element.source_end;
+                j++;
+                chain_consumed_up_to = j;
+                continue;
+            }
+            if (sd->else_mark) {
+                if (saw_else) {
+                    compile_errorf(cc,
+                        "multiple x-else in the same chain");
+                    return -1;
+                }
+                branches[nb].cond = NULL;
+                branches[nb].node = sib;
+                nb++;
+                chain_end = sib->element.source_end;
+                saw_else = true;
+                j++;
+                chain_consumed_up_to = j;
+                continue;
+            }
+            break;
+        }
+
+        out[out_n++] = ir_make_chain(cc->arena, cc->L,
+                                     branches, nb,
+                                     child->element.source_start,
+                                     chain_end);
+        i = chain_consumed_up_to;
+    }
+
+    if (parent->type == IR_ROOT) {
+        parent->root.children = out;
+        parent->root.n_children = out_n;
+    } else {
+        parent->element.children = out;
+        parent->element.n_children = out_n;
+    }
+    return 0;
+}
+
+/* When parent has x-match, gather its direct x-case / x-nocase children
+ * into directives.match and clear the child list. */
+static int collect_match_branches(compile_ctx *cc, ir_node *parent)
+{
+    if (parent->type != IR_ELEMENT ||
+        parent->element.directives.match_expr == NULL) {
+        return 0;
+    }
+
+    size_t old_n = parent->element.n_children;
+    ir_branch *branches = (ir_branch *)compile_arena_alloc(
+        cc->arena, cc->L, sizeof(ir_branch) * (old_n + 1));
+    size_t nb = 0;
+    bool saw_nocase = false;
+
+    for (size_t i = 0; i < old_n; i++) {
+        ir_node *child = parent->element.children[i];
+        if (node_is_ignorable(child)) continue;
+        if (child->type != IR_ELEMENT) {
+            compile_errorf(cc,
+                "x-match: direct children must be x-case or x-nocase "
+                "elements");
+            return -1;
+        }
+        const ir_directives *d = &child->element.directives;
+        if (d->case_expr) {
+            if (saw_nocase) {
+                compile_errorf(cc,
+                    "x-case must not appear after x-nocase in the same "
+                    "x-match");
+                return -1;
+            }
+            branches[nb].cond = d->case_expr;
+            branches[nb].node = child;
+            nb++;
+            continue;
+        }
+        if (d->nocase_mark) {
+            if (saw_nocase) {
+                compile_errorf(cc,
+                    "multiple x-nocase in the same x-match");
+                return -1;
+            }
+            branches[nb].cond = NULL;
+            branches[nb].node = child;
+            nb++;
+            saw_nocase = true;
+            continue;
+        }
+        compile_errorf(cc,
+            "x-match: direct children must be x-case or x-nocase elements");
+        return -1;
+    }
+
+    if (nb == 0 || (nb == 1 && branches[0].cond == NULL)) {
+        compile_errorf(cc, "x-match requires at least one x-case");
+        return -1;
+    }
+
+    ir_match *m = (ir_match *)compile_arena_alloc(
+        cc->arena, cc->L, sizeof(ir_match));
+    m->expr       = parent->element.directives.match_expr;
+    m->branches   = branches;
+    m->n_branches = nb;
+    parent->element.directives.match = m;
+    parent->element.children   = NULL;
+    parent->element.n_children = 0;
+    return 0;
+}
+
+/* After chain/match consolidation, any surviving x-elseif / x-else /
+ * x-case / x-nocase in the child list is orphan. */
+static int detect_orphans(compile_ctx *cc, ir_node *parent)
+{
+    ir_node **children = NULL;
+    size_t n_children = 0;
+    if (parent->type == IR_ROOT) {
+        children   = parent->root.children;
+        n_children = parent->root.n_children;
+    } else if (parent->type == IR_ELEMENT) {
+        children   = parent->element.children;
+        n_children = parent->element.n_children;
+    }
+    for (size_t i = 0; i < n_children; i++) {
+        ir_node *child = children[i];
+        if (child->type != IR_ELEMENT) continue;
+        const ir_directives *d = &child->element.directives;
+        if (d->elseif_expr) {
+            compile_errorf(cc, "x-elseif has no preceding x-if");
+            return -1;
+        }
+        if (d->else_mark) {
+            compile_errorf(cc, "x-else has no preceding x-if / x-elseif");
+            return -1;
+        }
+        if (d->case_expr) {
+            compile_errorf(cc, "x-case must be a direct child of x-match");
+            return -1;
+        }
+        if (d->nocase_mark) {
+            compile_errorf(cc,
+                "x-nocase must be a direct child of x-match");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int post_process(compile_ctx *cc, ir_node *parent)
+{
+    if (consolidate_chains(cc, parent) != 0) return -1;
+    if (collect_match_branches(cc, parent) != 0) return -1;
+    if (detect_orphans(cc, parent) != 0) return -1;
+    return 0;
+}
+
+/* Recursively verify x-break / x-break-if only appear within a loop body. */
+static int validate_break_context(compile_ctx *cc, ir_node *node,
+                                  bool in_loop)
+{
+    if (node == NULL) return 0;
+    switch (node->type) {
+    case IR_ROOT:
+        for (size_t i = 0; i < node->root.n_children; i++) {
+            if (validate_break_context(cc, node->root.children[i],
+                                       in_loop) != 0)
+                return -1;
+        }
+        return 0;
+    case IR_CHAIN:
+        for (size_t i = 0; i < node->chain.n_branches; i++) {
+            if (validate_break_context(cc,
+                    node->chain.branches[i].node, in_loop) != 0)
+                return -1;
+        }
+        return 0;
+    case IR_ELEMENT: {
+        const ir_directives *d = &node->element.directives;
+        if ((d->break_mark || d->break_if_expr) && !in_loop) {
+            compile_errorf(cc,
+                "x-break / x-break-if outside of x-for or x-each");
+            return -1;
+        }
+        bool introduces_loop = (d->for_spec != NULL || d->each_spec != NULL);
+        bool child_in_loop = in_loop || introduces_loop;
+        if (d->match) {
+            for (size_t i = 0; i < d->match->n_branches; i++) {
+                if (validate_break_context(cc,
+                        d->match->branches[i].node, child_in_loop) != 0)
+                    return -1;
+            }
+        }
+        for (size_t i = 0; i < node->element.n_children; i++) {
+            if (validate_break_context(cc,
+                    node->element.children[i], child_in_loop) != 0)
+                return -1;
+        }
+        return 0;
+    }
+    default:
+        return 0;
+    }
+}
+
+
 static void cb_element(void *ud,
                        const char *tag_name, size_t tag_len,
                        const sax_attr *attrs, size_t n_attrs,
@@ -570,6 +841,9 @@ static void cb_endtag(void *ud,
 
     flush_text(cc);
     ir_node *finished = cc->stack[--cc->depth];
+    if (post_process(cc, finished) != 0) {
+        return;
+    }
     ir_add_child(cc->arena, cc->L, current_parent(cc), finished);
 }
 
@@ -639,6 +913,14 @@ ir_node *compile_template(compile_arena *arena, lua_State *L,
     flush_text(&cc);
     if (cc.depth != 1) {
         compile_errorf(&cc, "internal: element stack not balanced");
+        return NULL;
+    }
+    /* Root-level post-processing (chains + orphan detection). */
+    if (post_process(&cc, root) != 0) {
+        return NULL;
+    }
+    /* Global break-context validation traverses the finished tree. */
+    if (validate_break_context(&cc, root, false) != 0) {
         return NULL;
     }
     return root;
