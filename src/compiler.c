@@ -34,6 +34,7 @@
 #include "parser.h"
 #include "renderer.h"
 #include "scope.h"
+#include "selector/index.h"
 #include "selector/parse.h"
 #include "value.h"
 // depend
@@ -869,6 +870,124 @@ static void ir_to_lua(lua_State *L, const ir_node *node)
  *   prefix defaults to "x-"
  *   helpers may be an array of names or a set (t[name] = true)
  * Returns nil + error message on failure. */
+/* build_selector_index: test hook — compile HTML, build the selector
+ * index, and return { root, index } where index describes the buckets
+ * and the element annotations. Uses element `order` (1-based) as a
+ * stable identifier the test can cross-reference against the walked
+ * IR. */
+static int build_selector_index_lua(lua_State *L)
+{
+    size_t      hlen = 0;
+    const char *html = luaL_checklstring(L, 1, &hlen);
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    int            carena_stack_pos = lua_gettop(L);
+
+    reflow_error err = {0};
+    ir_node *root = compile_template(carena, L, NULL, html, hlen,
+                                     "x-", 2, NULL, 0, &err);
+    if (root == NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "compile error");
+        return 2;
+    }
+    sel_index *idx = sel_build_index(carena, L, root);
+    if (idx == NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushliteral(L, "index build failed");
+        return 2;
+    }
+
+    /* {
+     *   annotations = { [order] = { tag, depth, parent, chainBranch,
+     *                               matchBranch, id, class, attrs } },
+     *   byId, byClass, byTag, byAttrName = { key = { order, ... }, ... },
+     *   includes = { order, ... },
+     *   all = { order, ... },
+     * } */
+    lua_newtable(L);
+
+    lua_newtable(L);
+    for (size_t i = 0; i < idx->n_all; i++) {
+        const ir_node *el = idx->all[i];
+        lua_newtable(L);
+        lua_pushinteger(L, (lua_Integer)el->element.order);
+        lua_setfield(L, -2, "order");
+        lua_pushstring(L, el->element.tag_name ? el->element.tag_name : "");
+        lua_setfield(L, -2, "tag");
+        lua_pushinteger(L, (lua_Integer)el->element.depth);
+        lua_setfield(L, -2, "depth");
+        if (el->element.parent != NULL) {
+            lua_pushinteger(L,
+                (lua_Integer)el->element.parent->element.order);
+            lua_setfield(L, -2, "parent");
+        }
+        if (el->element.is_chain_branch) {
+            lua_pushinteger(L,
+                (lua_Integer)el->element.chain_branch);
+            lua_setfield(L, -2, "chainBranch");
+        }
+        if (el->element.is_match_branch) {
+            lua_pushinteger(L,
+                (lua_Integer)el->element.match_branch);
+            lua_setfield(L, -2, "matchBranch");
+        }
+        lua_rawseti(L, -2, (int)el->element.order);
+    }
+    lua_setfield(L, -2, "annotations");
+
+    struct {
+        const char       *field;
+        const sel_bucket *bucket;
+    } bs[] = {
+        {"byId",       &idx->by_id},
+        {"byClass",    &idx->by_class},
+        {"byTag",      &idx->by_tag},
+        {"byAttrName", &idx->by_attr_name},
+    };
+    for (size_t bi = 0; bi < sizeof(bs) / sizeof(bs[0]); bi++) {
+        lua_newtable(L);
+        const sel_bucket *b = bs[bi].bucket;
+        for (size_t i = 0; i < b->n_keys; i++) {
+            lua_createtable(L, (int)b->keys[i].count, 0);
+            for (size_t j = 0; j < b->keys[i].count; j++) {
+                const ir_node *el = b->entries[b->keys[i].offset + j];
+                lua_pushinteger(L, (lua_Integer)el->element.order);
+                lua_rawseti(L, -2, (int)(j + 1));
+            }
+            lua_pushlstring(L, b->keys[i].key, b->keys[i].key_len);
+            lua_insert(L, -2);
+            lua_settable(L, -3);
+        }
+        lua_setfield(L, -2, bs[bi].field);
+    }
+
+    lua_createtable(L, (int)idx->n_includes, 0);
+    for (size_t i = 0; i < idx->n_includes; i++) {
+        lua_pushinteger(L,
+            (lua_Integer)idx->includes[i]->element.order);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "includes");
+
+    lua_createtable(L, (int)idx->n_all, 0);
+    for (size_t i = 0; i < idx->n_all; i++) {
+        lua_pushinteger(L, (lua_Integer)idx->all[i]->element.order);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "all");
+
+    /* Drop arena — the table is now self-contained in Lua state. */
+    lua_remove(L, carena_stack_pos);
+    return 1;
+}
+
+/* ============================================================ */
+/* compile_template test hook — dumps the IR tree as a table    */
+/* ============================================================ */
+
 static int compile_template_lua(lua_State *L)
 {
     size_t hlen = 0;
@@ -1116,6 +1235,7 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"dir_group",        dir_group_lua       },
         {"parse_html",       parse_html_lua      },
         {"parse_selector",   parse_selector_lua  },
+        {"build_selector_index", build_selector_index_lua},
         {"compile_template", compile_template_lua},
         {"render",           render_lua          },
         /* State-based public API (used by lua/reflow.lua). */

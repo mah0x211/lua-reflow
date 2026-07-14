@@ -148,6 +148,18 @@ typedef struct ir_node {
             size_t          source_start;
             size_t          source_end;
             bool            invisible_marker;
+            /* Selector index annotations (populated by sel_build_index).
+             * Zero-initialized on creation so an un-annotated tree behaves
+             * predictably; consumers must check `order > 0` before relying
+             * on any of these fields. */
+            const struct ir_node *parent;         /* enclosing element */
+            const struct ir_node *chain_parent;   /* wrapping IR_CHAIN */
+            size_t                depth;          /* 0 at root's children */
+            size_t                order;          /* 1-based document order */
+            size_t                chain_branch;   /* branch index in chain_parent */
+            size_t                match_branch;   /* branch index within x-match */
+            bool                  is_chain_branch;
+            bool                  is_match_branch;
         } element;
 
         /* IR_TEXT */
