@@ -240,7 +240,7 @@ static render_result emit_text_content(render_ctx *rc, const expr_node *e)
     if (eval_expr(rc, e, &v) != RR_OK) return RR_ERROR;
     if (rv_is_nullish(&v)) return RR_OK;
     if (v.tag == RV_ARRAY || v.tag == RV_OBJECT) {
-        render_errorf(rc, "x-text: cannot serialize %s to string",
+        render_errorf(rc, "x-text: value must be primitive, got %s",
                       v.tag == RV_ARRAY ? "array" : "object");
         return RR_ERROR;
     }
@@ -387,7 +387,8 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                             memcmp(rc->include_stack[i], nv.string.data,
                                    nv.string.len) == 0) {
                             render_errorf(rc,
-                                "x-include: cyclic include of \"%.*s\"",
+                                "x-include: include cycle detected on "
+                                "\"%.*s\"",
                                 (int)nv.string.len, nv.string.data);
                             rr = RR_ERROR;
                             break;
@@ -405,8 +406,8 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                                 render_errorf(rc, "%s", lerr.message);
                             } else {
                                 render_errorf(rc,
-                                    "x-include: template \"%.*s\" not "
-                                    "registered",
+                                    "x-include: template not found: "
+                                    "\"%.*s\"",
                                     (int)nv.string.len, nv.string.data);
                             }
                             rr = RR_ERROR;
