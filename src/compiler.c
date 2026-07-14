@@ -29,6 +29,7 @@
 #include "expr/eval.h"
 #include "expr/parse.h"
 #include "json5.h"
+#include "parser.h"
 #include "scope.h"
 #include "value.h"
 // depend
@@ -369,6 +370,150 @@ static int dir_group_lua(lua_State *L)
     return 1;
 }
 
+/* ============================================================ */
+/* Parser test hook — dumps SAX events as a Lua array           */
+/* ============================================================ */
+
+typedef struct {
+    lua_State *L;
+    int        table_idx; /* absolute index of the events table */
+    int        n;
+} parse_ctx;
+
+static void ev_push_string(lua_State *L, const char *s, size_t n)
+{
+    if (s == NULL) {
+        lua_pushnil(L);
+    } else {
+        lua_pushlstring(L, s, n);
+    }
+}
+
+static void ev_element(void *ud,
+                       const char *tag_name, size_t tag_len,
+                       const sax_attr *attrs, size_t n_attrs,
+                       bool self_closing,
+                       size_t src_start, size_t src_end,
+                       int token)
+{
+    parse_ctx *ctx = (parse_ctx *)ud;
+    lua_State *L = ctx->L;
+    lua_createtable(L, 7, 0);
+    lua_pushliteral(L, "element");
+    lua_rawseti(L, -2, 1);
+    ev_push_string(L, tag_name, tag_len);
+    lua_rawseti(L, -2, 2);
+    /* attrs */
+    lua_createtable(L, (int)n_attrs, 0);
+    for (size_t i = 0; i < n_attrs; i++) {
+        lua_createtable(L, 4, 0);
+        ev_push_string(L, attrs[i].name, attrs[i].name_len);
+        lua_rawseti(L, -2, 1);
+        ev_push_string(L, attrs[i].value, attrs[i].value_len);
+        lua_rawseti(L, -2, 2);
+        lua_pushinteger(L, (lua_Integer)attrs[i].source_start);
+        lua_rawseti(L, -2, 3);
+        lua_pushinteger(L, (lua_Integer)attrs[i].source_end);
+        lua_rawseti(L, -2, 4);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_rawseti(L, -2, 3);
+    lua_pushboolean(L, self_closing);
+    lua_rawseti(L, -2, 4);
+    lua_pushinteger(L, (lua_Integer)token);
+    lua_rawseti(L, -2, 5);
+    lua_pushinteger(L, (lua_Integer)src_start);
+    lua_rawseti(L, -2, 6);
+    lua_pushinteger(L, (lua_Integer)src_end);
+    lua_rawseti(L, -2, 7);
+
+    ctx->n++;
+    lua_rawseti(L, ctx->table_idx, ctx->n);
+}
+
+static void ev_endtag(void *ud,
+                      const char *tag_name, size_t tag_len,
+                      int token)
+{
+    parse_ctx *ctx = (parse_ctx *)ud;
+    lua_State *L = ctx->L;
+    lua_createtable(L, 3, 0);
+    lua_pushliteral(L, "endtag");
+    lua_rawseti(L, -2, 1);
+    ev_push_string(L, tag_name, tag_len);
+    lua_rawseti(L, -2, 2);
+    lua_pushinteger(L, (lua_Integer)token);
+    lua_rawseti(L, -2, 3);
+    ctx->n++;
+    lua_rawseti(L, ctx->table_idx, ctx->n);
+}
+
+static void ev_text(void *ud, const char *text, size_t len,
+                    bool last_in_text_node)
+{
+    parse_ctx *ctx = (parse_ctx *)ud;
+    lua_State *L = ctx->L;
+    lua_createtable(L, 3, 0);
+    lua_pushliteral(L, "text");
+    lua_rawseti(L, -2, 1);
+    ev_push_string(L, text, len);
+    lua_rawseti(L, -2, 2);
+    lua_pushboolean(L, last_in_text_node);
+    lua_rawseti(L, -2, 3);
+    ctx->n++;
+    lua_rawseti(L, ctx->table_idx, ctx->n);
+}
+
+static void ev_comment(void *ud, const char *text, size_t len)
+{
+    parse_ctx *ctx = (parse_ctx *)ud;
+    lua_State *L = ctx->L;
+    lua_createtable(L, 2, 0);
+    lua_pushliteral(L, "comment");
+    lua_rawseti(L, -2, 1);
+    ev_push_string(L, text, len);
+    lua_rawseti(L, -2, 2);
+    ctx->n++;
+    lua_rawseti(L, ctx->table_idx, ctx->n);
+}
+
+/* parse_html: test hook — tokenize HTML and return an events array.
+ * Each event is a table starting with a type tag:
+ *   {"element", tag, {attrs}, self_closing, token, src_start, src_end}
+ *   {"endtag", tag, token}
+ *   {"text", data, last_in_text_node}
+ *   {"comment", data}
+ * Attribute entries are {name, value, source_start, source_end}
+ * (value is nil when the attribute has no value). */
+static int parse_html_lua(lua_State *L)
+{
+    size_t hlen = 0;
+    const char *html = luaL_checklstring(L, 1, &hlen);
+
+    lua_newtable(L);
+    parse_ctx ctx = {
+        .L = L,
+        .table_idx = lua_gettop(L),
+        .n = 0,
+    };
+    sax_handler handler = {
+        .ud         = &ctx,
+        .on_element = ev_element,
+        .on_endtag  = ev_endtag,
+        .on_text    = ev_text,
+        .on_comment = ev_comment,
+    };
+    reflow_error err = {0};
+    int rc = html_parse(html, hlen, &handler, &err);
+    if (rc != 0 || err.message != NULL) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        return 2;
+    }
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
@@ -387,6 +532,7 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"dir_assert_empty", dir_assert_empty_lua},
         {"dir_is_known",     dir_is_known_lua    },
         {"dir_group",        dir_group_lua       },
+        {"parse_html",       parse_html_lua      },
         {NULL,         NULL           },
     };
 
