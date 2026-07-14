@@ -46,6 +46,93 @@
 #include <string.h>
 
 #define REFLOW_STATE_MT  "reflow.state"
+#define REFLOW_ERROR_MT  "reflow.error"
+
+/*
+ * Push a Lua table representation of the error onto the stack.  Every
+ * string is copied into Lua state so the caller may free any arena
+ * that backed the source pointers after this returns.  Combine with a
+ * subsequent lua_error(L) to actually raise; the two-step form lets
+ * the caller destroy render arenas between building the table and
+ * raising the error.
+ */
+static void push_reflow_error(lua_State *L, const reflow_error *err,
+                              const char *template_name)
+{
+    lua_newtable(L);
+    lua_pushstring(L, err->type ? err->type : "ReflowError");
+    lua_setfield(L, -2, "type");
+    lua_pushstring(L, err->message ? err->message : "error");
+    lua_setfield(L, -2, "message");
+
+    const char *tn = err->template_name ? err->template_name : template_name;
+    if (tn != NULL) {
+        lua_pushstring(L, tn);
+        lua_setfield(L, -2, "templateName");
+    }
+    if (err->line > 0) {
+        lua_pushinteger(L, (lua_Integer)err->line);
+        lua_setfield(L, -2, "line");
+    }
+    if (err->column > 0) {
+        lua_pushinteger(L, (lua_Integer)err->column);
+        lua_setfield(L, -2, "column");
+    }
+    if (err->snippet != NULL) {
+        lua_pushstring(L, err->snippet);
+        lua_setfield(L, -2, "snippet");
+    }
+    if (err->element != NULL) {
+        lua_pushstring(L, err->element);
+        lua_setfield(L, -2, "element");
+    }
+    if (err->directive != NULL) {
+        lua_pushstring(L, err->directive);
+        lua_setfield(L, -2, "directive");
+    }
+    if (err->reason != NULL) {
+        lua_pushstring(L, err->reason);
+        lua_setfield(L, -2, "reason");
+    }
+    if (err->requested != NULL) {
+        lua_pushstring(L, err->requested);
+        lua_setfield(L, -2, "requested");
+    }
+    luaL_getmetatable(L, REFLOW_ERROR_MT);
+    lua_setmetatable(L, -2);
+}
+
+/*
+ * Push the error table and raise. Convenience wrapper when no arena
+ * cleanup needs to happen between the two.
+ */
+static int raise_reflow_error(lua_State *L, const reflow_error *err,
+                              const char *template_name)
+{
+    push_reflow_error(L, err, template_name);
+    return lua_error(L);
+}
+
+/* __tostring for reflow.error tables: "ReflowXxxError: <message>". */
+static int reflow_error_tostring(lua_State *L)
+{
+    lua_getfield(L, 1, "type");
+    lua_getfield(L, 1, "message");
+    lua_pushfstring(L, "%s: %s",
+                    lua_tostring(L, -2) ? lua_tostring(L, -2) : "ReflowError",
+                    lua_tostring(L, -1) ? lua_tostring(L, -1) : "");
+    return 1;
+}
+
+/* Called from luaopen_reflow_compiler to install the reflow.error metatable. */
+void reflow_register_error_metatable(lua_State *L)
+{
+    if (luaL_newmetatable(L, REFLOW_ERROR_MT)) {
+        lua_pushcfunction(L, reflow_error_tostring);
+        lua_setfield(L, -2, "__tostring");
+    }
+    lua_pop(L, 1);
+}
 
 typedef struct reflow_state {
     int    templates_ref;   /* Lua table {name -> template entry} */
@@ -196,12 +283,12 @@ int rf_state_compile(lua_State *L)
 
     reflow_error err = {0};
     ir_node *root = compile_template(carena, L,
+                                     name /* template_name */,
                                      html, hlen,
                                      s->prefix, s->prefix_len,
                                      helpers, n_helpers, &err);
     if (root == NULL) {
-        return luaL_error(L, "reflow:compile(\"%s\"): %s",
-                          name, err.message ? err.message : "compile error");
+        return raise_reflow_error(L, &err, name);
     }
 
     /* Copy html source into arena for render-time snippets. */
@@ -262,9 +349,14 @@ static reflow_value *value_from_lua(lua_State *L, int idx,
 }
 
 /* Look up a compiled template by name in the current reflow_state's
- * templates table. Returns NULL when the entry is missing. */
+ * templates table. When out_html is non-NULL, the stored HTML source is
+ * also handed back so interpret can rebase its source context for
+ * errors raised inside the included template.  Returns NULL when the
+ * entry is missing. */
 static const ir_node *include_lookup(void *ud,
                                      const char *name, size_t name_len,
+                                     const char **out_html,
+                                     size_t *out_html_len,
                                      reflow_error *err)
 {
     (void)err;
@@ -283,7 +375,16 @@ static const ir_node *include_lookup(void *ud,
     }
     lua_getfield(L, -1, "root");
     const ir_node *root = (const ir_node *)lua_touserdata(L, -1);
-    lua_pop(L, 3);
+    lua_pop(L, 1);
+    if (out_html != NULL) {
+        lua_getfield(L, -1, "html");
+        size_t hl = 0;
+        const char *hs = lua_tolstring(L, -1, &hl);
+        *out_html = hs;
+        if (out_html_len != NULL) *out_html_len = hl;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 2);
     return root;
 }
 
@@ -297,12 +398,21 @@ int rf_state_render(lua_State *L)
     lua_getfield(L, -1, name);
     if (lua_isnil(L, -1)) {
         lua_pop(L, 2);
-        return luaL_error(L, "reflow:render(\"%s\"): template not registered",
-                          name);
+        reflow_error nferr = {
+            .type          = "ReflowRuntimeError",
+            .message       = "template not registered",
+            .template_name = name,
+            .reason        = "not_found",
+        };
+        return raise_reflow_error(L, &nferr, name);
     }
     lua_getfield(L, -1, "root");
     ir_node *root = (ir_node *)lua_touserdata(L, -1);
-    lua_pop(L, 3); /* root, entry, templates */
+    lua_pop(L, 1); /* pop root, keep entry */
+    lua_getfield(L, -1, "html");
+    size_t html_len = 0;
+    const char *html = lua_tolstring(L, -1, &html_len);
+    lua_pop(L, 3); /* html, entry, templates */
 
     /* Set up render arena. */
     arena_t rarena;
@@ -312,7 +422,8 @@ int rf_state_render(lua_State *L)
     reflow_value *globals = value_from_lua(L, 3, &rarena, &derr);
     if (derr.message != NULL) {
         arena_destroy(&rarena);
-        return luaL_error(L, "reflow:render(\"%s\"): %s", name, derr.message);
+        derr.template_name = name;
+        return raise_reflow_error(L, &derr, name);
     }
 
     /* Set up include hooks. */
@@ -334,12 +445,23 @@ int rf_state_render(lua_State *L)
     }
     reflow_error rerr = {0};
     int rc = interpret_render(&rarena, root, globals, L,
-                              s->helpers_ref, &hooks, &out, &rerr);
+                              s->helpers_ref,
+                              name, html, html_len,
+                              &hooks, &out, &rerr);
     if (rc != 0) {
+        /* Build the error table BEFORE freeing the render arena so the
+         * snippet / element strings (which point into the arena) are
+         * still valid when we copy them into Lua state. Only set the
+         * outer template_name when interpret did not populate one — it
+         * will have the included template's name if the error fired
+         * inside an x-include recursion. */
+        if (rerr.template_name == NULL) {
+            rerr.template_name = name;
+        }
+        push_reflow_error(L, &rerr, name);
         buf_free(&out);
         arena_destroy(&rarena);
-        return luaL_error(L, "reflow:render(\"%s\"): %s", name,
-                          rerr.message ? rerr.message : "render error");
+        return lua_error(L);
     }
     lua_pushlstring(L, out.data, out.len);
     buf_free(&out);

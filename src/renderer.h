@@ -39,6 +39,10 @@
 /* new(prefix, max_include_depth) -> state userdata */
 int rf_state_new(lua_State *L);
 
+/* Register the reflow.error metatable (idempotent). Called from
+ * luaopen_reflow_compiler so tostring() on an error table works. */
+void reflow_register_error_metatable(lua_State *L);
+
 /* add_helper(state, name, function) -> state */
 int rf_state_add_helper(lua_State *L);
 
