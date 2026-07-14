@@ -231,11 +231,14 @@ static void add_bind(compile_ctx *cc, ir_directives *d,
 
 /* Returns 0 on success, -1 on directive parse or validation failure. */
 static int process_x_directive(compile_ctx *cc, ir_node *element,
-                               const char *full_name, size_t full_name_len,
+                               const char *raw_name, size_t full_name_len,
                                const char *value, size_t value_len,
                                unsigned *groups)
 {
     ir_directives *d = &element->element.directives;
+    /* raw_name is a pointer into the HTML source, NOT NUL-terminated.
+     * Duplicate it once so downstream error paths can use %s. */
+    const char *full_name = dup_str(cc, raw_name, full_name_len);
     /* suffix = full_name minus prefix */
     const char *suffix     = full_name + cc->prefix_len;
     size_t      suffix_len = full_name_len - cc->prefix_len;
