@@ -21,7 +21,7 @@
 --
 local compiler = require('reflow.compiler')
 
---- @alias reflow.helper fun(name: string, fn: fun(...: any): any)
+--- @alias reflow.helper fun(...: any): any
 
 --- @class reflow.options
 --- @field prefix string
@@ -29,19 +29,50 @@ local compiler = require('reflow.compiler')
 --- @field helpers table<string, reflow.helper>
 
 --- @class reflow
---- @field _prefix string
---- @field _max_include_depth integer
+--- @field _state userdata
 --- @field _helpers table<string, reflow.helper>
 local Reflow = {}
 Reflow.__index = Reflow
 
---- Add a helper function to the reflow instance.
+--- Register a helper function on this instance.
 --- @param name string
 --- @param fn reflow.helper
 --- @return reflow
 function Reflow:add_helper(name, fn)
     self._helpers[name] = fn
+    compiler.state_add_helper(self._state, name, fn)
     return self
+end
+
+--- Compile an HTML template and cache it under `name`.
+--- @param name string
+--- @param html string
+--- @return reflow
+function Reflow:compile(name, html)
+    compiler.state_compile(self._state, name, html)
+    return self
+end
+
+--- Render a compiled template against `data`.
+--- @param name string
+--- @param data string|nil     JSON5 string, or nil for empty globals
+--- @return string html
+function Reflow:render(name, data)
+    return compiler.state_render(self._state, name, data)
+end
+
+--- Remove one template by name, or every template when name is nil.
+--- Returns the list of names actually removed.
+--- @param name string?
+--- @return string[]
+function Reflow:clear(name)
+    return compiler.state_clear(self._state, name)
+end
+
+--- List every currently registered template name.
+--- @return string[]
+function Reflow:templates()
+    return compiler.state_templates(self._state)
 end
 
 --- Create a new reflow instance.
@@ -49,9 +80,10 @@ end
 --- @return reflow
 local function new(opts)
     opts = opts or {}
+    local prefix = opts.prefix or 'x-'
+    local max_include_depth = opts.max_include_depth or 50
     local self = setmetatable({
-        _prefix = opts.prefix or 'x-',
-        _max_include_depth = opts.max_include_depth or 50,
+        _state = compiler.state_new(prefix, max_include_depth),
         _helpers = {},
     }, Reflow)
     for name, fn in pairs(opts.helpers or {}) do
