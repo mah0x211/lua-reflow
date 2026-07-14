@@ -46,6 +46,7 @@
  * Returns the root ir_node on success, or NULL on error (with `err` set).
  */
 ir_node *compile_template(compile_arena *arena, lua_State *L,
+                          const char *template_name,
                           const char *html, size_t html_len,
                           const char *prefix, size_t prefix_len,
                           const char **helper_names, size_t n_helpers,

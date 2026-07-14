@@ -778,6 +778,7 @@ static int compile_template_lua(lua_State *L)
 
     reflow_error err = {0};
     ir_node *root = compile_template(carena, L,
+                                     NULL /* template_name */,
                                      html, hlen,
                                      prefix, prefix_len,
                                      helpers, n_helpers,
@@ -862,7 +863,9 @@ static int render_lua(lua_State *L)
 
     /* 1. Compile. */
     reflow_error err = {0};
-    ir_node *root = compile_template(carena, L, html, hlen,
+    ir_node *root = compile_template(carena, L,
+                                     NULL /* template_name */,
+                                     html, hlen,
                                      prefix, prefix_len,
                                      helper_names, n_helpers, &err);
     if (root == NULL) {
@@ -905,6 +908,7 @@ static int render_lua(lua_State *L)
     }
     reflow_error rerr = {0};
     int rc = interpret_render(&rarena, root, globals, L, helpers_ref,
+                              NULL, html, hlen,
                               NULL, &out, &rerr);
     if (rc != 0) {
         buf_free(&out);
@@ -958,6 +962,9 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
     };
 
     lua_errno_loadlib(L);
+    /* Install the reflow.error metatable so structured errors raised
+     * from renderer.c produce a meaningful tostring(). */
+    reflow_register_error_metatable(L);
 
     lua_newtable(L);
     for (struct luaL_Reg *ptr = method; ptr->name != NULL; ptr++) {
