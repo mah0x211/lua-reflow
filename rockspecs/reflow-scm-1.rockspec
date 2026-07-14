@@ -53,15 +53,23 @@ build = {
                 "src/scope.c",
                 "src/ir.c",
                 "src/directives.c",
+                "src/parser.c",
                 "src/expr/parse.c",
                 "src/expr/eval.c",
                 "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
                 "deps/yyjson/src",
+                "deps/lexbor/source",
                 "$(DEP_LAUXHLIB_INCDIR)",
                 "$(DEP_ERRNO_INCDIR)",
                 "$(DEP_ERROR_INCDIR)",
+            },
+            libdirs = {
+                "deps/lexbor/build",
+            },
+            libraries = {
+                "lexbor_static",
             },
             -- build_lexbor.lua produces liblexbor_static.a before the build.
         },
