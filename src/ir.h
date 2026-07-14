@@ -96,7 +96,9 @@ typedef struct {
 /* ── Directives (all optional, NULL/zero if absent) ───────── */
 
 typedef struct {
-    reflow_value     *data;             /* x-data: parsed JSON5 scopes */
+    reflow_value     *data;             /* x-data: parsed at render time */
+    char             *data_raw;         /* x-data: raw JSON5 slice for parse */
+    size_t            data_raw_len;
     /* x-with */
     ir_with_binding  *with_bindings;
     size_t            n_with;
