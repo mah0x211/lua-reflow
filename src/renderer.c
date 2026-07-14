@@ -261,6 +261,32 @@ static reflow_value *value_from_lua(lua_State *L, int idx,
     return NULL;
 }
 
+/* Look up a compiled template by name in the current reflow_state's
+ * templates table. Returns NULL when the entry is missing. */
+static const ir_node *include_lookup(void *ud,
+                                     const char *name, size_t name_len,
+                                     reflow_error *err)
+{
+    (void)err;
+    struct include_ctx {
+        lua_State *L;
+        int templates_ref;
+    } *ctx = (struct include_ctx *)ud;
+    lua_State *L = ctx->L;
+
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->templates_ref);
+    lua_pushlstring(L, name, name_len);
+    lua_rawget(L, -2);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 2);
+        return NULL;
+    }
+    lua_getfield(L, -1, "root");
+    const ir_node *root = (const ir_node *)lua_touserdata(L, -1);
+    lua_pop(L, 3);
+    return root;
+}
+
 int rf_state_render(lua_State *L)
 {
     reflow_state *s = check_state(L, 1);
@@ -289,16 +315,26 @@ int rf_state_render(lua_State *L)
         return luaL_error(L, "reflow:render(\"%s\"): %s", name, derr.message);
     }
 
+    /* Set up include hooks. */
+    struct include_ctx {
+        lua_State *L;
+        int templates_ref;
+    } ictx = { L, s->templates_ref };
+    interpret_include_hooks hooks = {
+        .ud            = &ictx,
+        .get_template  = include_lookup,
+        .max_depth     = s->max_include_depth,
+    };
+
     /* Render. */
     buf_t out;
     if (buf_init(&out) != 0) {
         arena_destroy(&rarena);
         return luaL_error(L, "out of memory");
     }
-    /* Push helpers table ref so eval sees it. */
     reflow_error rerr = {0};
     int rc = interpret_render(&rarena, root, globals, L,
-                              s->helpers_ref, &out, &rerr);
+                              s->helpers_ref, &hooks, &out, &rerr);
     if (rc != 0) {
         buf_free(&out);
         arena_destroy(&rarena);
