@@ -29,6 +29,7 @@
 #include "escape.h"
 #include "expr/eval.h"
 #include "expr/parse.h"
+#include "interpret.h"
 #include "json5.h"
 #include "parser.h"
 #include "scope.h"
@@ -793,6 +794,137 @@ static int compile_template_lua(lua_State *L)
     return 1;
 }
 
+/* render: test hook — compile HTML and render against a JSON5 data string.
+ * args: html, data_json5?, opts?
+ *   opts = { prefix?, helpers? = { name = lua_function, ... } }
+ * Returns the rendered HTML string, or nil + error message. */
+static int render_lua(lua_State *L)
+{
+    size_t hlen = 0;
+    const char *html = luaL_checklstring(L, 1, &hlen);
+    const char *data = NULL;
+    size_t data_len = 0;
+    if (lua_type(L, 2) == LUA_TSTRING) {
+        data = lua_tolstring(L, 2, &data_len);
+    }
+
+    const char *prefix = "x-";
+    size_t prefix_len = 2;
+    const char **helper_names = NULL;
+    size_t n_helpers = 0;
+    int helpers_ref = LUA_NOREF;
+
+    compile_arena *carena = compile_arena_new(L, 4096);
+    int carena_stack_pos = lua_gettop(L);
+
+    /* Parse options for prefix + helpers. */
+    if (lua_istable(L, 3)) {
+        lua_getfield(L, 3, "prefix");
+        if (lua_isstring(L, -1)) {
+            prefix = lua_tolstring(L, -1, &prefix_len);
+        }
+        lua_pop(L, 1);
+
+        lua_getfield(L, 3, "helpers");
+        if (lua_istable(L, -1)) {
+            /* Build helper name array from table keys. */
+            size_t cnt = 0;
+            lua_pushnil(L);
+            while (lua_next(L, -2)) {
+                cnt++;
+                lua_pop(L, 1);
+            }
+            if (cnt > 0) {
+                helper_names = (const char **)compile_arena_alloc(
+                    carena, L, cnt * sizeof(const char *));
+                size_t idx = 0;
+                lua_pushnil(L);
+                while (lua_next(L, -2)) {
+                    size_t nl = 0;
+                    const char *nm = lua_tolstring(L, -2, &nl);
+                    char *dup = (char *)compile_arena_alloc(
+                        carena, L, nl + 1);
+                    memcpy(dup, nm, nl);
+                    dup[nl] = '\0';
+                    helper_names[idx++] = dup;
+                    lua_pop(L, 1);
+                }
+                n_helpers = idx;
+            }
+            /* Store the helpers table itself in the registry for
+             * name→function lookup at eval time. */
+            lua_pushvalue(L, -1);
+            helpers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        }
+        lua_pop(L, 1);
+    }
+
+    /* 1. Compile. */
+    reflow_error err = {0};
+    ir_node *root = compile_template(carena, L, html, hlen,
+                                     prefix, prefix_len,
+                                     helper_names, n_helpers, &err);
+    if (root == NULL) {
+        if (helpers_ref != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+        lua_settop(L, carena_stack_pos);
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, err.message ? err.message : "compile error");
+        return 2;
+    }
+
+    /* 2. Set up render arena and parse render data (JSON5). */
+    arena_t rarena;
+    arena_init(&rarena, NULL, 0);
+
+    reflow_value *globals = NULL;
+    if (data != NULL) {
+        reflow_error derr = {0};
+        globals = json5_parse(data, data_len, &rarena, &derr);
+        if (globals == NULL) {
+            arena_destroy(&rarena);
+            if (helpers_ref != LUA_NOREF)
+                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+            lua_settop(L, carena_stack_pos);
+            lua_pop(L, 1);
+            lua_pushnil(L);
+            lua_pushstring(L, derr.message ? derr.message : "data error");
+            return 2;
+        }
+    }
+
+    /* 3. Render into a buf_t. */
+    buf_t out;
+    if (buf_init(&out) != 0) {
+        arena_destroy(&rarena);
+        if (helpers_ref != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+        return luaL_error(L, "out of memory");
+    }
+    reflow_error rerr = {0};
+    int rc = interpret_render(&rarena, root, globals, L, helpers_ref,
+                              &out, &rerr);
+    if (rc != 0) {
+        buf_free(&out);
+        arena_destroy(&rarena);
+        if (helpers_ref != LUA_NOREF)
+            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+        lua_settop(L, carena_stack_pos);
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_pushstring(L, rerr.message ? rerr.message : "render error");
+        return 2;
+    }
+    lua_pushlstring(L, out.data, out.len);
+    buf_free(&out);
+    arena_destroy(&rarena);
+    if (helpers_ref != LUA_NOREF)
+        luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+    lua_remove(L, carena_stack_pos);
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_compiler(lua_State *L)
 {
     struct luaL_Reg method[] = {
@@ -813,6 +945,7 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"dir_group",        dir_group_lua       },
         {"parse_html",       parse_html_lua      },
         {"compile_template", compile_template_lua},
+        {"render",           render_lua          },
         {NULL,         NULL           },
     };
 
