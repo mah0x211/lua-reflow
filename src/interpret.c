@@ -240,7 +240,7 @@ static render_result emit_text_content(render_ctx *rc, const expr_node *e)
     if (eval_expr(rc, e, &v) != RR_OK) return RR_ERROR;
     if (rv_is_nullish(&v)) return RR_OK;
     if (v.tag == RV_ARRAY || v.tag == RV_OBJECT) {
-        render_errorf(rc, "x-text: cannot serialize %s to string",
+        render_errorf(rc, "x-text: value must be primitive, got %s",
                       v.tag == RV_ARRAY ? "array" : "object");
         return RR_ERROR;
     }
@@ -330,6 +330,35 @@ static render_result push_with_scope(render_ctx *rc,
 
 /* --- element rendering --- */
 
+/* Evaluate x-with bindings against the CURRENT scope environment and
+ * return them as a fresh reflow_value object suitable for use as the
+ * initial data frame of an included template. Returns NULL on error. */
+static reflow_value *eval_with_bindings(render_ctx *rc,
+                                        const ir_directives *d)
+{
+    if (d->n_with == 0) return NULL;
+    rv_prop *props = (rv_prop *)arena_alloc(rc->arena,
+                                            d->n_with * sizeof(rv_prop));
+    if (props == NULL) return NULL;
+    for (size_t i = 0; i < d->n_with; i++) {
+        reflow_value v;
+        if (eval_expr(rc, d->with_bindings[i].expr, &v) != RR_OK) {
+            return NULL;
+        }
+        props[i].key     = d->with_bindings[i].name;
+        props[i].key_len = strlen(d->with_bindings[i].name);
+        props[i].value   = v;
+    }
+    reflow_value *frame = (reflow_value *)arena_alloc(rc->arena,
+                                                      sizeof(reflow_value));
+    if (frame == NULL) return NULL;
+    frame->tag          = RV_OBJECT;
+    frame->object.props = props;
+    frame->object.len   = d->n_with;
+    frame->object.cap   = d->n_with;
+    return frame;
+}
+
 /*
  * Render one element instance (without applying iteration).
  * Applies x-data / x-with scopes, evaluates content or renders children,
@@ -338,13 +367,16 @@ static render_result push_with_scope(render_ctx *rc,
 static render_result render_element_body(render_ctx *rc, const ir_node *el)
 {
     const ir_directives *d = &el->element.directives;
+    bool has_include = (d->include_expr != NULL);
 
     /* x-data pushes a data frame that persists during body render. */
     size_t frames_before_data = rc->env.n_frames;
     if (push_data_scope(rc, d) != RR_OK) return RR_ERROR;
 
-    /* x-with adds another data frame. */
-    if (push_with_scope(rc, d) != RR_OK) {
+    /* x-with adds another data frame — EXCEPT when combined with x-include,
+     * where the bindings become the initial data frame of the included
+     * template rather than being visible in the outer scope. */
+    if (!has_include && push_with_scope(rc, d) != RR_OK) {
         while (rc->env.n_frames > frames_before_data) scope_pop_frame(&rc->env);
         return RR_ERROR;
     }
@@ -387,7 +419,8 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                             memcmp(rc->include_stack[i], nv.string.data,
                                    nv.string.len) == 0) {
                             render_errorf(rc,
-                                "x-include: cyclic include of \"%.*s\"",
+                                "x-include: include cycle detected on "
+                                "\"%.*s\"",
                                 (int)nv.string.len, nv.string.data);
                             rr = RR_ERROR;
                             break;
@@ -405,25 +438,43 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                                 render_errorf(rc, "%s", lerr.message);
                             } else {
                                 render_errorf(rc,
-                                    "x-include: template \"%.*s\" not "
-                                    "registered",
+                                    "x-include: template not found: "
+                                    "\"%.*s\"",
                                     (int)nv.string.len, nv.string.data);
                             }
                             rr = RR_ERROR;
                         } else {
-                            /* Recurse with fresh scope: globals carry
-                             * through, all data / loop frames from the
-                             * outer template are hidden. */
-                            size_t saved_n = rc->env.n_frames;
-                            rc->env.n_frames = 0;
-                            rc->include_stack[rc->include_depth] =
-                                nv.string.data;
-                            rc->include_stack_len[rc->include_depth] =
-                                nv.string.len;
-                            rc->include_depth++;
-                            rr = render_node(rc, inc_root);
-                            rc->include_depth--;
-                            rc->env.n_frames = saved_n;
+                            /* If this element also carries x-with,
+                             * evaluate the bindings in the outer env
+                             * and hand them to the included template
+                             * as its initial data frame. */
+                            reflow_value *init_frame = NULL;
+                            if (d->n_with > 0) {
+                                init_frame = eval_with_bindings(rc, d);
+                                if (init_frame == NULL) {
+                                    rr = RR_ERROR;
+                                }
+                            }
+                            if (rr == RR_OK) {
+                                /* Recurse with fresh scope: globals
+                                 * carry through, outer frames are
+                                 * hidden; x-with (if any) becomes the
+                                 * initial data frame. */
+                                size_t saved_n = rc->env.n_frames;
+                                rc->env.n_frames = 0;
+                                if (init_frame != NULL) {
+                                    scope_push_frame(&rc->env,
+                                        SCOPE_FRAME_DATA, init_frame);
+                                }
+                                rc->include_stack[rc->include_depth] =
+                                    nv.string.data;
+                                rc->include_stack_len[rc->include_depth] =
+                                    nv.string.len;
+                                rc->include_depth++;
+                                rr = render_node(rc, inc_root);
+                                rc->include_depth--;
+                                rc->env.n_frames = saved_n;
+                            }
                         }
                     }
                 }
