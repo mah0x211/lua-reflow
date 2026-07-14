@@ -46,6 +46,7 @@
 #include "expr/parse.h"
 #include "ir.h"
 #include "parser.h"
+#include "snippet.h"
 // system
 #include <stdarg.h>
 #include <stdio.h>
@@ -61,6 +62,7 @@ typedef struct {
     lua_State     *L;
     const char    *html;
     size_t         html_len;
+    const char    *template_name;
     const char    *prefix;
     size_t         prefix_len;
     const char   **helper_names;
@@ -70,11 +72,74 @@ typedef struct {
     ir_node *stack[COMPILE_MAX_DEPTH];
     size_t   depth;
 
+    /* Element currently being processed; used to attach source location
+     * to any error raised during its processing. NULL when not inside
+     * an element callback. */
+    const ir_node *current_element;
+
     /* Text coalescing buffer for the current text run. */
     char   *text_buf;
     size_t  text_len;
     size_t  text_cap;
 } compile_ctx;
+
+/* Reconstruct an element open tag from its non-directive attributes.
+ * Directive attributes (x-*) are omitted because they have been moved
+ * to element.directives by the time we build this string. */
+static char *reconstruct_open_tag(compile_ctx *cc, const ir_node *el)
+{
+    if (el == NULL || el->type != IR_ELEMENT) {
+        return NULL;
+    }
+    buf_t buf;
+    if (buf_init(&buf) != 0) return NULL;
+    buf_putc(&buf, '<');
+    buf_put(&buf, el->element.tag_name, strlen(el->element.tag_name));
+    for (size_t i = 0; i < el->element.n_attrs; i++) {
+        const ir_attr *a = &el->element.attrs[i];
+        buf_putc(&buf, ' ');
+        buf_put(&buf, a->name, strlen(a->name));
+        if (a->value != NULL) {
+            buf_put(&buf, "=\"", 2);
+            buf_put(&buf, a->value, strlen(a->value));
+            buf_putc(&buf, '"');
+        }
+    }
+    buf_putc(&buf, '>');
+    char *out = (char *)compile_arena_alloc(cc->arena, cc->L, buf.len + 1);
+    memcpy(out, buf.data, buf.len);
+    out[buf.len] = '\0';
+    buf_free(&buf);
+    return out;
+}
+
+/* Populate the location-related fields of the error from an element's
+ * source range. Caller has already set type / message. */
+static void compile_error_populate_at(compile_ctx *cc, const ir_node *at)
+{
+    if (cc->err == NULL) return;
+    cc->err->template_name = cc->template_name;
+    if (at != NULL && at->type == IR_ELEMENT) {
+        long line = 0, col = 0;
+        offset_to_linecol(cc->html, cc->html_len,
+                          at->element.source_start, &line, &col);
+        cc->err->line   = line;
+        cc->err->column = col;
+        buf_t snip;
+        if (buf_init(&snip) == 0) {
+            make_snippet(cc->html, cc->html_len,
+                         at->element.source_start,
+                         at->element.source_end, &snip);
+            char *dst = (char *)compile_arena_alloc(
+                cc->arena, cc->L, snip.len + 1);
+            memcpy(dst, snip.data, snip.len);
+            dst[snip.len] = '\0';
+            cc->err->snippet = dst;
+            buf_free(&snip);
+        }
+        cc->err->element = reconstruct_open_tag(cc, at);
+    }
+}
 
 static void compile_errorf(compile_ctx *cc, const char *fmt, ...)
 {
@@ -87,6 +152,26 @@ static void compile_errorf(compile_ctx *cc, const char *fmt, ...)
     va_end(ap);
     cc->err->type    = "ReflowCompileError";
     cc->err->message = g_compile_err;
+    /* Attach source context from whatever element is currently being
+     * processed (set by cb_element / post_process). NULL is fine — it
+     * simply leaves the location fields unset. */
+    compile_error_populate_at(cc, cc->current_element);
+}
+
+/* Format an error and attach source location from the given element. */
+static void compile_error_at(compile_ctx *cc, const ir_node *at,
+                             const char *fmt, ...)
+{
+    if (cc->err == NULL || cc->err->message != NULL) {
+        return;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_compile_err, sizeof(g_compile_err), fmt, ap);
+    va_end(ap);
+    cc->err->type    = "ReflowCompileError";
+    cc->err->message = g_compile_err;
+    compile_error_populate_at(cc, at);
 }
 
 static ir_node *current_parent(compile_ctx *cc)
@@ -586,7 +671,7 @@ static int consolidate_chains(compile_ctx *cc, ir_node *parent)
             const ir_directives *sd = &sib->element.directives;
             if (sd->elseif_expr != NULL) {
                 if (saw_else) {
-                    compile_errorf(cc,
+                    compile_error_at(cc, sib,
                         "x-elseif after x-else is not allowed");
                     return -1;
                 }
@@ -600,7 +685,7 @@ static int consolidate_chains(compile_ctx *cc, ir_node *parent)
             }
             if (sd->else_mark) {
                 if (saw_else) {
-                    compile_errorf(cc,
+                    compile_error_at(cc, sib,
                         "multiple x-else in the same chain");
                     return -1;
                 }
@@ -652,7 +737,7 @@ static int collect_match_branches(compile_ctx *cc, ir_node *parent)
         ir_node *child = parent->element.children[i];
         if (node_is_ignorable(child)) continue;
         if (child->type != IR_ELEMENT) {
-            compile_errorf(cc,
+            compile_error_at(cc, parent,
                 "x-match: direct children must be x-case or x-nocase "
                 "elements");
             return -1;
@@ -660,7 +745,7 @@ static int collect_match_branches(compile_ctx *cc, ir_node *parent)
         const ir_directives *d = &child->element.directives;
         if (d->case_expr) {
             if (saw_nocase) {
-                compile_errorf(cc,
+                compile_error_at(cc, child,
                     "x-case must not appear after x-nocase in the same "
                     "x-match");
                 return -1;
@@ -672,7 +757,7 @@ static int collect_match_branches(compile_ctx *cc, ir_node *parent)
         }
         if (d->nocase_mark) {
             if (saw_nocase) {
-                compile_errorf(cc,
+                compile_error_at(cc, child,
                     "multiple x-nocase in the same x-match");
                 return -1;
             }
@@ -682,13 +767,13 @@ static int collect_match_branches(compile_ctx *cc, ir_node *parent)
             saw_nocase = true;
             continue;
         }
-        compile_errorf(cc,
+        compile_error_at(cc, child,
             "x-match: direct children must be x-case or x-nocase elements");
         return -1;
     }
 
     if (nb == 0 || (nb == 1 && branches[0].cond == NULL)) {
-        compile_errorf(cc, "x-match requires at least one x-case");
+        compile_error_at(cc, parent, "x-match requires at least one x-case");
         return -1;
     }
 
@@ -721,19 +806,21 @@ static int detect_orphans(compile_ctx *cc, ir_node *parent)
         if (child->type != IR_ELEMENT) continue;
         const ir_directives *d = &child->element.directives;
         if (d->elseif_expr) {
-            compile_errorf(cc, "x-elseif has no preceding x-if");
+            compile_error_at(cc, child, "x-elseif has no preceding x-if");
             return -1;
         }
         if (d->else_mark) {
-            compile_errorf(cc, "x-else has no preceding x-if / x-elseif");
+            compile_error_at(cc, child,
+                "x-else has no preceding x-if / x-elseif");
             return -1;
         }
         if (d->case_expr) {
-            compile_errorf(cc, "x-case must be a direct child of x-match");
+            compile_error_at(cc, child,
+                "x-case must be a direct child of x-match");
             return -1;
         }
         if (d->nocase_mark) {
-            compile_errorf(cc,
+            compile_error_at(cc, child,
                 "x-nocase must be a direct child of x-match");
             return -1;
         }
@@ -772,7 +859,7 @@ static int validate_break_context(compile_ctx *cc, ir_node *node,
     case IR_ELEMENT: {
         const ir_directives *d = &node->element.directives;
         if ((d->break_mark || d->break_if_expr) && !in_loop) {
-            compile_errorf(cc,
+            compile_error_at(cc, node,
                 "x-break / x-break-if outside of x-for or x-each");
             return -1;
         }
@@ -821,6 +908,7 @@ static void cb_element(void *ud,
     char *name = dup_str(cc, tag_name, tag_len);
     ir_node *node = ir_make_element(cc->arena, cc->L, name,
                                     src_start, src_end);
+    cc->current_element = node;
 
     unsigned groups = 0;
     for (size_t i = 0; i < n_attrs; i++) {
@@ -843,16 +931,20 @@ static void cb_element(void *ud,
                                 attrs[i].value != NULL
                                     ? attrs[i].value_len : 0,
                                 &groups) != 0) {
+            cc->current_element = NULL;
             return;
         }
     }
 
     if (validate_combinations(cc, &node->element.directives, groups) != 0) {
+        cc->current_element = NULL;
         return;
     }
     if (is_k_only(&node->element.directives, node->element.n_attrs)) {
         node->element.invisible_marker = true;
     }
+
+    cc->current_element = NULL;
 
     if (self_closing) {
         ir_add_child(cc->arena, cc->L, current_parent(cc), node);
@@ -907,25 +999,28 @@ static void cb_comment(void *ud, const char *text, size_t len)
 }
 
 ir_node *compile_template(compile_arena *arena, lua_State *L,
+                          const char *template_name,
                           const char *html, size_t html_len,
                           const char *prefix, size_t prefix_len,
                           const char **helper_names, size_t n_helpers,
                           reflow_error *err)
 {
     compile_ctx cc = {
-        .arena        = arena,
-        .L            = L,
-        .html         = html,
-        .html_len     = html_len,
-        .prefix       = prefix,
-        .prefix_len   = prefix_len,
-        .helper_names = helper_names,
-        .n_helpers    = n_helpers,
-        .err          = err,
-        .depth        = 0,
-        .text_buf     = NULL,
-        .text_len     = 0,
-        .text_cap     = 0,
+        .arena         = arena,
+        .L             = L,
+        .html          = html,
+        .html_len      = html_len,
+        .template_name = template_name,
+        .prefix        = prefix,
+        .prefix_len    = prefix_len,
+        .helper_names  = helper_names,
+        .n_helpers     = n_helpers,
+        .err           = err,
+        .depth         = 0,
+        .current_element = NULL,
+        .text_buf      = NULL,
+        .text_len      = 0,
+        .text_cap      = 0,
     };
 
     ir_node *root = ir_make_root(arena, L);

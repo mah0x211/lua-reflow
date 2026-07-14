@@ -43,6 +43,7 @@
 #include "expr/parse.h"
 #include "json5.h"
 #include "scope.h"
+#include "snippet.h"
 #include "value.h"
 // system
 #include <stdarg.h>
@@ -62,6 +63,12 @@ typedef struct {
     lua_State    *L;
     int           helpers_ref;
     reflow_error *err;
+    /* Source context for error location; may be NULL/0 when unavailable. */
+    const char   *template_name;
+    const char   *html;
+    size_t        html_len;
+    /* Element currently being rendered; used to attach location to errors. */
+    const ir_node *current_element;
     /* x-include state. */
     const interpret_include_hooks *hooks;
     const char *include_stack[64];
@@ -84,6 +91,66 @@ static bool tag_is_void(const char *name)
     return false;
 }
 
+/* Reconstruct an element open tag from its non-directive attributes. */
+static char *render_reconstruct_open_tag(render_ctx *rc, const ir_node *el)
+{
+    if (el == NULL || el->type != IR_ELEMENT) return NULL;
+    buf_t buf;
+    if (buf_init(&buf) != 0) return NULL;
+    buf_putc(&buf, '<');
+    buf_put(&buf, el->element.tag_name, strlen(el->element.tag_name));
+    for (size_t i = 0; i < el->element.n_attrs; i++) {
+        const ir_attr *a = &el->element.attrs[i];
+        buf_putc(&buf, ' ');
+        buf_put(&buf, a->name, strlen(a->name));
+        if (a->value != NULL) {
+            buf_put(&buf, "=\"", 2);
+            buf_put(&buf, a->value, strlen(a->value));
+            buf_putc(&buf, '"');
+        }
+    }
+    buf_putc(&buf, '>');
+    char *out = (char *)arena_alloc(rc->arena, buf.len + 1);
+    if (out != NULL) {
+        memcpy(out, buf.data, buf.len);
+        out[buf.len] = '\0';
+    }
+    buf_free(&buf);
+    return out;
+}
+
+/* Populate err with template_name, line, column, snippet, and element from
+ * the current source context and the element being processed. */
+static void render_error_populate(render_ctx *rc)
+{
+    if (rc->err == NULL) return;
+    if (rc->template_name != NULL) {
+        rc->err->template_name = rc->template_name;
+    }
+    const ir_node *at = rc->current_element;
+    if (at != NULL && at->type == IR_ELEMENT && rc->html != NULL) {
+        long line = 0, col = 0;
+        offset_to_linecol(rc->html, rc->html_len,
+                          at->element.source_start, &line, &col);
+        rc->err->line   = line;
+        rc->err->column = col;
+        buf_t snip;
+        if (buf_init(&snip) == 0) {
+            make_snippet(rc->html, rc->html_len,
+                         at->element.source_start,
+                         at->element.source_end, &snip);
+            char *dst = (char *)arena_alloc(rc->arena, snip.len + 1);
+            if (dst != NULL) {
+                memcpy(dst, snip.data, snip.len);
+                dst[snip.len] = '\0';
+                rc->err->snippet = dst;
+            }
+            buf_free(&snip);
+        }
+        rc->err->element = render_reconstruct_open_tag(rc, at);
+    }
+}
+
 static char g_render_err[512];
 
 static void render_errorf(render_ctx *rc, const char *fmt, ...)
@@ -97,6 +164,7 @@ static void render_errorf(render_ctx *rc, const char *fmt, ...)
     va_end(ap);
     rc->err->type    = "ReflowRuntimeError";
     rc->err->message = g_render_err;
+    render_error_populate(rc);
 }
 
 /* --- forward declarations --- */
@@ -428,10 +496,14 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                     }
                     if (rr == RR_OK) {
                         reflow_error lerr = {0};
+                        const char *inc_html = NULL;
+                        size_t inc_html_len = 0;
                         const ir_node *inc_root =
                             rc->hooks->get_template(rc->hooks->ud,
                                                     nv.string.data,
                                                     nv.string.len,
+                                                    &inc_html,
+                                                    &inc_html_len,
                                                     &lerr);
                         if (inc_root == NULL) {
                             if (lerr.message != NULL) {
@@ -456,24 +528,55 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                                 }
                             }
                             if (rr == RR_OK) {
-                                /* Recurse with fresh scope: globals
-                                 * carry through, outer frames are
-                                 * hidden; x-with (if any) becomes the
-                                 * initial data frame. */
-                                size_t saved_n = rc->env.n_frames;
-                                rc->env.n_frames = 0;
-                                if (init_frame != NULL) {
-                                    scope_push_frame(&rc->env,
-                                        SCOPE_FRAME_DATA, init_frame);
+                                /* Copy the name into arena so it stays
+                                 * live across the recursion (nv points
+                                 * into the outer eval arena, but the
+                                 * included template may allocate more). */
+                                char *inc_name = (char *)arena_alloc(
+                                    rc->arena, nv.string.len + 1);
+                                if (inc_name == NULL) {
+                                    render_errorf(rc, "out of memory");
+                                    rr = RR_ERROR;
                                 }
-                                rc->include_stack[rc->include_depth] =
-                                    nv.string.data;
-                                rc->include_stack_len[rc->include_depth] =
-                                    nv.string.len;
-                                rc->include_depth++;
-                                rr = render_node(rc, inc_root);
-                                rc->include_depth--;
-                                rc->env.n_frames = saved_n;
+                                if (rr == RR_OK) {
+                                    memcpy(inc_name, nv.string.data,
+                                           nv.string.len);
+                                    inc_name[nv.string.len] = '\0';
+                                    /* Recurse with fresh scope + swap
+                                     * source context so errors in the
+                                     * included template report its own
+                                     * name / html. */
+                                    size_t saved_n = rc->env.n_frames;
+                                    rc->env.n_frames = 0;
+                                    if (init_frame != NULL) {
+                                        scope_push_frame(&rc->env,
+                                            SCOPE_FRAME_DATA, init_frame);
+                                    }
+                                    const char *saved_tn =
+                                        rc->template_name;
+                                    const char *saved_html = rc->html;
+                                    size_t saved_hl = rc->html_len;
+                                    const ir_node *saved_el =
+                                        rc->current_element;
+                                    rc->template_name = inc_name;
+                                    if (inc_html != NULL) {
+                                        rc->html = inc_html;
+                                        rc->html_len = inc_html_len;
+                                    }
+                                    rc->current_element = NULL;
+                                    rc->include_stack[rc->include_depth] =
+                                        inc_name;
+                                    rc->include_stack_len[
+                                        rc->include_depth] = nv.string.len;
+                                    rc->include_depth++;
+                                    rr = render_node(rc, inc_root);
+                                    rc->include_depth--;
+                                    rc->env.n_frames = saved_n;
+                                    rc->template_name = saved_tn;
+                                    rc->html = saved_html;
+                                    rc->html_len = saved_hl;
+                                    rc->current_element = saved_el;
+                                }
                             }
                         }
                     }
@@ -519,25 +622,38 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
  */
 static render_result render_element_once(render_ctx *rc, const ir_node *el)
 {
+    /* Track this element as the "current" one for error location. */
+    const ir_node *saved_el = rc->current_element;
+    rc->current_element = el;
     const ir_directives *d = &el->element.directives;
+
+    render_result rr;
 
     /* K-only element: no output, just break signaling. */
     if (el->element.invisible_marker) {
         if (d->break_mark) {
-            return RR_BREAK;
+            rr = RR_BREAK;
+            goto out;
         }
         if (d->break_if_expr) {
             reflow_value v;
-            if (eval_expr(rc, d->break_if_expr, &v) != RR_OK)
-                return RR_ERROR;
-            return rv_is_truthy(&v) ? RR_BREAK : RR_OK;
+            if (eval_expr(rc, d->break_if_expr, &v) != RR_OK) {
+                rr = RR_ERROR;
+                goto out;
+            }
+            rr = rv_is_truthy(&v) ? RR_BREAK : RR_OK;
+            goto out;
         }
-        return RR_OK;
+        rr = RR_OK;
+        goto out;
     }
 
-    if (emit_open_tag(rc, el) != RR_OK) return RR_ERROR;
+    if (emit_open_tag(rc, el) != RR_OK) {
+        rr = RR_ERROR;
+        goto out;
+    }
 
-    render_result rr = RR_OK;
+    rr = RR_OK;
     if (!tag_is_void(el->element.tag_name)) {
         rr = render_element_body(rc, el);
         emit_close_tag(rc, el);
@@ -548,11 +664,15 @@ static render_result render_element_once(render_ctx *rc, const ir_node *el)
         if (d->break_mark) rr = RR_BREAK;
         else if (d->break_if_expr) {
             reflow_value v;
-            if (eval_expr(rc, d->break_if_expr, &v) != RR_OK)
-                return RR_ERROR;
+            if (eval_expr(rc, d->break_if_expr, &v) != RR_OK) {
+                rr = RR_ERROR;
+                goto out;
+            }
             if (rv_is_truthy(&v)) rr = RR_BREAK;
         }
     }
+out:
+    rc->current_element = saved_el;
     return rr;
 }
 
@@ -732,6 +852,9 @@ int interpret_render(arena_t *arena,
                      reflow_value  *globals,
                      lua_State     *L,
                      int            helpers_ref,
+                     const char    *template_name,
+                     const char    *html,
+                     size_t         html_len,
                      const interpret_include_hooks *hooks,
                      buf_t         *out,
                      reflow_error  *err)
@@ -742,6 +865,10 @@ int interpret_render(arena_t *arena,
         .L             = L,
         .helpers_ref   = helpers_ref,
         .err           = err,
+        .template_name = template_name,
+        .html          = html,
+        .html_len      = html_len,
+        .current_element = NULL,
         .hooks         = hooks,
         .include_depth = 0,
     };

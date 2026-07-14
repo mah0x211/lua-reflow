@@ -44,11 +44,17 @@ typedef struct interpret_include_hooks {
     void *ud;
     /*
      * Return the compiled IR root registered under (name, name_len).
+     * When out_html / out_html_len are non-NULL they are additionally
+     * populated with the included template's source so any error raised
+     * inside the include reports the correct location.
+     *
      * Return NULL when the name is not registered; interpret then emits
      * a ReflowIncludeError with reason=not_found.
      */
     const ir_node *(*get_template)(void *ud,
                                    const char *name, size_t name_len,
+                                   const char **out_html,
+                                   size_t *out_html_len,
                                    reflow_error *err);
     /* Maximum recursion depth for x-include. */
     int max_depth;
@@ -63,6 +69,10 @@ typedef struct interpret_include_hooks {
  *   globals       : $ scope; may be NULL for none.
  *   L, helpers_ref: helper registry table stored in the Lua registry via
  *                   luaL_ref; pass LUA_NOREF when no helpers are registered.
+ *   template_name : the current template's name, used to annotate
+ *                   runtime errors; may be NULL.
+ *   html, html_len: the current template's source, used for snippet
+ *                   generation on runtime errors; may be NULL / 0.
  *   hooks         : x-include support; NULL disables x-include (a template
  *                   using it will report a runtime error).
  *
@@ -73,6 +83,9 @@ int interpret_render(arena_t *arena,
                      reflow_value  *globals,
                      lua_State     *L,
                      int            helpers_ref,
+                     const char    *template_name,
+                     const char    *html,
+                     size_t         html_len,
                      const interpret_include_hooks *hooks,
                      buf_t         *out,
                      reflow_error  *err);
