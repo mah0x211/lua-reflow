@@ -232,9 +232,13 @@ for _, name in ipairs(list_dir(FIXTURE_ROOT .. '/invalid')) do
             end
             if r.spec.messagePattern then
                 local pat = r.spec.messagePattern
-                if not match_js_pattern(r.err, pat) then
+                -- The error may be a structured table; prefer .message
+                -- for precise matching, fall back to tostring otherwise.
+                local text = type(r.err) == 'table' and r.err.message
+                             or tostring(r.err)
+                if not match_js_pattern(text, pat) then
                     error(('%s: expected error to match /%s/, got %q')
-                        :format(name, pat, r.err))
+                        :format(name, pat, text))
                 end
             end
         end
