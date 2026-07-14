@@ -37,6 +37,10 @@ build = {
             CFLAGS = "--coverage",
             LIBFLAG = "--coverage",
         },
+        REFLOW_ASAN = {
+            CFLAGS = "-fsanitize=address -fno-omit-frame-pointer -g -O1",
+            LIBFLAG = "-fsanitize=address",
+        },
     },
     modules = {
         reflow = "lua/reflow.lua",

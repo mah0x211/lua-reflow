@@ -76,3 +76,45 @@ jobs:
           disable_search: true
           files: ./luacov.report.out, ./coverage/lcov.info
           flags: unittests
+
+  asan:
+    needs: luacheck
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/mah0x211/lua-ci:latest
+    steps:
+      -
+        name: Switch Lua Version
+        run: |
+          lenv -g use 5.1.:latest
+          lua -v || true
+      -
+        name: Checkout
+        uses: actions/checkout@v2
+        with:
+          submodules: 'true'
+      -
+        name: Install cmake (lexbor build)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends cmake
+      -
+        name: Build & Install with AddressSanitizer
+        run: |
+          REFLOW_ASAN=1 luarocks make
+      -
+        name: Install test tools
+        run: |
+          luarocks install testcase
+          luarocks install luacov
+      -
+        name: Run Test under AddressSanitizer
+        run: |
+          # Lua itself is not ASan-instrumented; preload the ASan runtime
+          # so mallocs inside our .so get checked. Leak detection is
+          # disabled because Lua keeps globals for the process lifetime.
+          ASAN_LIB=$(gcc -print-file-name=libasan.so)
+          echo "Using ASan runtime at: $ASAN_LIB"
+          LD_PRELOAD=$ASAN_LIB \
+            ASAN_OPTIONS=detect_leaks=0:abort_on_error=1:halt_on_error=1 \
+            testcase ./test/
