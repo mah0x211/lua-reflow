@@ -32,6 +32,29 @@
 #include "ir.h"
 
 /*
+ * x-include hooks supplied by higher layers.
+ *
+ * When `hooks` is non-NULL, interpret honors x-include: it evaluates the
+ * expression, calls `get_template` for the resolved name, and recurses
+ * with a fresh scope environment inheriting only the globals. Include
+ * depth and cycles are tracked with the hook's ceiling.
+ */
+typedef struct interpret_include_hooks {
+    /* user-supplied context passed to get_template. */
+    void *ud;
+    /*
+     * Return the compiled IR root registered under (name, name_len).
+     * Return NULL when the name is not registered; interpret then emits
+     * a ReflowIncludeError with reason=not_found.
+     */
+    const ir_node *(*get_template)(void *ud,
+                                   const char *name, size_t name_len,
+                                   reflow_error *err);
+    /* Maximum recursion depth for x-include. */
+    int max_depth;
+} interpret_include_hooks;
+
+/*
  * Render a compiled IR tree into `out`.
  *
  *   arena         : render-scope allocations (freed by caller via
@@ -40,6 +63,8 @@
  *   globals       : $ scope; may be NULL for none.
  *   L, helpers_ref: helper registry table stored in the Lua registry via
  *                   luaL_ref; pass LUA_NOREF when no helpers are registered.
+ *   hooks         : x-include support; NULL disables x-include (a template
+ *                   using it will report a runtime error).
  *
  * Returns 0 on success; -1 on runtime error (err set).
  */
@@ -48,6 +73,7 @@ int interpret_render(arena_t *arena,
                      reflow_value  *globals,
                      lua_State     *L,
                      int            helpers_ref,
+                     const interpret_include_hooks *hooks,
                      buf_t         *out,
                      reflow_error  *err);
 
