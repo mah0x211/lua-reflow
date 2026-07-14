@@ -54,6 +54,7 @@ build = {
                 "src/ir.c",
                 "src/directives.c",
                 "src/parser.c",
+                "src/compile.c",
                 "src/expr/parse.c",
                 "src/expr/eval.c",
                 "deps/yyjson/src/yyjson.c",
