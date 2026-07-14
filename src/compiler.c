@@ -34,6 +34,7 @@
 #include "parser.h"
 #include "renderer.h"
 #include "scope.h"
+#include "selector/parse.h"
 #include "value.h"
 // depend
 #include "lauxhlib.h"
@@ -521,6 +522,171 @@ static int parse_html_lua(lua_State *L)
 /* compile_template test hook — dumps the IR tree as a table    */
 /* ============================================================ */
 
+static const char *ATTR_OP_NAMES[] = {
+    NULL, "=", "~=", "|=", "^=", "$=", "*=",
+};
+
+static const char *PSEUDO_NAMES[] = {
+    "first-child", "last-child", "only-child",
+    "first-of-type", "last-of-type", "only-of-type",
+    "nth-child", "nth-last-child", "nth-of-type", "nth-last-of-type",
+};
+
+static void push_compound(lua_State *L, const sel_compound *c)
+{
+    lua_newtable(L);
+    lua_pushliteral(L, "compound");
+    lua_setfield(L, -2, "type");
+    if (c->tag) {
+        lua_pushlstring(L, c->tag, c->tag_len);
+    } else {
+        lua_pushnil(L);
+    }
+    lua_setfield(L, -2, "tag");
+    if (c->id) {
+        lua_pushlstring(L, c->id, c->id_len);
+    } else {
+        lua_pushnil(L);
+    }
+    lua_setfield(L, -2, "id");
+
+    lua_createtable(L, (int)c->n_classes, 0);
+    for (size_t i = 0; i < c->n_classes; i++) {
+        lua_pushlstring(L, c->classes[i], c->class_lens[i]);
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "classes");
+
+    lua_createtable(L, (int)c->n_attrs, 0);
+    for (size_t i = 0; i < c->n_attrs; i++) {
+        lua_newtable(L);
+        lua_pushlstring(L, c->attrs[i].name, c->attrs[i].name_len);
+        lua_setfield(L, -2, "name");
+        if (c->attrs[i].op == SEL_ATTR_OP_NONE) {
+            lua_pushnil(L);
+        } else {
+            lua_pushstring(L, ATTR_OP_NAMES[c->attrs[i].op]);
+        }
+        lua_setfield(L, -2, "op");
+        if (c->attrs[i].value) {
+            lua_pushlstring(L, c->attrs[i].value, c->attrs[i].value_len);
+        } else {
+            lua_pushnil(L);
+        }
+        lua_setfield(L, -2, "value");
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "attrs");
+
+    lua_createtable(L, (int)c->n_pseudos, 0);
+    for (size_t i = 0; i < c->n_pseudos; i++) {
+        lua_newtable(L);
+        lua_pushstring(L, PSEUDO_NAMES[c->pseudos[i].name]);
+        lua_setfield(L, -2, "name");
+        int has_arg = c->pseudos[i].name >= SEL_PSEUDO_NTH_CHILD;
+        if (has_arg) {
+            lua_pushinteger(L, (lua_Integer)c->pseudos[i].n);
+        } else {
+            lua_pushnil(L);
+        }
+        lua_setfield(L, -2, "n");
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "pseudos");
+}
+
+static int parse_selector_lua(lua_State *L)
+{
+    size_t      slen = 0;
+    const char *src  = luaL_checklstring(L, 1, &slen);
+
+    compile_arena *arena = compile_arena_new(L, 4096);
+    reflow_error   err   = {0};
+    sel_compiled  *sel   = selector_parse(arena, L, src, slen, &err);
+
+    if (!sel) {
+        lua_pop(L, 1);
+        lua_pushnil(L);
+        lua_newtable(L);
+        lua_pushstring(L, err.type ? err.type : "ReflowSelectorError");
+        lua_setfield(L, -2, "type");
+        lua_pushstring(L, err.message ? err.message : "parse error");
+        lua_setfield(L, -2, "message");
+        if (err.reason) {
+            lua_pushstring(L, err.reason);
+            lua_setfield(L, -2, "reason");
+        }
+        if (err.source) {
+            lua_pushstring(L, err.source);
+            lua_setfield(L, -2, "source");
+        }
+        lua_pushinteger(L, (lua_Integer)err.position);
+        lua_setfield(L, -2, "position");
+        if (err.feature) {
+            lua_pushstring(L, err.feature);
+            lua_setfield(L, -2, "feature");
+        }
+        if (err.line > 0) {
+            lua_pushinteger(L, (lua_Integer)err.line);
+            lua_setfield(L, -2, "line");
+        }
+        if (err.column > 0) {
+            lua_pushinteger(L, (lua_Integer)err.column);
+            lua_setfield(L, -2, "column");
+        }
+        return 2;
+    }
+
+    /* Build result table before dropping arena so string pointers stay
+     * valid while lua_pushlstring copies them into Lua. */
+    lua_newtable(L);
+    lua_pushliteral(L, "list");
+    lua_setfield(L, -2, "type");
+    lua_pushlstring(L, sel->source, sel->source_len);
+    lua_setfield(L, -2, "source");
+    lua_pushboolean(L, sel->has_positional);
+    lua_setfield(L, -2, "hasPositional");
+
+    lua_createtable(L, (int)sel->n_selectors, 0);
+    for (size_t i = 0; i < sel->n_selectors; i++) {
+        const sel_complex *cx = &sel->selectors[i];
+        lua_newtable(L);
+        lua_pushliteral(L, "complex");
+        lua_setfield(L, -2, "type");
+
+        lua_createtable(L, (int)cx->n_parts, 0);
+        for (size_t j = 0; j < cx->n_parts; j++) {
+            lua_newtable(L);
+            switch (cx->parts[j].combinator) {
+            case SEL_COMB_NONE:
+                lua_pushnil(L);
+                break;
+            case SEL_COMB_DESCENDANT:
+                lua_pushliteral(L, " ");
+                break;
+            case SEL_COMB_CHILD:
+                lua_pushliteral(L, ">");
+                break;
+            }
+            lua_setfield(L, -2, "combinator");
+            push_compound(L, &cx->parts[j].compound);
+            lua_setfield(L, -2, "compound");
+            lua_rawseti(L, -2, (int)(j + 1));
+        }
+        lua_setfield(L, -2, "parts");
+        lua_rawseti(L, -2, (int)(i + 1));
+    }
+    lua_setfield(L, -2, "selectors");
+
+    /* pop arena — result is fully copied into Lua state now */
+    lua_remove(L, -2);
+    return 1;
+}
+
+/* ============================================================ */
+/* compile_template test hook — dumps the IR tree as a table    */
+/* ============================================================ */
+
 static void ir_to_lua(lua_State *L, const ir_node *node);
 
 static void ir_children_to_lua(lua_State *L,
@@ -949,6 +1115,7 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"dir_is_known",     dir_is_known_lua    },
         {"dir_group",        dir_group_lua       },
         {"parse_html",       parse_html_lua      },
+        {"parse_selector",   parse_selector_lua  },
         {"compile_template", compile_template_lua},
         {"render",           render_lua          },
         /* State-based public API (used by lua/reflow.lua). */
