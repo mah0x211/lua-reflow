@@ -63,6 +63,7 @@ build = {
                 "src/renderer.c",
                 "src/expr/parse.c",
                 "src/expr/eval.c",
+                "src/selector/parse.c",
                 "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
