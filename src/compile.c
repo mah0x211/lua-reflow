@@ -474,11 +474,42 @@ static int validate_combinations(compile_ctx *cc, ir_directives *d,
                        "/ x-break-if on a child");
         return -1;
     }
-    /* x-data and x-with binding-name collision */
+    /* x-data and x-with binding-name collision: parse x-data JSON5 keys
+     * against a scratch arena so we can enforce the "same name declared
+     * twice" rule without keeping the pre-parsed tree. */
     if (d->data_raw != NULL && d->with_bindings != NULL) {
-        /* We cannot cheaply extract data names without re-parsing the raw
-         * JSON5; defer this collision check to stage 3 or when x-data
-         * pre-parsing lands. */
+        char scratch[8192];
+        arena_t validation;
+        arena_init(&validation, scratch, sizeof(scratch));
+        reflow_error verr = {0};
+        reflow_value *data_val = directives_parse_data(
+            cc->arena, cc->L, &validation,
+            d->data_raw, d->data_raw_len, &verr);
+        if (data_val == NULL) {
+            /* Already validated once; a failure here means arena was
+             * too small. Propagate defensively. */
+            arena_destroy(&validation);
+            compile_errorf(cc, "%s",
+                verr.message ? verr.message : "x-data: parse error");
+            return -1;
+        }
+        for (size_t i = 0; i < d->n_with; i++) {
+            const char *wname = d->with_bindings[i].name;
+            size_t wlen = strlen(wname);
+            for (size_t j = 0; j < data_val->object.len; j++) {
+                const rv_prop *p = &data_val->object.props[j];
+                if (p->key_len == wlen &&
+                    memcmp(p->key, wname, wlen) == 0) {
+                    arena_destroy(&validation);
+                    compile_errorf(cc,
+                        "name \"%s\" declared by both x-data and x-with "
+                        "on the same element",
+                        wname);
+                    return -1;
+                }
+            }
+        }
+        arena_destroy(&validation);
     }
     return 0;
 }
