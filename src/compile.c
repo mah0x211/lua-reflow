@@ -228,6 +228,25 @@ static char *dup_str(compile_ctx *cc, const char *s, size_t n)
     return out;
 }
 
+/* Duplicate `s` into arena while lowercasing ASCII letters.  HTML
+ * attribute names are case-insensitive; storing them lowercased once
+ * lets every downstream consumer (directive detection, selector
+ * matching, x-bind lookup) compare with plain memcmp. */
+static char *dup_lower_str(compile_ctx *cc, const char *s, size_t n)
+{
+    if (s == NULL) {
+        return NULL;
+    }
+    char *out = (char *)compile_arena_alloc(cc->arena, cc->L, n + 1);
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
+        out[i] = c;
+    }
+    out[n] = '\0';
+    return out;
+}
+
 /* Bit positions for directive groups (packed to fit in an unsigned). */
 static unsigned group_bit(char g)
 {
@@ -912,18 +931,23 @@ static void cb_element(void *ud,
 
     unsigned groups = 0;
     for (size_t i = 0; i < n_attrs; i++) {
-        const char *an = attrs[i].name;
-        size_t      al = attrs[i].name_len;
+        /* Lowercase the attribute name up front so every downstream
+         * consumer (directive prefix match, selector matcher, x-bind
+         * lookup) can compare with plain memcmp. HTML attribute names
+         * are case-insensitive and JS reference lowercases them too. */
+        char       *an_lower = dup_lower_str(cc, attrs[i].name,
+                                             attrs[i].name_len);
+        const char *an       = an_lower;
+        size_t      al       = attrs[i].name_len;
 
         /* Split by prefix. */
         bool is_directive = (al >= cc->prefix_len &&
                              memcmp(an, cc->prefix, cc->prefix_len) == 0);
         if (!is_directive) {
-            char *aname = dup_str(cc, an, al);
             char *aval = (attrs[i].value != NULL)
                          ? dup_str(cc, attrs[i].value, attrs[i].value_len)
                          : NULL;
-            ir_add_attr(cc->arena, cc->L, node, aname, aval);
+            ir_add_attr(cc->arena, cc->L, node, an_lower, aval);
             continue;
         }
         if (process_x_directive(cc, node, an, al,
