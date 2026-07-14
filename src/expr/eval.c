@@ -384,7 +384,7 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
                     props[i].key = dst;
                     props[i].key_len = len;
                 } else {
-                    eval_error(err, "computed key must be string or number");
+                    eval_error(err, "computed key must evaluate to a string or number");
                     return rv_undef();
                 }
             } else {
