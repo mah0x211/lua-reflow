@@ -923,3 +923,55 @@ int interpret_render(arena_t *arena,
     }
     return 0;
 }
+
+/*
+ * Render a single element into `out` using the same code path as
+ * interpret_render but without walking the enclosing tree.  Used by
+ * the selector fragment path: the caller has already located `target`
+ * inside a compiled template and confirmed that no ancestor requires
+ * runtime execution (no chain / match / x-for / x-each / x-with /
+ * x-data on the ascent).  Under that contract the target renders as
+ * if it were the sole child of a root document.
+ *
+ * The target's own directives (x-text, x-html, x-bind, x-for, x-each,
+ * x-match, x-include) are honoured — render_element dispatches to
+ * x-for / x-each iteration when present, so a multi-emission target
+ * produces the concatenated output.
+ */
+int interpret_render_fragment(arena_t *arena,
+                              const ir_node *target,
+                              reflow_value  *globals,
+                              lua_State     *L,
+                              int            helpers_ref,
+                              const char    *template_name,
+                              const char    *html,
+                              size_t         html_len,
+                              const interpret_include_hooks *hooks,
+                              buf_t         *out,
+                              reflow_error  *err)
+{
+    render_ctx rc = {
+        .arena         = arena,
+        .out           = out,
+        .L             = L,
+        .helpers_ref   = helpers_ref,
+        .err           = err,
+        .template_name = template_name,
+        .html          = html,
+        .html_len      = html_len,
+        .current_element = NULL,
+        .hooks         = hooks,
+        .include_depth = 0,
+    };
+    scope_env_init(&rc.env, globals);
+
+    render_result rr = render_element(&rc, target);
+    if (rr == RR_BREAK) {
+        render_errorf(&rc, "x-break outside of a loop reached top of tree");
+        return -1;
+    }
+    if (rr == RR_ERROR) {
+        return -1;
+    }
+    return 0;
+}
