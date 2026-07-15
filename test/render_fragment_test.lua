@@ -126,7 +126,11 @@ function testcase.positional_pseudo_reports_unsupported()
     assert.equal(err.feature, 'fragment:positional')
 end
 
-function testcase.ancestor_with_x_if_reports_unsupported()
+-- ============================================================
+-- ancestor control flow: now supported (stage 3b)
+-- ============================================================
+
+function testcase.ancestor_x_if_selects_shown_branch()
     local r = make([[
 <div>
   <section x-if="$.show">
@@ -134,24 +138,46 @@ function testcase.ancestor_with_x_if_reports_unsupported()
   </section>
 </div>
 ]])
-    -- h1 is inside a chain branch (section as x-if). Reject cleanly.
-    local err = fail(r, 't', nil, '#title')
-    assert.equal(err.reason, 'unsupported')
-    -- Either flagged as ancestor-control (section is chain branch) or
-    -- another follow-up-stage feature — either way the reason must
-    -- be `unsupported` and the feature must start with 'fragment:'.
-    assert(err.feature:sub(1, 9) == 'fragment:',
-        ('feature %q missing fragment: prefix'):format(tostring(err.feature)))
+    assert.equal(r:render('t', '{show:true}', '#title'),
+        '<h1 id="title">Hi</h1>')
+
+    -- Branch not chosen → no_match at render time.
+    local err = fail(r, 't', '{show:false}', '#title')
+    assert.equal(err.reason, 'no_match')
 end
 
-function testcase.chain_branch_target_reports_unsupported()
+function testcase.chain_branch_target_via_runtime_selection()
+    -- Each <p> is a chain branch; the selector `p` finds all three, but
+    -- only the currently selected branch emits — the render layer
+    -- filters through the runtime chain check.
     local r = make(
         '<p x-if="$.a">A</p><p x-elseif="$.b">B</p><p x-else>C</p>')
-    local err = fail(r, 't', '{a:false,b:false}', 'p')
-    -- Every p is a chain branch — either flagged as multi-match (three
-    -- candidates) or branch-target. Both are valid rejections; assert
-    -- the shape rather than the exact reason.
-    assert.equal(err.type, 'ReflowSelectorError')
+    assert.equal(r:render('t', '{a:true}',           'p'), '<p>A</p>')
+    assert.equal(r:render('t', '{a:false,b:true}',   'p'), '<p>B</p>')
+    assert.equal(r:render('t', '{a:false,b:false}',  'p'), '<p>C</p>')
+end
+
+function testcase.ancestor_x_data_pushes_scope()
+    local r = make(
+        [[<section x-data="cfg: {name: 'world'}"><h1 id="t" x-text="@cfg.name">?</h1></section>]])
+    assert.equal(r:render('t', nil, '#t'), '<h1 id="t">world</h1>')
+end
+
+function testcase.ancestor_x_for_iterates_and_multi_matches()
+    local r = make(
+        '<ul><li x-for="i=1,3" x-text=".i"></li></ul>')
+    -- The single <li> statically matches once, but at render time it
+    -- emits 3 times.  Single-fragment contract must reject.
+    local err = fail(r, 't', nil, 'li')
+    assert.equal(err.reason, 'multiple_matches')
+end
+
+function testcase.ancestor_x_each_single_iteration_ok()
+    -- Ancestor produces exactly one iteration → single match.
+    local r = make(
+        '<div x-each="i in $.list"><p id="only" x-text=".i.name">?</p></div>')
+    assert.equal(r:render('t', "{list:[{name:'x'}]}", '#only'),
+        '<p id="only">x</p>')
 end
 
 -- ============================================================
