@@ -461,29 +461,16 @@ static bool eval_positional_from_candidate(void *ud,
 
 /* --- x-include cross-template fragment search --- */
 
-typedef struct {
-    buf_t         first_match;
-    size_t        match_count;
-    reflow_state *s;
-    lua_State    *L;
-    const interpret_include_hooks *hooks;
-    arena_t      *rarena;
-    const sel_compiled *sel;
-    const char *stack[64];
-    size_t      stack_len[64];
-    int         depth;
-    int         max_depth;
-} frag_search_ctx;
-
-/* Look up a compiled template entry by name.  Returns 0 on success and
- * populates *out_root / *out_sindex / *out_html / *out_hlen.  Returns
- * -1 when the entry is missing. */
-static int fetch_template_entry(lua_State *L, reflow_state *s,
-                                const char *tname, size_t tname_len,
-                                ir_node **out_root,
-                                const sel_index **out_sindex,
-                                const char **out_html, size_t *out_hlen)
+/* Adapter: fetch a template entry from a reflow_state's templates_ref
+ * table.  Entries are the legacy {arena, root, html, index} tables. */
+static int state_fetch_template_entry(void *ud, lua_State *L,
+                                      const char *tname, size_t tname_len,
+                                      ir_node **out_root,
+                                      const sel_index **out_sindex,
+                                      const char **out_html,
+                                      size_t *out_hlen)
 {
+    reflow_state *s = (reflow_state *)ud;
     lua_rawgeti(L, LUA_REGISTRYINDEX, s->templates_ref);
     lua_pushlstring(L, tname, tname_len);
     lua_rawget(L, -2);
@@ -503,7 +490,7 @@ static int fetch_template_entry(lua_State *L, reflow_state *s,
     return 0;
 }
 
-static int frag_search(frag_search_ctx *ctx,
+int reflow_frag_search(frag_search_pub *ctx,
                        const char *tname, size_t tname_len,
                        ir_node *root, const sel_index *sindex,
                        const char *html, size_t html_len,
@@ -515,7 +502,7 @@ static int frag_search(frag_search_ctx *ctx,
  * performs safety checks, looks up the target template, and recurses
  * frag_search on it. */
 typedef struct {
-    frag_search_ctx *ctx;
+    frag_search_pub *ctx;
     const ir_node   *include_el;
     reflow_error    *err;
 } include_reach_ud;
@@ -523,7 +510,7 @@ typedef struct {
 static int include_reach_cb(void *ud, lua_State *L, reflow_error *err)
 {
     include_reach_ud *rud = (include_reach_ud *)ud;
-    frag_search_ctx  *ctx = rud->ctx;
+    frag_search_pub  *ctx = rud->ctx;
     const ir_node    *el  = rud->include_el;
     const expr_node  *include_expr = el->element.directives.include_expr;
     (void)err;
@@ -575,9 +562,9 @@ static int include_reach_cb(void *ud, lua_State *L, reflow_error *err)
     const sel_index *tgt_sidx  = NULL;
     const char      *tgt_html  = NULL;
     size_t           tgt_hlen  = 0;
-    if (fetch_template_entry(ctx->L, ctx->s, target_name, target_len,
-                             &tgt_root, &tgt_sidx,
-                             &tgt_html, &tgt_hlen) != 0) {
+    if (ctx->fetch(ctx->fetch_ud, ctx->L, target_name, target_len,
+                   &tgt_root, &tgt_sidx,
+                   &tgt_html, &tgt_hlen) != 0) {
         rud->err->type      = "ReflowIncludeError";
         rud->err->message   = "template not found";
         rud->err->reason    = "not_found";
@@ -591,7 +578,7 @@ static int include_reach_cb(void *ud, lua_State *L, reflow_error *err)
     ctx->depth++;
     /* Recurse with the outer globals — for this stage we do not seed
      * initial data from an x-with on the include element (deferred). */
-    int rc = frag_search(ctx, target_name, target_len,
+    int rc = reflow_frag_search(ctx, target_name, target_len,
                          tgt_root, tgt_sidx, tgt_html, tgt_hlen,
                          /*globals=*/NULL,
                          rud->err);
@@ -599,7 +586,7 @@ static int include_reach_cb(void *ud, lua_State *L, reflow_error *err)
     return rc;
 }
 
-static int frag_search(frag_search_ctx *ctx,
+int reflow_frag_search(frag_search_pub *ctx,
                        const char *tname, size_t tname_len,
                        ir_node *root, const sel_index *sindex,
                        const char *html, size_t html_len,
@@ -668,7 +655,7 @@ static int frag_search(frag_search_ctx *ctx,
                         rchildren, n_rchildren,
                         group_els, group_ud, group_n,
                         eval_positional_from_candidate,
-                        globals, ctx->L, ctx->s->helpers_ref,
+                        globals, ctx->L, ctx->helpers_ref,
                         tname, html, html_len, ctx->hooks,
                         &group_out, &frerr);
                 if (fres == INTERPRET_FRAG_ERROR) {
@@ -703,7 +690,7 @@ static int frag_search(frag_search_ctx *ctx,
                 interpret_fragment_result fres =
                     interpret_render_fragment_at(
                         ctx->rarena, target, globals, ctx->L,
-                        ctx->s->helpers_ref, tname, html, html_len,
+                        ctx->helpers_ref, tname, html, html_len,
                         ctx->hooks, &local, &frerr);
                 if (fres == INTERPRET_FRAG_ERROR) {
                     lua_pop(ctx->L, 1);
@@ -736,7 +723,7 @@ static int frag_search(frag_search_ctx *ctx,
             size_t reached = 0;
             int rc = interpret_execute_at(
                 ctx->rarena, include_el, globals, ctx->L,
-                ctx->s->helpers_ref, tname, html, html_len, ctx->hooks,
+                ctx->helpers_ref, tname, html, html_len, ctx->hooks,
                 include_reach_cb, &iud, &reached, err);
             if (rc != 0) {
                 lua_pop(ctx->L, 1);
@@ -789,23 +776,25 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
     /* Set up the shared match state and dispatch through frag_search,
      * which handles both same-template resolution and x-include
      * cross-template fallback with a shared match count. */
-    frag_search_ctx ctx = {0};
+    frag_search_pub ctx = {0};
     if (buf_init(&ctx.first_match) != 0) {
         arena_destroy(rarena);
         return luaL_error(L, "out of memory");
     }
-    ctx.s          = s;
-    ctx.L          = L;
-    ctx.hooks      = hooks;
-    ctx.rarena     = rarena;
-    ctx.sel        = sel;
-    ctx.max_depth  = s->max_include_depth;
+    ctx.L           = L;
+    ctx.helpers_ref = s->helpers_ref;
+    ctx.hooks       = hooks;
+    ctx.rarena      = rarena;
+    ctx.sel         = sel;
+    ctx.fetch       = state_fetch_template_entry;
+    ctx.fetch_ud    = s;
+    ctx.max_depth   = s->max_include_depth;
     ctx.stack[ctx.depth]     = name;
     ctx.stack_len[ctx.depth] = strlen(name);
     ctx.depth++;
 
     reflow_error serr = {0};
-    int rc = frag_search(&ctx, name, strlen(name),
+    int rc = reflow_frag_search(&ctx, name, strlen(name),
                          root, sindex, html, html_len,
                          globals, &serr);
     if (rc != 0) {

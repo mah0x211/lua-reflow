@@ -26,6 +26,13 @@
 
 #include <lauxlib.h>
 #include <lua.h>
+#include "arena.h"
+#include "buf.h"
+#include "error.h"
+#include "interpret.h"
+#include "ir.h"
+#include "selector/index.h"
+#include "selector/parse.h"
 
 /*
  * Public Lua entry points implemented in renderer.c.  They are registered
@@ -58,5 +65,51 @@ int rf_state_clear(lua_State *L);
 
 /* templates(state) -> array of names */
 int rf_state_templates(lua_State *L);
+
+/* ============================================================
+ * Fragment search — shared between the state-based path and any
+ * caller that already has a compiled template (e.g. lua_template).
+ * ============================================================ */
+
+/* Include-target fetch callback used by frag_search when the outer
+ * template has zero static candidates and recursion into x-include
+ * targets is required.  Returns 0 on success and populates the output
+ * params; -1 when the name is not registered.
+ */
+typedef int (*frag_fetch_fn_pub)(void *ud, lua_State *L,
+                                 const char *name, size_t name_len,
+                                 ir_node **out_root,
+                                 const sel_index **out_sindex,
+                                 const char **out_html,
+                                 size_t *out_hlen);
+
+typedef struct frag_search_pub {
+    buf_t         first_match;
+    size_t        match_count;
+    lua_State    *L;
+    int           helpers_ref;
+    const interpret_include_hooks *hooks;
+    arena_t      *rarena;
+    const sel_compiled *sel;
+    frag_fetch_fn_pub fetch;
+    void         *fetch_ud;
+    const char *stack[64];
+    size_t      stack_len[64];
+    int         depth;
+    int         max_depth;
+} frag_search_pub;
+
+/* Run a fragment search over a single compiled template.  Accumulates
+ * matches into ctx->first_match / ctx->match_count and, when the outer
+ * template yields zero candidates, walks x-include elements via
+ * ctx->fetch.  Returns 0 on success and -1 with err populated on
+ * failure.
+ */
+int reflow_frag_search(frag_search_pub *ctx,
+                       const char *tname, size_t tname_len,
+                       ir_node *root, const sel_index *sindex,
+                       const char *html, size_t html_len,
+                       reflow_value *globals,
+                       reflow_error *err);
 
 #endif /* REFLOW_RENDERER_H */
