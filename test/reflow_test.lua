@@ -43,28 +43,24 @@ end
 
 function testcase.render_missing_template_errors()
     local r = Reflow.new()
-    local ok, err = pcall(function() r:render('missing', nil) end)
-    assert.is_false(ok)
-    assert.match(err, 'not registered')
+    local html, err = r:render('missing', nil)
+    assert.is_nil(html)
+    assert.match(err.message, 'not registered')
 end
 
 function testcase.compile_error_surfaces()
     local r = Reflow.new()
-    local ok, err = pcall(function()
-        r:compile('bad', '<div x-unknown="x">y</div>')
-    end)
-    assert.is_false(ok)
-    assert.match(err, 'unknown directive')
+    local self, err = r:compile('bad', '<div x-unknown="x">y</div>')
+    assert.is_nil(self)
+    assert.match(err.message, 'unknown directive')
 end
 
 function testcase.render_directive_error_surfaces()
     local r = Reflow.new()
     r:compile('t', [[<div x-html="$.n"></div>]])
-    local ok, err = pcall(function()
-        r:render('t', [[{n: 42}]])
-    end)
-    assert.is_false(ok)
-    assert.match(err, 'value must be a string')
+    local html, err = r:render('t', [[{n: 42}]])
+    assert.is_nil(html)
+    assert.match(err.message, 'value must be a string')
 end
 
 -- ===== templates =====
@@ -126,11 +122,10 @@ end
 function testcase.compile_before_helper_registration_errors()
     -- Helpers must be registered before compile validates references.
     local r = Reflow.new()
-    local ok, err = pcall(function()
-        r:compile('t', [[<span x-text="unknownfn($.n)"></span>]])
-    end)
-    assert.is_false(ok)
-    assert.match(err, 'unknown helper')
+    local self, err = r:compile('t',
+        [[<span x-text="unknownfn($.n)"></span>]])
+    assert.is_nil(self)
+    assert.match(err.message, 'unknown helper')
 end
 
 -- ===== custom prefix =====
