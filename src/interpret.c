@@ -975,3 +975,482 @@ int interpret_render_fragment(arena_t *arena,
     }
     return 0;
 }
+
+/* ============================================================
+ * Fragment rendering with ancestor control flow
+ * ============================================================ */
+
+/* Return true when `el` (or one of its intermediate wrappers) carries
+ * a directive that affects the render of subsequent children — used
+ * to decide whether to include the element in the target's control
+ * path.  Mirrors JS elementRequiresExecution. */
+static bool fragment_requires_execution(const ir_node *el)
+{
+    if (el == NULL) return false;
+    if (el->element.is_chain_branch) return true;
+    if (el->element.is_match_branch) return true;
+    const ir_directives *d = &el->element.directives;
+    if (d->data != NULL || d->data_raw != NULL) return true;
+    if (d->n_with > 0) return true;
+    if (d->for_spec != NULL) return true;
+    if (d->each_spec != NULL) return true;
+    return false;
+}
+
+typedef struct {
+    render_ctx    *rc;
+    const ir_node *target;
+    buf_t         *out;             /* final captured emission (single) */
+    size_t         emission_count;
+    const ir_node **path;
+    size_t          path_len;
+} fragment_ctx;
+
+/* Return the chain branch index currently selected by the env; -1
+ * when no branch matches, -2 on evaluation error. */
+static long fragment_chain_selected(render_ctx *rc, const ir_node *chain)
+{
+    for (size_t i = 0; i < chain->chain.n_branches; i++) {
+        const ir_branch *br = &chain->chain.branches[i];
+        if (br->cond == NULL) return (long)i;
+        reflow_value v;
+        if (eval_expr(rc, br->cond, &v) != RR_OK) return -2;
+        if (rv_is_truthy(&v)) return (long)i;
+    }
+    return -1;
+}
+
+static long fragment_match_selected(render_ctx *rc, const ir_node *match_el)
+{
+    const ir_match *m = match_el->element.directives.match;
+    reflow_value mv;
+    if (eval_expr(rc, m->expr, &mv) != RR_OK) return -2;
+    long fallback = -1;
+    for (size_t i = 0; i < m->n_branches; i++) {
+        const ir_branch *br = &m->branches[i];
+        if (br->cond == NULL) {
+            /* nocase — remember as the fallback but keep looking for
+             * a case that matches. */
+            if (fallback < 0) fallback = (long)i;
+            continue;
+        }
+        reflow_value cv;
+        if (eval_expr(rc, br->cond, &cv) != RR_OK) return -2;
+        if (rv_strict_eq(&mv, &cv)) return (long)i;
+    }
+    return fallback;
+}
+
+static render_result fragment_check_own_branch(render_ctx *rc,
+                                               const ir_node *target,
+                                               bool *out_ok)
+{
+    *out_ok = true;
+    if (target->element.is_chain_branch) {
+        long chosen = fragment_chain_selected(rc,
+            target->element.chain_parent);
+        if (chosen == -2) return RR_ERROR;
+        *out_ok = (chosen == (long)target->element.chain_branch);
+        return RR_OK;
+    }
+    if (target->element.is_match_branch) {
+        long chosen = fragment_match_selected(rc,
+            target->element.parent);
+        if (chosen == -2) return RR_ERROR;
+        *out_ok = (chosen == (long)target->element.match_branch);
+        return RR_OK;
+    }
+    return RR_OK;
+}
+
+static render_result fragment_walk(fragment_ctx *fc, size_t idx);
+
+/* Emit target with the given own frames already active.  Wrapper used
+ * by fragment_emit_target so target's x-for / x-each iterations are
+ * counted individually as separate emissions to match the JS single-
+ * fragment contract. */
+static render_result fragment_capture_once(fragment_ctx *fc)
+{
+    buf_t local;
+    if (buf_init(&local) != 0) {
+        render_errorf(fc->rc, "out of memory");
+        return RR_ERROR;
+    }
+    buf_t *saved_out = fc->rc->out;
+    fc->rc->out = &local;
+    render_result rr;
+    /* Chain / match branch targets skip the wrapper's dispatch and go
+     * straight into the per-instance body. */
+    if (fc->target->element.is_chain_branch ||
+        fc->target->element.is_match_branch) {
+        rr = render_element_once(fc->rc, fc->target);
+    } else {
+        /* render_element_once — target's iteration is handled by the
+         * fragment layer, so we render this instance only. */
+        rr = render_element_once(fc->rc, fc->target);
+    }
+    fc->rc->out = saved_out;
+    if (rr == RR_ERROR) {
+        buf_free(&local);
+        return RR_ERROR;
+    }
+    if (rr == RR_BREAK) {
+        buf_free(&local);
+        return RR_OK;
+    }
+    if (fc->emission_count == 0) {
+        if (buf_put(fc->out, local.data, local.len) != 0) {
+            buf_free(&local);
+            render_errorf(fc->rc, "out of memory");
+            return RR_ERROR;
+        }
+    }
+    fc->emission_count++;
+    buf_free(&local);
+    return (fc->emission_count > 1) ? RR_BREAK : RR_OK;
+}
+
+static render_result fragment_emit_target(fragment_ctx *fc)
+{
+    bool branch_ok;
+    if (fragment_check_own_branch(fc->rc, fc->target, &branch_ok) != RR_OK) {
+        return RR_ERROR;
+    }
+    if (!branch_ok) return RR_OK;
+
+    const ir_directives *d = &fc->target->element.directives;
+
+    /* Target's own x-for: each iteration is a distinct emission per
+     * JS single-fragment contract. */
+    if (d->for_spec != NULL) {
+        const ir_for_spec *fs = d->for_spec;
+        double stepv = fs->step;
+        bool ascending = stepv > 0;
+        for (double i = fs->start;
+             ascending ? i <= fs->stop : i >= fs->stop;
+             i += stepv) {
+            reflow_value item;
+            item.tag = RV_NUMBER;
+            item.number = i;
+            rv_prop pf = { .key = fs->var_name,
+                           .key_len = strlen(fs->var_name),
+                           .value = item };
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = &pf;
+            frame.object.len    = 1;
+            frame.object.cap    = 1;
+            scope_push_frame(&fc->rc->env, SCOPE_FRAME_LOOP, &frame);
+            size_t frames_before = fc->rc->env.n_frames - 1;
+            if (push_data_scope(fc->rc, d) != RR_OK ||
+                push_with_scope(fc->rc, d) != RR_OK) {
+                while (fc->rc->env.n_frames > frames_before) {
+                    scope_pop_frame(&fc->rc->env);
+                }
+                return RR_ERROR;
+            }
+            render_result rr = fragment_capture_once(fc);
+            while (fc->rc->env.n_frames > frames_before) {
+                scope_pop_frame(&fc->rc->env);
+            }
+            if (rr == RR_ERROR) return RR_ERROR;
+            if (fc->emission_count > 1) return RR_BREAK;
+        }
+        return RR_OK;
+    }
+    if (d->each_spec != NULL) {
+        const ir_each_spec *es = d->each_spec;
+        reflow_value coll;
+        if (eval_expr(fc->rc, es->collection, &coll) != RR_OK) return RR_ERROR;
+        if (coll.tag != RV_ARRAY && coll.tag != RV_OBJECT) {
+            render_errorf(fc->rc, "x-each: expected array or object");
+            return RR_ERROR;
+        }
+        size_t n = (coll.tag == RV_ARRAY) ? coll.array.len : coll.object.len;
+        for (size_t i = 0; i < n; i++) {
+            reflow_value item;
+            if (coll.tag == RV_ARRAY) {
+                item = coll.array.items[i];
+            } else {
+                item = coll.object.props[i].value;
+            }
+            rv_prop props[2];
+            size_t nprops = 0;
+            props[nprops].key     = es->item_name;
+            props[nprops].key_len = strlen(es->item_name);
+            props[nprops].value   = item;
+            nprops++;
+            if (es->index_name != NULL) {
+                reflow_value iv;
+                iv.tag = RV_NUMBER;
+                iv.number = (double)i;
+                props[nprops].key     = es->index_name;
+                props[nprops].key_len = strlen(es->index_name);
+                props[nprops].value   = iv;
+                nprops++;
+            }
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = props;
+            frame.object.len    = nprops;
+            frame.object.cap    = nprops;
+            scope_push_frame(&fc->rc->env, SCOPE_FRAME_LOOP, &frame);
+            size_t frames_before = fc->rc->env.n_frames - 1;
+            if (push_data_scope(fc->rc, d) != RR_OK ||
+                push_with_scope(fc->rc, d) != RR_OK) {
+                while (fc->rc->env.n_frames > frames_before) {
+                    scope_pop_frame(&fc->rc->env);
+                }
+                return RR_ERROR;
+            }
+            render_result rr = fragment_capture_once(fc);
+            while (fc->rc->env.n_frames > frames_before) {
+                scope_pop_frame(&fc->rc->env);
+            }
+            if (rr == RR_ERROR) return RR_ERROR;
+            if (fc->emission_count > 1) return RR_BREAK;
+        }
+        return RR_OK;
+    }
+
+    /* No target-level iteration.  Push own scopes and render. */
+    size_t frames_before = fc->rc->env.n_frames;
+    if (push_data_scope(fc->rc, d) != RR_OK) return RR_ERROR;
+    if (push_with_scope(fc->rc, d) != RR_OK) return RR_ERROR;
+    render_result rr;
+    if (fc->target->element.is_chain_branch ||
+        fc->target->element.is_match_branch) {
+        /* fragment_capture_once already covers this branch, but for
+         * targets without iteration we can inline the same call. */
+        rr = fragment_capture_once(fc);
+    } else {
+        /* Use render_element to honor x-match on the target. */
+        buf_t local;
+        if (buf_init(&local) != 0) {
+            while (fc->rc->env.n_frames > frames_before) {
+                scope_pop_frame(&fc->rc->env);
+            }
+            render_errorf(fc->rc, "out of memory");
+            return RR_ERROR;
+        }
+        buf_t *saved_out = fc->rc->out;
+        fc->rc->out = &local;
+        rr = render_element(fc->rc, fc->target);
+        fc->rc->out = saved_out;
+        if (rr == RR_OK) {
+            if (fc->emission_count == 0) {
+                if (buf_put(fc->out, local.data, local.len) != 0) {
+                    buf_free(&local);
+                    while (fc->rc->env.n_frames > frames_before) {
+                        scope_pop_frame(&fc->rc->env);
+                    }
+                    render_errorf(fc->rc, "out of memory");
+                    return RR_ERROR;
+                }
+            }
+            fc->emission_count++;
+        }
+        buf_free(&local);
+        if (rr == RR_BREAK) rr = RR_OK;   /* swallow break */
+    }
+    while (fc->rc->env.n_frames > frames_before) {
+        scope_pop_frame(&fc->rc->env);
+    }
+    return rr;
+}
+
+static render_result fragment_step(fragment_ctx *fc, size_t idx)
+{
+    const ir_node *step = fc->path[idx];
+
+    if (step->element.is_chain_branch) {
+        long chosen = fragment_chain_selected(fc->rc,
+            step->element.chain_parent);
+        if (chosen == -2) return RR_ERROR;
+        if (chosen != (long)step->element.chain_branch) return RR_OK;
+    }
+    if (step->element.is_match_branch) {
+        long chosen = fragment_match_selected(fc->rc,
+            step->element.parent);
+        if (chosen == -2) return RR_ERROR;
+        if (chosen != (long)step->element.match_branch) return RR_OK;
+    }
+
+    const ir_directives *d = &step->element.directives;
+
+    if (d->for_spec != NULL) {
+        const ir_for_spec *fs = d->for_spec;
+        double stepv = fs->step;
+        bool ascending = stepv > 0;
+        for (double i = fs->start;
+             ascending ? i <= fs->stop : i >= fs->stop;
+             i += stepv) {
+            reflow_value item;
+            item.tag = RV_NUMBER;
+            item.number = i;
+            rv_prop pf = { .key = fs->var_name,
+                           .key_len = strlen(fs->var_name),
+                           .value = item };
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = &pf;
+            frame.object.len    = 1;
+            frame.object.cap    = 1;
+            scope_push_frame(&fc->rc->env, SCOPE_FRAME_LOOP, &frame);
+            size_t frames_before = fc->rc->env.n_frames - 1;
+            if (push_data_scope(fc->rc, d) != RR_OK ||
+                push_with_scope(fc->rc, d) != RR_OK) {
+                while (fc->rc->env.n_frames > frames_before) {
+                    scope_pop_frame(&fc->rc->env);
+                }
+                return RR_ERROR;
+            }
+            render_result inner = fragment_walk(fc, idx + 1);
+            while (fc->rc->env.n_frames > frames_before) {
+                scope_pop_frame(&fc->rc->env);
+            }
+            if (inner == RR_ERROR) return RR_ERROR;
+            if (fc->emission_count > 1) return RR_BREAK;
+        }
+        return RR_OK;
+    }
+    if (d->each_spec != NULL) {
+        const ir_each_spec *es = d->each_spec;
+        reflow_value coll;
+        if (eval_expr(fc->rc, es->collection, &coll) != RR_OK) return RR_ERROR;
+        if (coll.tag != RV_ARRAY && coll.tag != RV_OBJECT) {
+            render_errorf(fc->rc,
+                "x-each: expected array or object");
+            return RR_ERROR;
+        }
+        size_t n = (coll.tag == RV_ARRAY) ? coll.array.len : coll.object.len;
+        for (size_t i = 0; i < n; i++) {
+            reflow_value item;
+            if (coll.tag == RV_ARRAY) {
+                item = coll.array.items[i];
+            } else {
+                item = coll.object.props[i].value;
+            }
+            rv_prop props[2];
+            size_t nprops = 0;
+            props[nprops].key     = es->item_name;
+            props[nprops].key_len = strlen(es->item_name);
+            props[nprops].value   = item;
+            nprops++;
+            if (es->index_name != NULL) {
+                reflow_value iv;
+                iv.tag = RV_NUMBER;
+                iv.number = (double)i;
+                props[nprops].key     = es->index_name;
+                props[nprops].key_len = strlen(es->index_name);
+                props[nprops].value   = iv;
+                nprops++;
+            }
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = props;
+            frame.object.len    = nprops;
+            frame.object.cap    = nprops;
+            scope_push_frame(&fc->rc->env, SCOPE_FRAME_LOOP, &frame);
+            size_t frames_before = fc->rc->env.n_frames - 1;
+            if (push_data_scope(fc->rc, d) != RR_OK ||
+                push_with_scope(fc->rc, d) != RR_OK) {
+                while (fc->rc->env.n_frames > frames_before) {
+                    scope_pop_frame(&fc->rc->env);
+                }
+                return RR_ERROR;
+            }
+            render_result inner = fragment_walk(fc, idx + 1);
+            while (fc->rc->env.n_frames > frames_before) {
+                scope_pop_frame(&fc->rc->env);
+            }
+            if (inner == RR_ERROR) return RR_ERROR;
+            if (fc->emission_count > 1) return RR_BREAK;
+        }
+        return RR_OK;
+    }
+
+    size_t frames_before = fc->rc->env.n_frames;
+    if (push_data_scope(fc->rc, d) != RR_OK ||
+        push_with_scope(fc->rc, d) != RR_OK) {
+        while (fc->rc->env.n_frames > frames_before) {
+            scope_pop_frame(&fc->rc->env);
+        }
+        return RR_ERROR;
+    }
+    render_result inner = fragment_walk(fc, idx + 1);
+    while (fc->rc->env.n_frames > frames_before) {
+        scope_pop_frame(&fc->rc->env);
+    }
+    return inner;
+}
+
+static render_result fragment_walk(fragment_ctx *fc, size_t idx)
+{
+    if (idx >= fc->path_len) {
+        return fragment_emit_target(fc);
+    }
+    return fragment_step(fc, idx);
+}
+
+interpret_fragment_result
+interpret_render_fragment_at(arena_t *arena,
+                             const ir_node *target,
+                             reflow_value  *globals,
+                             lua_State     *L,
+                             int            helpers_ref,
+                             const char    *template_name,
+                             const char    *html,
+                             size_t         html_len,
+                             const interpret_include_hooks *hooks,
+                             buf_t         *out,
+                             reflow_error  *err)
+{
+    const ir_node *chain_up[64];
+    size_t chain_len = 0;
+    for (const ir_node *cur = target->element.parent;
+         cur != NULL; cur = cur->element.parent) {
+        if (fragment_requires_execution(cur)) {
+            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
+                err->type    = "ReflowSelectorError";
+                err->message = "fragment control path exceeds depth limit";
+                err->reason  = "unsupported";
+                return INTERPRET_FRAG_ERROR;
+            }
+            chain_up[chain_len++] = cur;
+        }
+    }
+    const ir_node *path[64];
+    for (size_t i = 0; i < chain_len; i++) {
+        path[i] = chain_up[chain_len - 1 - i];
+    }
+
+    render_ctx rc = {
+        .arena         = arena,
+        .out           = out,
+        .L             = L,
+        .helpers_ref   = helpers_ref,
+        .err           = err,
+        .template_name = template_name,
+        .html          = html,
+        .html_len      = html_len,
+        .current_element = NULL,
+        .hooks         = hooks,
+        .include_depth = 0,
+    };
+    scope_env_init(&rc.env, globals);
+
+    fragment_ctx fc = {
+        .rc             = &rc,
+        .target         = target,
+        .out            = out,
+        .emission_count = 0,
+        .path           = path,
+        .path_len       = chain_len,
+    };
+    render_result rr = fragment_walk(&fc, 0);
+    if (rr == RR_ERROR) return INTERPRET_FRAG_ERROR;
+    if (fc.emission_count == 0) return INTERPRET_FRAG_NO_MATCH;
+    if (fc.emission_count > 1)  return INTERPRET_FRAG_MULTIPLE_MATCHES;
+    return INTERPRET_FRAG_OK;
+}
