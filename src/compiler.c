@@ -39,6 +39,8 @@
 #include "selector/match.h"
 #include "selector/parse.h"
 #include "selector/resolve.h"
+#include "lua_template.h"
+#include "lua_selector.h"
 #include "value.h"
 // depend
 #include "lauxhlib.h"
@@ -1471,10 +1473,26 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
      * from renderer.c produce a meaningful tostring(). */
     reflow_register_error_metatable(L);
 
+    /* Install template and selector userdata metatables so callers
+     * that receive these values directly (without going through the
+     * dedicated luaopen entrypoints) can still use their methods. */
+    reflow_template_register(L);
+    reflow_selector_register(L);
+
     lua_newtable(L);
     for (struct luaL_Reg *ptr = method; ptr->name != NULL; ptr++) {
         lauxh_pushfn2tbl(L, ptr->name, ptr->func);
     }
+
+    /* Expose the userdata factories as members on the compiler table
+     * so `require('reflow.compiler').new_template(...)` works and the
+     * thin Lua wrappers under lua/reflow/ can pick them up. */
+    lua_pushcfunction(L, luaopen_reflow_template);
+    lua_call(L, 0, 1);
+    lua_setfield(L, -2, "new_template");
+    lua_pushcfunction(L, luaopen_reflow_selector);
+    lua_call(L, 0, 1);
+    lua_setfield(L, -2, "new_selector");
 
     return 1;
 }
