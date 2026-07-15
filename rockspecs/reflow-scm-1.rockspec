@@ -44,6 +44,8 @@ build = {
     },
     modules = {
         reflow = "lua/reflow.lua",
+        ["reflow.template"] = "lua/reflow/template.lua",
+        ["reflow.selector"] = "lua/reflow/selector.lua",
         ["reflow.compiler"] = {
             sources = {
                 "src/compiler.c",
@@ -68,6 +70,8 @@ build = {
                 "src/selector/match.c",
                 "src/selector/resolve.c",
                 "src/selector/cache.c",
+                "src/lua_template.c",
+                "src/lua_selector.c",
                 "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
