@@ -1454,3 +1454,487 @@ interpret_render_fragment_at(arena_t *arena,
     if (fc.emission_count > 1)  return INTERPRET_FRAG_MULTIPLE_MATCHES;
     return INTERPRET_FRAG_OK;
 }
+
+/* ============================================================
+ * Positional fragment rendering
+ * ============================================================
+ *
+ * Walks a parent's children in emission order, capturing each
+ * candidate emission with its (index, of_type_index) position.  Once
+ * the walk completes and totals are known, evaluates the caller's
+ * predicate against each captured emission and appends surviving
+ * emissions to `out`.
+ */
+
+typedef struct {
+    const ir_node *element;
+    void          *predicate_ud;
+    char          *captured;
+    size_t         captured_len;
+    size_t         index;
+    size_t         of_type_index;
+} positional_record;
+
+typedef struct {
+    const char *tag;
+    size_t      count;
+} tag_counter;
+
+typedef struct {
+    render_ctx        *rc;
+    const ir_node    **candidates;
+    void             **candidate_ud;
+    size_t             n_candidates;
+    positional_record *records;
+    size_t             n_records;
+    size_t             cap_records;
+    size_t             total_index;
+    tag_counter        tag_counts[64];
+    size_t             n_tag_counts;
+} positional_ctx;
+
+/* Return the 1-based position (this emission's rank) among siblings of
+ * the same tag; increments the counter as a side effect. */
+static size_t pctx_increment_of_type(positional_ctx *pctx, const char *tag)
+{
+    for (size_t i = 0; i < pctx->n_tag_counts; i++) {
+        if (strcmp(pctx->tag_counts[i].tag, tag) == 0) {
+            return ++pctx->tag_counts[i].count;
+        }
+    }
+    if (pctx->n_tag_counts >= sizeof(pctx->tag_counts)/sizeof(pctx->tag_counts[0])) {
+        /* Overflow: rare, fall through as untracked (still gives count=1). */
+        return 1;
+    }
+    pctx->tag_counts[pctx->n_tag_counts].tag   = tag;
+    pctx->tag_counts[pctx->n_tag_counts].count = 1;
+    pctx->n_tag_counts++;
+    return 1;
+}
+
+static size_t pctx_of_type_total(positional_ctx *pctx, const char *tag)
+{
+    for (size_t i = 0; i < pctx->n_tag_counts; i++) {
+        if (strcmp(pctx->tag_counts[i].tag, tag) == 0) {
+            return pctx->tag_counts[i].count;
+        }
+    }
+    return 0;
+}
+
+/* Find a candidate's user data by identity, or NULL if not a
+ * candidate.  Returns the predicate_ud pointer via *out_ud on match. */
+static bool pctx_is_candidate(positional_ctx *pctx, const ir_node *el,
+                              void **out_ud)
+{
+    for (size_t i = 0; i < pctx->n_candidates; i++) {
+        if (pctx->candidates[i] == el) {
+            if (out_ud) *out_ud = pctx->candidate_ud[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+static render_result pctx_record_emission(positional_ctx *pctx,
+                                          const ir_node *el, void *ud)
+{
+    if (pctx->n_records == pctx->cap_records) {
+        size_t ncap = pctx->cap_records ? pctx->cap_records * 2 : 4;
+        positional_record *nb = (positional_record *)realloc(
+            pctx->records, ncap * sizeof(*nb));
+        if (!nb) {
+            render_errorf(pctx->rc, "out of memory");
+            return RR_ERROR;
+        }
+        pctx->records     = nb;
+        pctx->cap_records = ncap;
+    }
+    /* Capture render output. */
+    buf_t local;
+    if (buf_init(&local) != 0) {
+        render_errorf(pctx->rc, "out of memory");
+        return RR_ERROR;
+    }
+    buf_t *saved_out = pctx->rc->out;
+    pctx->rc->out = &local;
+    render_result rr = render_element_once(pctx->rc, el);
+    pctx->rc->out = saved_out;
+    if (rr == RR_ERROR) {
+        buf_free(&local);
+        return RR_ERROR;
+    }
+    if (rr == RR_BREAK) {
+        /* Break at positional emission — treat as no-op. */
+        buf_free(&local);
+        return RR_OK;
+    }
+    positional_record *rec = &pctx->records[pctx->n_records++];
+    rec->element       = el;
+    rec->predicate_ud  = ud;
+    rec->captured      = (char *)malloc(local.len + 1);
+    if (!rec->captured) {
+        buf_free(&local);
+        render_errorf(pctx->rc, "out of memory");
+        return RR_ERROR;
+    }
+    memcpy(rec->captured, local.data, local.len);
+    rec->captured[local.len] = '\0';
+    rec->captured_len = local.len;
+    rec->index         = pctx->total_index;
+    rec->of_type_index = pctx_of_type_total(pctx, el->element.tag_name);
+    buf_free(&local);
+    return RR_OK;
+}
+
+static render_result process_sibling(positional_ctx *pctx,
+                                     const ir_node *child);
+
+/* Emit a single element instance: increment counters, and if it's a
+ * candidate, capture the render output. */
+static render_result emit_instance(positional_ctx *pctx, const ir_node *el)
+{
+    pctx->total_index++;
+    if (el->element.tag_name) {
+        pctx_increment_of_type(pctx, el->element.tag_name);
+    }
+    void *ud = NULL;
+    if (pctx_is_candidate(pctx, el, &ud)) {
+        return pctx_record_emission(pctx, el, ud);
+    }
+    /* Non-candidate — no capture needed, position already accounted. */
+    return RR_OK;
+}
+
+/* Process one emission unit given the resolved emitting element (post
+ * chain / match branch selection).  Expands x-for / x-each iterations
+ * so each iteration counts as a distinct emission. */
+static render_result process_element_emission(positional_ctx *pctx,
+                                              const ir_node *el)
+{
+    if (el->element.invisible_marker) return RR_OK;
+
+    const ir_directives *d = &el->element.directives;
+    if (d->for_spec != NULL) {
+        const ir_for_spec *fs = d->for_spec;
+        double stepv = fs->step;
+        bool ascending = stepv > 0;
+        for (double i = fs->start;
+             ascending ? i <= fs->stop : i >= fs->stop;
+             i += stepv) {
+            reflow_value item;
+            item.tag = RV_NUMBER;
+            item.number = i;
+            rv_prop pf = { .key = fs->var_name,
+                           .key_len = strlen(fs->var_name),
+                           .value = item };
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = &pf;
+            frame.object.len    = 1;
+            frame.object.cap    = 1;
+            scope_push_frame(&pctx->rc->env, SCOPE_FRAME_LOOP, &frame);
+            render_result rr = emit_instance(pctx, el);
+            scope_pop_frame(&pctx->rc->env);
+            if (rr == RR_ERROR) return RR_ERROR;
+        }
+        return RR_OK;
+    }
+    if (d->each_spec != NULL) {
+        const ir_each_spec *es = d->each_spec;
+        reflow_value coll;
+        if (eval_expr(pctx->rc, es->collection, &coll) != RR_OK) return RR_ERROR;
+        if (coll.tag != RV_ARRAY && coll.tag != RV_OBJECT) {
+            render_errorf(pctx->rc, "x-each: expected array or object");
+            return RR_ERROR;
+        }
+        size_t n = (coll.tag == RV_ARRAY) ? coll.array.len : coll.object.len;
+        for (size_t i = 0; i < n; i++) {
+            reflow_value item = (coll.tag == RV_ARRAY)
+                                ? coll.array.items[i]
+                                : coll.object.props[i].value;
+            rv_prop props[2];
+            size_t nprops = 0;
+            props[nprops].key     = es->item_name;
+            props[nprops].key_len = strlen(es->item_name);
+            props[nprops].value   = item;
+            nprops++;
+            if (es->index_name != NULL) {
+                reflow_value iv;
+                iv.tag = RV_NUMBER;
+                iv.number = (double)i;
+                props[nprops].key     = es->index_name;
+                props[nprops].key_len = strlen(es->index_name);
+                props[nprops].value   = iv;
+                nprops++;
+            }
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = props;
+            frame.object.len    = nprops;
+            frame.object.cap    = nprops;
+            scope_push_frame(&pctx->rc->env, SCOPE_FRAME_LOOP, &frame);
+            render_result rr = emit_instance(pctx, el);
+            scope_pop_frame(&pctx->rc->env);
+            if (rr == RR_ERROR) return RR_ERROR;
+        }
+        return RR_OK;
+    }
+    return emit_instance(pctx, el);
+}
+
+static render_result process_sibling(positional_ctx *pctx,
+                                     const ir_node *child)
+{
+    if (child == NULL) return RR_OK;
+    if (child->type == IR_CHAIN) {
+        /* Chain: exactly one branch (or none) contributes. */
+        long chosen = -1;
+        for (size_t i = 0; i < child->chain.n_branches; i++) {
+            const ir_branch *br = &child->chain.branches[i];
+            if (br->cond == NULL) { chosen = (long)i; break; }
+            reflow_value v;
+            if (eval_expr(pctx->rc, br->cond, &v) != RR_OK) return RR_ERROR;
+            if (rv_is_truthy(&v)) { chosen = (long)i; break; }
+        }
+        if (chosen < 0) return RR_OK;
+        return process_element_emission(pctx,
+            child->chain.branches[chosen].node);
+    }
+    if (child->type == IR_ELEMENT) {
+        return process_element_emission(pctx, child);
+    }
+    /* text / comment — not counted as siblings for positional pseudos. */
+    return RR_OK;
+}
+
+/* Compute the parent's control path (ancestors requiring execution)
+ * and set up the render env with their scopes / branch selection.
+ * On success, invokes `fn` with the env prepared and pops frames on
+ * return.  Returns RR_OK / RR_ERROR forwarded from fn. */
+static render_result with_parent_control_env(fragment_ctx *fc,
+                                             const ir_node *parent,
+                                             render_result (*fn)(fragment_ctx *))
+{
+    /* Reuse fragment_step / fragment_walk by pointing target at parent
+     * and running until "path idx == path_len", but that also emits
+     * the parent — not what we want.  Instead build a mini control
+     * path just for the parent's ancestors and invoke fn once at the
+     * end. */
+    const ir_node *chain_up[64];
+    size_t chain_len = 0;
+    for (const ir_node *cur = parent ? parent->element.parent : NULL;
+         cur != NULL; cur = cur->element.parent) {
+        if (fragment_requires_execution(cur)) {
+            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
+                render_errorf(fc->rc,
+                    "fragment parent control path exceeds depth limit");
+                return RR_ERROR;
+            }
+            chain_up[chain_len++] = cur;
+        }
+    }
+    const ir_node *path[64];
+    for (size_t i = 0; i < chain_len; i++) {
+        path[i] = chain_up[chain_len - 1 - i];
+    }
+    /* Use fragment_walk with a special target-emitter that just calls
+     * fn instead of rendering.  Hack: temporarily override
+     * emission via a flag; simpler to inline the walk here. */
+    fc->path     = path;
+    fc->path_len = chain_len;
+    /* Store fn in fc via type-punning is ugly — instead do inline. */
+    (void)fn;
+    /* Not used: this function is a scaffold; positional entry point
+     * runs the walk directly. */
+    return RR_OK;
+}
+
+interpret_fragment_result
+interpret_render_fragment_positional(
+    arena_t *arena,
+    const ir_node *parent,
+    struct ir_node * const *root_children,
+    size_t         n_root_children,
+    const ir_node **candidates,
+    void         **candidate_ud,
+    size_t         n_candidates,
+    interpret_fragment_positional_eval_fn eval_fn,
+    reflow_value  *globals,
+    lua_State     *L,
+    int            helpers_ref,
+    const char    *template_name,
+    const char    *html,
+    size_t         html_len,
+    const interpret_include_hooks *hooks,
+    buf_t         *out,
+    reflow_error  *err)
+{
+    (void)with_parent_control_env;  /* scaffold, unused */
+
+    /* Build parent's ancestor control path so we render inside the
+     * correct scope / branch state. */
+    const ir_node *chain_up[64];
+    size_t chain_len = 0;
+    for (const ir_node *cur = parent ? parent->element.parent : NULL;
+         cur != NULL; cur = cur->element.parent) {
+        if (fragment_requires_execution(cur)) {
+            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
+                err->type    = "ReflowSelectorError";
+                err->message = "fragment parent control path exceeds depth limit";
+                err->reason  = "unsupported";
+                return INTERPRET_FRAG_ERROR;
+            }
+            chain_up[chain_len++] = cur;
+        }
+    }
+    /* If parent itself is on a chain/match branch or has iteration /
+     * data / with, include parent as the innermost element on the
+     * control path (its children are what we walk). */
+    const ir_node *path[64];
+    size_t path_len = 0;
+    for (size_t i = 0; i < chain_len; i++) {
+        path[path_len++] = chain_up[chain_len - 1 - i];
+    }
+    if (parent != NULL && fragment_requires_execution(parent)) {
+        if (path_len >= sizeof(path)/sizeof(path[0])) {
+            err->type    = "ReflowSelectorError";
+            err->message = "fragment parent control path exceeds depth limit";
+            err->reason  = "unsupported";
+            return INTERPRET_FRAG_ERROR;
+        }
+        path[path_len++] = parent;
+    }
+
+    render_ctx rc = {
+        .arena         = arena,
+        .out           = out,
+        .L             = L,
+        .helpers_ref   = helpers_ref,
+        .err           = err,
+        .template_name = template_name,
+        .html          = html,
+        .html_len      = html_len,
+        .current_element = NULL,
+        .hooks         = hooks,
+        .include_depth = 0,
+    };
+    scope_env_init(&rc.env, globals);
+
+    positional_ctx pctx = {0};
+    pctx.rc            = &rc;
+    pctx.candidates    = candidates;
+    pctx.candidate_ud  = candidate_ud;
+    pctx.n_candidates  = n_candidates;
+
+    /* Walk parent's ancestor control path — we need scope frames /
+     * branch selection to be active while we walk the siblings. Use
+     * fragment_walk with a hijacked terminal that runs the sibling
+     * walk instead of emitting the target. */
+    /* Set up a fragment_ctx just for the walk framework; target is
+     * unused at the terminal because we override emit. */
+    fragment_ctx fc = {
+        .rc             = &rc,
+        .target         = NULL,
+        .out            = out,
+        .emission_count = 0,
+        .path           = path,
+        .path_len       = path_len,
+    };
+    (void)fc;
+
+    /* Inline mini walk: for each ancestor in path, evaluate branch
+     * check and push frames.  At the terminal, run the sibling walk. */
+    size_t frames_start = rc.env.n_frames;
+    render_result walk_rc = RR_OK;
+    for (size_t i = 0; i < path_len && walk_rc == RR_OK; i++) {
+        const ir_node *step = path[i];
+        if (step->element.is_chain_branch) {
+            long chosen = fragment_chain_selected(&rc,
+                step->element.chain_parent);
+            if (chosen == -2) { walk_rc = RR_ERROR; break; }
+            if (chosen != (long)step->element.chain_branch) {
+                /* Branch not selected — walk aborted with zero emissions. */
+                walk_rc = RR_OK;
+                goto after_walk;
+            }
+        }
+        if (step->element.is_match_branch) {
+            long chosen = fragment_match_selected(&rc,
+                step->element.parent);
+            if (chosen == -2) { walk_rc = RR_ERROR; break; }
+            if (chosen != (long)step->element.match_branch) {
+                walk_rc = RR_OK;
+                goto after_walk;
+            }
+        }
+        const ir_directives *d = &step->element.directives;
+        if (d->for_spec != NULL || d->each_spec != NULL) {
+            /* Ancestor iteration in the positional path is out of
+             * scope for stage 3c — reject explicitly so callers can
+             * upgrade to a future stage. */
+            err->type    = "ReflowSelectorError";
+            err->message = "positional fragment with iterating ancestor "
+                           "is not yet supported";
+            err->reason  = "unsupported";
+            err->feature = "fragment:positional-iterating-ancestor";
+            walk_rc = RR_ERROR;
+            break;
+        }
+        if (push_data_scope(&rc, d) != RR_OK ||
+            push_with_scope(&rc, d) != RR_OK) {
+            walk_rc = RR_ERROR;
+            break;
+        }
+    }
+
+    if (walk_rc == RR_OK) {
+        /* Sibling walk. */
+        if (parent != NULL) {
+            for (size_t i = 0; i < parent->element.n_children; i++) {
+                walk_rc = process_sibling(&pctx,
+                    parent->element.children[i]);
+                if (walk_rc == RR_ERROR) break;
+            }
+        } else {
+            for (size_t i = 0; i < n_root_children; i++) {
+                walk_rc = process_sibling(&pctx, root_children[i]);
+                if (walk_rc == RR_ERROR) break;
+            }
+        }
+    }
+
+after_walk:
+    /* Pop all frames we pushed. */
+    while (rc.env.n_frames > frames_start) {
+        scope_pop_frame(&rc.env);
+    }
+
+    if (walk_rc == RR_ERROR) {
+        for (size_t i = 0; i < pctx.n_records; i++) free(pctx.records[i].captured);
+        free(pctx.records);
+        return INTERPRET_FRAG_ERROR;
+    }
+
+    /* Evaluate predicates on captured emissions. */
+    size_t matches = 0;
+    for (size_t i = 0; i < pctx.n_records; i++) {
+        positional_record *rec = &pctx.records[i];
+        size_t of_total = pctx_of_type_total(&pctx, rec->element->element.tag_name);
+        bool pass = eval_fn(rec->predicate_ud,
+                            rec->index, pctx.total_index,
+                            rec->of_type_index, of_total);
+        if (pass) {
+            if (matches == 0) {
+                buf_put(out, rec->captured, rec->captured_len);
+            }
+            matches++;
+        }
+    }
+    for (size_t i = 0; i < pctx.n_records; i++) free(pctx.records[i].captured);
+    free(pctx.records);
+
+    if (matches == 0) return INTERPRET_FRAG_NO_MATCH;
+    if (matches > 1)  return INTERPRET_FRAG_MULTIPLE_MATCHES;
+    return INTERPRET_FRAG_OK;
+}
