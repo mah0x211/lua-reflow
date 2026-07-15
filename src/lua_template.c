@@ -329,6 +329,33 @@ static const ir_node *template_include_lookup(void *ud,
     return t->root;
 }
 
+/* Fetch callback for reflow_frag_search when the templates argument to
+ * template:render is a Lua table mapping name → template userdata. */
+static int template_dict_fetch(void *ud, lua_State *L,
+                               const char *name, size_t name_len,
+                               ir_node **out_root,
+                               const sel_index **out_sindex,
+                               const char **out_html,
+                               size_t *out_hlen)
+{
+    struct template_include_ctx *ctx = (struct template_include_ctx *)ud;
+    if (ctx->templates_idx == 0) return -1;
+    lua_pushlstring(L, name, name_len);
+    lua_rawget(L, ctx->templates_idx);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return -1;
+    }
+    reflow_template *t = reflow_template_check(L, lua_gettop(L));
+    lua_pop(L, 1);
+    if (t == NULL) return -1;
+    *out_root   = (ir_node *)t->root;
+    *out_sindex = t->sindex;
+    *out_html   = t->html;
+    *out_hlen   = t->html_len;
+    return 0;
+}
+
 /* ------------------------------------------------------------------
  * Error push
  * ------------------------------------------------------------------ */
@@ -522,35 +549,101 @@ static int template_render(lua_State *L)
     }
 
     reflow_error rerr = {0};
-    int ok;
     if (sel != NULL) {
-        /* Fragment path.  Reuse the state-based renderer's fragment
-         * helper by pushing a temporary reflow_state-shaped struct
-         * would be ugly; instead reimplement the search here or expose
-         * a new interpret entry.  For now we call into the
-         * existing render_fragment_path by staging a minimal cache. */
-        /* TODO: implement fragment path.  For now, return an
-         * error so callers know fragments require the state-based
-         * path. */
-        (void)hooks;
+        /* Fragment path.  Reuse the shared reflow_frag_search with a
+         * template-userdata-aware fetch adapter. */
+        frag_search_pub ctx = {0};
+        if (buf_init(&ctx.first_match) != 0) {
+            buf_free(&out);
+            if (helpers_ref != LUA_NOREF) {
+                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+            }
+            arena_destroy(&rarena);
+            lua_pushnil(L);
+            lua_newtable(L);
+            lua_pushliteral(L, "ReflowRuntimeError");
+            lua_setfield(L, -2, "type");
+            lua_pushliteral(L, "out of memory");
+            lua_setfield(L, -2, "message");
+            return 2;
+        }
+        ctx.L           = L;
+        ctx.helpers_ref = helpers_ref;
+        ctx.hooks       = &hooks;
+        ctx.rarena      = &rarena;
+        ctx.sel         = sel;
+        ctx.fetch       = template_dict_fetch;
+        ctx.fetch_ud    = &ictx;
+        ctx.max_depth   = max_depth;
+
+        reflow_error serr = {0};
+        int frc = reflow_frag_search(&ctx, "", 0,
+                                     (ir_node *)t->root, t->sindex,
+                                     t->html, t->html_len,
+                                     globals, &serr);
+        if (frc != 0) {
+            buf_free(&ctx.first_match);
+            buf_free(&out);
+            if (helpers_ref != LUA_NOREF) {
+                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+            }
+            arena_destroy(&rarena);
+            lua_pushnil(L);
+            push_render_error(L, &serr, NULL);
+            return 2;
+        }
+        if (ctx.match_count == 0) {
+            buf_free(&ctx.first_match);
+            buf_free(&out);
+            if (helpers_ref != LUA_NOREF) {
+                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+            }
+            arena_destroy(&rarena);
+            lua_pushnil(L);
+            lua_newtable(L);
+            lua_pushliteral(L, "ReflowSelectorError");
+            lua_setfield(L, -2, "type");
+            lua_pushliteral(L, "no element matches the selector");
+            lua_setfield(L, -2, "message");
+            lua_pushliteral(L, "no_match");
+            lua_setfield(L, -2, "reason");
+            lua_pushlstring(L, sel->source, sel->source_len);
+            lua_setfield(L, -2, "source");
+            return 2;
+        }
+        if (ctx.match_count > 1) {
+            buf_free(&ctx.first_match);
+            buf_free(&out);
+            if (helpers_ref != LUA_NOREF) {
+                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
+            }
+            arena_destroy(&rarena);
+            lua_pushnil(L);
+            lua_newtable(L);
+            lua_pushliteral(L, "ReflowSelectorError");
+            lua_setfield(L, -2, "type");
+            lua_pushliteral(L, "multiple elements match the selector at render time");
+            lua_setfield(L, -2, "message");
+            lua_pushliteral(L, "multiple_matches");
+            lua_setfield(L, -2, "reason");
+            lua_pushlstring(L, sel->source, sel->source_len);
+            lua_setfield(L, -2, "source");
+            return 2;
+        }
+        lua_pushlstring(L, ctx.first_match.data, ctx.first_match.len);
+        buf_free(&ctx.first_match);
         buf_free(&out);
         if (helpers_ref != LUA_NOREF) {
             luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
         }
         arena_destroy(&rarena);
-        lua_pushnil(L);
-        lua_newtable(L);
-        lua_pushliteral(L, "ReflowRuntimeError");
-        lua_setfield(L, -2, "type");
-        lua_pushliteral(L,
-            "template:render fragment path is not yet exposed via userdata");
-        lua_setfield(L, -2, "message");
-        return 2;
+        return 1;
     }
-    ok = interpret_render(&rarena, t->root, globals, L,
-                          helpers_ref, NULL,
-                          t->html, t->html_len,
-                          &hooks, &out, &rerr);
+
+    int ok = interpret_render(&rarena, t->root, globals, L,
+                              helpers_ref, NULL,
+                              t->html, t->html_len,
+                              &hooks, &out, &rerr);
 
     if (ok != 0) {
         if (helpers_ref != LUA_NOREF) {
