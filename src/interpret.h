@@ -202,4 +202,33 @@ interpret_render_fragment_positional(
     buf_t         *out,
     reflow_error  *err);
 
+/*
+ * Reach `target` inside the ancestor control-flow (chain / match /
+ * for / each / data / with) with the render env prepared as if we
+ * were about to render it, then invoke the callback.  When the
+ * ancestor walk emits no path to the target (e.g. branch not
+ * selected), the callback is skipped and *out_reached is set to
+ * false.  Ancestor iteration (x-for / x-each) unfolds multiple
+ * reaches — callers that require single-reach semantics should
+ * assert *out_reached == 1 at the end.
+ *
+ * Returns 0 on success (including "no reach"), -1 on runtime error.
+ */
+typedef int (*interpret_reach_cb)(void *ud, lua_State *L,
+                                  reflow_error *err);
+
+int interpret_execute_at(arena_t *arena,
+                         const ir_node *target,
+                         reflow_value  *globals,
+                         lua_State     *L,
+                         int            helpers_ref,
+                         const char    *template_name,
+                         const char    *html,
+                         size_t         html_len,
+                         const interpret_include_hooks *hooks,
+                         interpret_reach_cb cb,
+                         void          *cb_ud,
+                         size_t        *out_reached,
+                         reflow_error  *err);
+
 #endif /* REFLOW_INTERPRET_H */
