@@ -154,4 +154,52 @@ interpret_render_fragment_at(arena_t *arena,
                              buf_t         *out,
                              reflow_error  *err);
 
+/*
+ * Positional fragment rendering.
+ *
+ * Given a set of candidates that share the same parent and carry
+ * positional predicates, walk the parent's children in emission
+ * order, count sibling positions, capture each candidate emission,
+ * and evaluate the predicates once totals are known.
+ *
+ * `parent` may be NULL to indicate a walk over the root's children
+ * (root-level candidates).  In that case `root_children` /
+ * `n_root_children` supply the sibling list.
+ *
+ * `eval_fn` is invoked once per candidate emission with the sibling
+ * position figures known at that point:
+ *   index         — 1-based order among all emitted siblings
+ *   total         — grand total emitted siblings
+ *   of_type_index — 1-based order among siblings of the same tag
+ *   of_type_total — grand total emitted siblings of that tag
+ * `predicate_ud` is the opaque per-candidate token supplied in the
+ * `candidate_ud` array (parallel to `candidates`).
+ *
+ * Result semantics mirror interpret_render_fragment_at.
+ */
+typedef bool (*interpret_fragment_positional_eval_fn)(
+    void  *predicate_ud,
+    size_t index, size_t total,
+    size_t of_type_index, size_t of_type_total);
+
+interpret_fragment_result
+interpret_render_fragment_positional(
+    arena_t *arena,
+    const ir_node *parent,
+    struct ir_node * const *root_children,
+    size_t         n_root_children,
+    const ir_node **candidates,
+    void         **candidate_ud,
+    size_t         n_candidates,
+    interpret_fragment_positional_eval_fn eval_fn,
+    reflow_value  *globals,
+    lua_State     *L,
+    int            helpers_ref,
+    const char    *template_name,
+    const char    *html,
+    size_t         html_len,
+    const interpret_include_hooks *hooks,
+    buf_t         *out,
+    reflow_error  *err);
+
 #endif /* REFLOW_INTERPRET_H */
