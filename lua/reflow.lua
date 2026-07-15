@@ -26,6 +26,7 @@ local compiler = require('reflow.compiler')
 --- @class reflow.options
 --- @field prefix string
 --- @field max_include_depth integer
+--- @field selector_cache_size integer
 --- @field helpers table<string, reflow.helper>
 
 --- @class reflow
@@ -54,11 +55,15 @@ function Reflow:compile(name, html)
 end
 
 --- Render a compiled template against `data`.
+--- When `selector` is provided, only the element matching that CSS
+--- selector is rendered; a `ReflowSelectorError` is raised when zero
+--- or multiple elements match.
 --- @param name string
---- @param data string|nil     JSON5 string, or nil for empty globals
+--- @param data string|table|nil    JSON5 string, table, or nil for empty globals
+--- @param selector string?         CSS selector for fragment extraction
 --- @return string html
-function Reflow:render(name, data)
-    return compiler.state_render(self._state, name, data)
+function Reflow:render(name, data, selector)
+    return compiler.state_render(self._state, name, data, selector)
 end
 
 --- Remove one template by name, or every template when name is nil.
@@ -76,14 +81,16 @@ function Reflow:templates()
 end
 
 --- Create a new reflow instance.
---- @param opts reflow.options? { prefix='x-', max_include_depth=50, helpers={...} }
+--- @param opts reflow.options? { prefix='x-', max_include_depth=50, selector_cache_size=128, helpers={...} }
 --- @return reflow
 local function new(opts)
     opts = opts or {}
     local prefix = opts.prefix or 'x-'
     local max_include_depth = opts.max_include_depth or 50
+    local selector_cache_size = opts.selector_cache_size or 128
     local self = setmetatable({
-        _state = compiler.state_new(prefix, max_include_depth),
+        _state = compiler.state_new(prefix, max_include_depth,
+                                    selector_cache_size),
         _helpers = {},
     }, Reflow)
     for name, fn in pairs(opts.helpers or {}) do
