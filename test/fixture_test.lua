@@ -149,9 +149,9 @@ local function run_valid(name)
     if setup ~= nil then setup(reflow) end
 
     reflow:compile('main', html)
-    local ok, out = pcall(function() return reflow:render('main', data) end)
-    if not ok then
-        return { ok = false, err = out }
+    local out, err = reflow:render('main', data)
+    if not out then
+        return { ok = false, err = err }
     end
     return { ok = true, output = out, expected = expected }
 end
@@ -175,18 +175,19 @@ local function run_invalid(name)
     local setup = load_override(name, 'setup')
     if setup ~= nil then setup(reflow) end
 
-    local err
-    local ok, e = pcall(function() reflow:compile('main', html) end)
-    if ok then
-        ok, e = pcall(function() return reflow:render('main', data) end)
+    local _, cerr = reflow:compile('main', html)
+    local rerr = nil
+    if cerr == nil then
+        local _, err2 = reflow:render('main', data)
+        rerr = err2
     end
-    if ok then
+    local err = cerr or rerr
+    if err == nil then
         return { ok = true, err = nil,
                  spec = { phase = phase, class = cls,
                           messagePattern = pattern, reason = reason } }
     end
-    err = tostring(e)
-    return { ok = false, err = err,
+    return { ok = false, err = tostring(err),
              spec = { phase = phase, class = cls,
                       messagePattern = pattern, reason = reason } }
 end

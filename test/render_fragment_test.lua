@@ -15,8 +15,8 @@ end
 -- helper: call render and expect a structured selector error. Returns
 -- the error table so callers can assert on individual fields.
 local function fail(r, name, data, selector)
-    local ok, err = pcall(r.render, r, name, data, selector)
-    assert.is_false(ok)
+    local html, err = r:render(name, data, selector)
+    assert.is_nil(html)
     assert(type(err) == 'table',
         ('expected table error, got %s (%s)'):format(type(err), tostring(err)))
     assert.equal(err.type, 'ReflowSelectorError')
@@ -158,11 +158,11 @@ function testcase.outer_match_wins_over_include_search()
     -- implementation both would emit if outer had zero static
     -- candidates AND include existed.  Here outer has a candidate so
     -- only outer contributes.
-    local ok, err = pcall(r.render, r, 'parent', nil, '#c')
+    local html, err = r:render('parent', nil, '#c')
     -- The result should be the outer p.  If both matched, we'd get
     -- multiple_matches; if only outer, we get its rendered content.
-    if ok then
-        assert.equal(err, '<p id="c">Outer</p>')
+    if html then
+        assert.equal(html, '<p id="c">Outer</p>')
     else
         -- Alternative acceptable behaviour: multiple_matches when the
         -- include-recursion still explored despite outer candidates.
@@ -175,8 +175,8 @@ function testcase.cross_template_no_match_reports_no_match()
     r:compile('child', '<p>no id here</p>')
     r:compile('parent',
         [[<div><div x-include="'child'"></div></div>]])
-    local ok, err = pcall(r.render, r, 'parent', nil, '#missing')
-    assert.is_false(ok)
+    local html, err = r:render('parent', nil, '#missing')
+    assert.is_nil(html)
     assert.equal(err.reason, 'no_match')
 end
 
@@ -184,8 +184,8 @@ function testcase.cross_template_cycle_detected()
     local r = reflow.new()
     r:compile('a', [[<div><div x-include="'b'"></div></div>]])
     r:compile('b', [[<div><div x-include="'a'"></div></div>]])
-    local ok, err = pcall(r.render, r, 'a', nil, '#nowhere')
-    assert.is_false(ok)
+    local html, err = r:render('a', nil, '#nowhere')
+    assert.is_nil(html)
     assert.equal(err.reason, 'cycle')
 end
 
