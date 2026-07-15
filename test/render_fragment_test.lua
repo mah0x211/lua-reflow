@@ -119,11 +119,18 @@ end
 -- explicit "not yet implemented" errors for follow-up work
 -- ============================================================
 
-function testcase.positional_pseudo_reports_unsupported()
-    local r = make('<ul><li>1</li></ul>')
-    local err = fail(r, 't', nil, 'li:first-child')
-    assert.equal(err.reason, 'unsupported')
-    assert.equal(err.feature, 'fragment:positional')
+function testcase.positional_pseudo_first_child()
+    local r = make('<ul><li>1</li><li>2</li><li>3</li></ul>')
+    assert.equal(r:render('t', nil, 'li:first-child'), '<li>1</li>')
+    assert.equal(r:render('t', nil, 'li:last-child'), '<li>3</li>')
+    assert.equal(r:render('t', nil, 'li:nth-child(2)'), '<li>2</li>')
+end
+
+function testcase.positional_pseudo_of_type()
+    local r = make('<div><h1>H</h1><p>P1</p><p>P2</p><p>P3</p></div>')
+    assert.equal(r:render('t', nil, 'p:first-of-type'), '<p>P1</p>')
+    assert.equal(r:render('t', nil, 'p:last-of-type'), '<p>P3</p>')
+    assert.equal(r:render('t', nil, 'p:nth-of-type(2)'), '<p>P2</p>')
 end
 
 -- ============================================================

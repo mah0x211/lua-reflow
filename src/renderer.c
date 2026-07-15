@@ -461,6 +461,26 @@ static int raise_fragment_unsupported(lua_State *L, const char *name,
     return lua_error(L);
 }
 
+/* Positional predicate callback used by the positional fragment
+ * renderer.  `ud` points at the sel_candidate whose positional[]
+ * array we iterate; every predicate must pass for the candidate to
+ * qualify as a match. */
+static bool eval_positional_from_candidate(void *ud,
+                                           size_t index, size_t total,
+                                           size_t of_type_index,
+                                           size_t of_type_total)
+{
+    const sel_candidate *cand = (const sel_candidate *)ud;
+    for (size_t i = 0; i < cand->n_positional; i++) {
+        if (!sel_eval_positional(&cand->positional[i],
+                                 index, total,
+                                 of_type_index, of_type_total)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /*
  * Fragment render: resolve `sel_src` against the compiled index,
  * enforce the single-match contract, and render the target via
@@ -527,15 +547,128 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
         return lua_error(L);
     }
 
-    /* Reject positional pseudos up front — every candidate would carry
-     * the same predicate set, so a single check suffices. */
+    /* Positional path: candidates carry runtime predicates.  Group by
+     * parent and dispatch to interpret_render_fragment_positional so
+     * sibling positions can be counted before predicate evaluation. */
     if (cands->items[0].n_positional > 0) {
-        lua_pop(L, 1);
-        return raise_fragment_unsupported(
-            L, name, sel->source, sel->source_len,
-            "fragment:positional",
-            "fragment rendering of positional pseudo-classes is not yet "
-            "implemented", rarena);
+        /* Group by parent (or NULL for root-level candidates).  Small
+         * candidate counts keep this linear-map fine. */
+        const ir_node *seen_parents[32];
+        size_t         n_seen = 0;
+        buf_t out_local;
+        if (buf_init(&out_local) != 0) {
+            lua_pop(L, 1);
+            arena_destroy(rarena);
+            return luaL_error(L, "out of memory");
+        }
+        size_t total_matches = 0;
+        for (size_t ci = 0; ci < cands->count; ci++) {
+            const ir_node *cand_parent = cands->items[ci].element->element.parent;
+            /* Skip if we already processed this parent group. */
+            bool already = false;
+            for (size_t k = 0; k < n_seen; k++) {
+                if (seen_parents[k] == cand_parent) { already = true; break; }
+            }
+            if (already) continue;
+            if (n_seen < sizeof(seen_parents)/sizeof(seen_parents[0])) {
+                seen_parents[n_seen++] = cand_parent;
+            }
+
+            /* Collect this parent's candidate group. */
+            const ir_node *group_els[64];
+            void          *group_ud[64];
+            size_t         group_n = 0;
+            for (size_t j = 0; j < cands->count; j++) {
+                if (cands->items[j].element->element.parent != cand_parent) {
+                    continue;
+                }
+                if (group_n >= 64) break;
+                group_els[group_n] = cands->items[j].element;
+                /* Store the sel_candidate pointer as opaque UD so the
+                 * predicate callback can iterate its `positional`
+                 * array. */
+                group_ud[group_n]  = (void *)&cands->items[j];
+                group_n++;
+            }
+
+            /* Root-level candidates: cand_parent is NULL. */
+            struct ir_node * const *rchildren = NULL;
+            size_t n_rchildren = 0;
+            if (cand_parent == NULL) {
+                rchildren = root->root.children;
+                n_rchildren = root->root.n_children;
+            }
+
+            reflow_error frerr = {0};
+            buf_t group_out;
+            if (buf_init(&group_out) != 0) {
+                lua_pop(L, 1);
+                buf_free(&out_local);
+                arena_destroy(rarena);
+                return luaL_error(L, "out of memory");
+            }
+            interpret_fragment_result fres =
+                interpret_render_fragment_positional(
+                    rarena, cand_parent,
+                    rchildren, n_rchildren,
+                    group_els, group_ud, group_n,
+                    eval_positional_from_candidate,
+                    globals, L, s->helpers_ref,
+                    name, html, html_len, hooks,
+                    &group_out, &frerr);
+            if (fres == INTERPRET_FRAG_ERROR) {
+                if (frerr.template_name == NULL) frerr.template_name = name;
+                lua_pop(L, 1);
+                buf_free(&group_out);
+                buf_free(&out_local);
+                push_reflow_error(L, &frerr, name);
+                arena_destroy(rarena);
+                return lua_error(L);
+            }
+            if (fres == INTERPRET_FRAG_OK) {
+                if (total_matches == 0) {
+                    buf_put(&out_local, group_out.data, group_out.len);
+                }
+                total_matches++;
+            } else if (fres == INTERPRET_FRAG_MULTIPLE_MATCHES) {
+                total_matches += 2;
+            }
+            buf_free(&group_out);
+            if (total_matches > 1) break;
+        }
+        lua_remove(L, scratch_pos);
+        if (total_matches == 0) {
+            reflow_error nferr = {
+                .type          = "ReflowSelectorError",
+                .message       = "no element matches the selector at render time",
+                .template_name = name,
+                .reason        = "no_match",
+                .source        = sel->source,
+                .position      = 0,
+            };
+            buf_free(&out_local);
+            push_reflow_error(L, &nferr, name);
+            arena_destroy(rarena);
+            return lua_error(L);
+        }
+        if (total_matches > 1) {
+            reflow_error mmerr = {
+                .type          = "ReflowSelectorError",
+                .message       = "multiple elements match the selector at render time",
+                .template_name = name,
+                .reason        = "multiple_matches",
+                .source        = sel->source,
+                .position      = 0,
+            };
+            buf_free(&out_local);
+            push_reflow_error(L, &mmerr, name);
+            arena_destroy(rarena);
+            return lua_error(L);
+        }
+        lua_pushlstring(L, out_local.data, out_local.len);
+        buf_free(&out_local);
+        arena_destroy(rarena);
+        return 1;
     }
 
     /* Iterate every static candidate.  Each candidate runs through the
