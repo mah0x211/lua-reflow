@@ -42,6 +42,10 @@
 #include "interpret.h"
 #include "ir.h"
 #include "json5.h"
+#include "selector/cache.h"
+#include "selector/index.h"
+#include "selector/parse.h"
+#include "selector/resolve.h"
 // system
 #include <string.h>
 
@@ -150,9 +154,12 @@ typedef struct reflow_state {
     int    templates_ref;   /* Lua table {name -> template entry} */
     int    helpers_ref;     /* Lua table {name -> function} */
     int    helper_names_ref; /* Lua table {name -> true} (compile static) */
+    int    sel_cache_ref;   /* userdata; LUA_NOREF when caching disabled */
+    sel_cache *sel_cache;   /* cached pointer; NULL when disabled */
     char   prefix[16];
     size_t prefix_len;
     int    max_include_depth;
+    size_t selector_cache_size;
 } reflow_state;
 
 static reflow_state *check_state(lua_State *L, int idx)
@@ -175,6 +182,11 @@ static int state_gc(lua_State *L)
         luaL_unref(L, LUA_REGISTRYINDEX, s->helper_names_ref);
         s->helper_names_ref = LUA_NOREF;
     }
+    if (s->sel_cache_ref != LUA_NOREF) {
+        luaL_unref(L, LUA_REGISTRYINDEX, s->sel_cache_ref);
+        s->sel_cache_ref = LUA_NOREF;
+        s->sel_cache = NULL;
+    }
     return 0;
 }
 
@@ -191,10 +203,15 @@ int rf_state_new(lua_State *L)
 {
     const char *prefix = luaL_optstring(L, 1, "x-");
     int max_include_depth = (int)luaL_optinteger(L, 2, 50);
+    lua_Integer sel_cache_size = luaL_optinteger(L, 3, 128);
 
     size_t plen = strlen(prefix);
     if (plen == 0 || plen >= sizeof(((reflow_state *)0)->prefix)) {
         return luaL_error(L, "reflow.new: prefix must be 1..15 bytes");
+    }
+    if (sel_cache_size < 0) {
+        return luaL_error(L,
+            "reflow.new: selectorCacheSize must be a non-negative integer");
     }
 
     ensure_metatable(L);
@@ -203,9 +220,12 @@ int rf_state_new(lua_State *L)
     s->prefix[plen] = '\0';
     s->prefix_len = plen;
     s->max_include_depth = max_include_depth;
+    s->selector_cache_size = (size_t)sel_cache_size;
     s->templates_ref = LUA_NOREF;
     s->helpers_ref = LUA_NOREF;
     s->helper_names_ref = LUA_NOREF;
+    s->sel_cache_ref = LUA_NOREF;
+    s->sel_cache = NULL;
 
     /* templates table */
     lua_newtable(L);
@@ -216,6 +236,10 @@ int rf_state_new(lua_State *L)
     /* helper names set */
     lua_newtable(L);
     s->helper_names_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    /* Selector cache — anchored on the state so its lifetime tracks
+     * this instance. */
+    s->sel_cache = sel_cache_new(L, (size_t)sel_cache_size);
+    s->sel_cache_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     luaL_getmetatable(L, REFLOW_STATE_MT);
     lua_setmetatable(L, -2);
@@ -308,15 +332,25 @@ int rf_state_compile(lua_State *L)
     memcpy(html_copy, html, hlen);
     html_copy[hlen] = '\0';
 
-    /* templates[name] = { arena = carena_ud, root = lightud, html = string } */
+    /* Build the selector index eagerly so fragment renders don't repeat
+     * this work. The index is bump-allocated from the template's arena
+     * and shares its lifetime, freed together with the compiled IR. */
+    sel_index *sindex = sel_build_index(carena, L, root);
+    if (sindex == NULL) {
+        return luaL_error(L, "reflow.compile: selector index build failed");
+    }
+
+    /* templates[name] = { arena, root, html, index } */
     lua_rawgeti(L, LUA_REGISTRYINDEX, s->templates_ref);
-    lua_createtable(L, 0, 3);
+    lua_createtable(L, 0, 4);
     lua_pushvalue(L, carena_stack_pos);
     lua_setfield(L, -2, "arena");
     lua_pushlightuserdata(L, root);
     lua_setfield(L, -2, "root");
     lua_pushlstring(L, html_copy, hlen);
     lua_setfield(L, -2, "html");
+    lua_pushlightuserdata(L, sindex);
+    lua_setfield(L, -2, "index");
     lua_setfield(L, -2, name);
     lua_pop(L, 1); /* templates */
 
@@ -360,6 +394,13 @@ static reflow_value *value_from_lua(lua_State *L, int idx,
     return NULL;
 }
 
+/* Shared context passed to include_lookup and the fragment renderer.
+ * Kept at file scope so a helper function can reuse the layout. */
+struct include_ctx {
+    lua_State *L;
+    int        templates_ref;
+};
+
 /* Look up a compiled template by name in the current reflow_state's
  * templates table. When out_html is non-NULL, the stored HTML source is
  * also handed back so interpret can rebase its source context for
@@ -372,10 +413,7 @@ static const ir_node *include_lookup(void *ud,
                                      reflow_error *err)
 {
     (void)err;
-    struct include_ctx {
-        lua_State *L;
-        int templates_ref;
-    } *ctx = (struct include_ctx *)ud;
+    struct include_ctx *ctx = (struct include_ctx *)ud;
     lua_State *L = ctx->L;
 
     lua_rawgeti(L, LUA_REGISTRYINDEX, ctx->templates_ref);
@@ -400,10 +438,219 @@ static const ir_node *include_lookup(void *ud,
     return root;
 }
 
+/*
+ * Return true when `el`'s ascent contains any ancestor that requires
+ * runtime execution — chain / match branch, x-data, x-with, x-for,
+ * x-each. Under the simple fragment path these unblock the emission
+ * count / scope / branch semantics that the render step needs, and are
+ * out of scope for now.
+ */
+static bool element_has_active_ancestor(const ir_node *el)
+{
+    const ir_node *cur = el->element.parent;
+    while (cur != NULL) {
+        const ir_directives *d = &cur->element.directives;
+        if (d->data != NULL || d->data_raw != NULL) return true;
+        if (d->n_with > 0) return true;
+        if (d->for_spec != NULL) return true;
+        if (d->each_spec != NULL) return true;
+        if (d->match != NULL) return true;
+        if (cur->element.is_chain_branch) return true;
+        if (cur->element.is_match_branch) return true;
+        cur = cur->element.parent;
+    }
+    return false;
+}
+
+/*
+ * Return true when `el` itself is a control-flow branch or declares
+ * x-data / x-with. Such targets need the ancestor-execution path even
+ * if their ancestors are inert.
+ */
+static bool element_is_control_branch(const ir_node *el)
+{
+    if (el->element.is_chain_branch) return true;
+    if (el->element.is_match_branch) return true;
+    const ir_directives *d = &el->element.directives;
+    if (d->data != NULL || d->data_raw != NULL) return true;
+    if (d->n_with > 0) return true;
+    return false;
+}
+
+static int raise_fragment_unsupported(lua_State *L, const char *name,
+                                      const char *sel_src, size_t sel_len,
+                                      const char *feature,
+                                      const char *msg,
+                                      arena_t *rarena)
+{
+    /* Copy source to persistent storage since msg may reference the
+     * transient sel_src. */
+    reflow_error err = {
+        .type          = "ReflowSelectorError",
+        .message       = msg,
+        .template_name = name,
+        .reason        = "unsupported",
+        .feature       = feature,
+    };
+    err.source   = sel_src;
+    err.position = 0;
+    (void)sel_len;
+    push_reflow_error(L, &err, name);
+    arena_destroy(rarena);
+    return lua_error(L);
+}
+
+/*
+ * Fragment render: resolve `sel_src` against the compiled index,
+ * enforce the single-match contract, and render the target via
+ * interpret_render_fragment. Errors follow the JS reference:
+ * no_match / multiple_matches / unsupported.  The render arena is
+ * always destroyed before returning.
+ */
+static int render_fragment_path(lua_State *L, reflow_state *s,
+                                const char *name,
+                                ir_node *root, const sel_index *sindex,
+                                const char *html, size_t html_len,
+                                reflow_value *globals,
+                                const interpret_include_hooks *hooks,
+                                arena_t *rarena,
+                                const char *sel_src, size_t sel_len)
+{
+    (void)root;
+    if (sindex == NULL) {
+        arena_destroy(rarena);
+        return luaL_error(L,
+            "reflow.render: template \"%s\" has no selector index", name);
+    }
+
+    /* Parse (via cache) — the cache lives on the state so subsequent
+     * calls for the same selector are constant-time. */
+    reflow_error perr = {0};
+    const sel_compiled *sel = sel_cache_resolve(s->sel_cache, L,
+                                                sel_src, sel_len, &perr);
+    if (sel == NULL) {
+        arena_destroy(rarena);
+        perr.template_name = name;
+        push_reflow_error(L, &perr, name);
+        return lua_error(L);
+    }
+
+    /* Resolve against the index using the render arena — the candidate
+     * list is short-lived and thrown away at the end of this call. */
+    compile_arena *scratch = compile_arena_new(L, 1024);
+    int scratch_pos = lua_gettop(L);
+    reflow_error rerr = {0};
+    sel_candidates *cands = sel_resolve(scratch, L, sindex, sel, &rerr);
+    if (cands == NULL) {
+        lua_pop(L, 1);
+        arena_destroy(rarena);
+        rerr.template_name = name;
+        push_reflow_error(L, &rerr, name);
+        return lua_error(L);
+    }
+
+    /* Enforce single-match contract. */
+    if (cands->count == 0) {
+        lua_pop(L, 1);
+        reflow_error nferr = {
+            .type          = "ReflowSelectorError",
+            .message       = "no element matches the selector",
+            .template_name = name,
+            .reason        = "no_match",
+            .source        = sel->source,
+            .position      = 0,
+        };
+        push_reflow_error(L, &nferr, name);
+        arena_destroy(rarena);
+        return lua_error(L);
+    }
+    if (cands->count > 1) {
+        lua_pop(L, 1);
+        reflow_error mmerr = {
+            .type          = "ReflowSelectorError",
+            .message       = "multiple elements match the selector",
+            .template_name = name,
+            .reason        = "multiple_matches",
+            .source        = sel->source,
+            .position      = 0,
+        };
+        push_reflow_error(L, &mmerr, name);
+        arena_destroy(rarena);
+        return lua_error(L);
+    }
+
+    const sel_candidate *cand = &cands->items[0];
+    const ir_node       *target = cand->element;
+
+    /* Simple-path guardrails.  Positional pseudos, ancestor control
+     * flow, and control-branch targets need the follow-up stages of
+     * the fragment renderer. Report them explicitly so callers can
+     * upgrade when those land. */
+    if (cand->n_positional > 0) {
+        lua_pop(L, 1);
+        return raise_fragment_unsupported(
+            L, name, sel->source, sel->source_len,
+            "fragment:positional",
+            "fragment rendering of positional pseudo-classes is not yet "
+            "implemented", rarena);
+    }
+    if (element_has_active_ancestor(target)) {
+        lua_pop(L, 1);
+        return raise_fragment_unsupported(
+            L, name, sel->source, sel->source_len,
+            "fragment:ancestor-control",
+            "fragment rendering across an ancestor that carries a control "
+            "directive is not yet implemented", rarena);
+    }
+    if (element_is_control_branch(target)) {
+        lua_pop(L, 1);
+        return raise_fragment_unsupported(
+            L, name, sel->source, sel->source_len,
+            "fragment:branch-target",
+            "fragment rendering of a chain / match branch or an element "
+            "with x-data / x-with is not yet implemented", rarena);
+    }
+
+    /* Drop the scratch arena — the candidate list is no longer needed
+     * because target itself lives in the template's arena. */
+    lua_remove(L, scratch_pos);
+
+    buf_t out;
+    if (buf_init(&out) != 0) {
+        arena_destroy(rarena);
+        return luaL_error(L, "out of memory");
+    }
+    reflow_error frerr = {0};
+    int rc = interpret_render_fragment(rarena, target, globals, L,
+                                       s->helpers_ref,
+                                       name, html, html_len,
+                                       hooks, &out, &frerr);
+    if (rc != 0) {
+        if (frerr.template_name == NULL) frerr.template_name = name;
+        push_reflow_error(L, &frerr, name);
+        buf_free(&out);
+        arena_destroy(rarena);
+        return lua_error(L);
+    }
+    lua_pushlstring(L, out.data, out.len);
+    buf_free(&out);
+    arena_destroy(rarena);
+    return 1;
+}
+
 int rf_state_render(lua_State *L)
 {
     reflow_state *s = check_state(L, 1);
     const char *name = luaL_checkstring(L, 2);
+    /* Optional selector: string (raw) or reserved for compiled AST in
+     * a future revision. When absent the whole template is rendered. */
+    size_t      sel_len = 0;
+    const char *sel_src = NULL;
+    if (lua_type(L, 4) == LUA_TSTRING) {
+        sel_src = lua_tolstring(L, 4, &sel_len);
+    } else if (!lua_isnoneornil(L, 4)) {
+        return luaL_error(L, "reflow.render: selector must be a string or nil");
+    }
 
     /* Look up template. */
     lua_rawgeti(L, LUA_REGISTRYINDEX, s->templates_ref);
@@ -421,6 +668,9 @@ int rf_state_render(lua_State *L)
     lua_getfield(L, -1, "root");
     ir_node *root = (ir_node *)lua_touserdata(L, -1);
     lua_pop(L, 1); /* pop root, keep entry */
+    lua_getfield(L, -1, "index");
+    sel_index *sindex = (sel_index *)lua_touserdata(L, -1);
+    lua_pop(L, 1);
     lua_getfield(L, -1, "html");
     size_t html_len = 0;
     const char *html = lua_tolstring(L, -1, &html_len);
@@ -439,17 +689,22 @@ int rf_state_render(lua_State *L)
     }
 
     /* Set up include hooks. */
-    struct include_ctx {
-        lua_State *L;
-        int templates_ref;
-    } ictx = { L, s->templates_ref };
+    struct include_ctx ictx = { L, s->templates_ref };
     interpret_include_hooks hooks = {
         .ud            = &ictx,
         .get_template  = include_lookup,
         .max_depth     = s->max_include_depth,
     };
 
-    /* Render. */
+    /* Fragment path: resolve selector, enforce single-match contract,
+     * and render the target via interpret_render_fragment. */
+    if (sel_src != NULL) {
+        return render_fragment_path(L, s, name, root, sindex, html,
+                                    html_len, globals, &hooks, &rarena,
+                                    sel_src, sel_len);
+    }
+
+    /* Full-template path. */
     buf_t out;
     if (buf_init(&out) != 0) {
         arena_destroy(&rarena);
