@@ -1750,6 +1750,229 @@ static render_result with_parent_control_env(fragment_ctx *fc,
     return RR_OK;
 }
 
+/*
+ * ============================================================
+ * Callback-based execute-at
+ * ============================================================
+ *
+ * Walks the target's ancestor control path with the same
+ * chain / match / for / each / data / with semantics as
+ * interpret_render_fragment_at, but at the terminal invokes a
+ * caller-supplied callback rather than rendering the target.  Used
+ * by the fragment renderer to reach an x-include element under the
+ * correct scope before recursively searching the target template.
+ */
+
+typedef struct {
+    render_ctx        *rc;
+    const ir_node    **path;
+    size_t             path_len;
+    const ir_node     *terminal;      /* only used to reproduce fragment_step
+                                       * behaviour; may be NULL when the
+                                       * terminal is entered from an
+                                       * arbitrary point. */
+    interpret_reach_cb cb;
+    void              *cb_ud;
+    size_t             reached;
+} reach_ctx;
+
+static render_result reach_walk(reach_ctx *rc, size_t idx);
+
+static render_result reach_terminal(reach_ctx *rc)
+{
+    rc->reached++;
+    reflow_error *err = rc->rc->err;
+    if (rc->cb(rc->cb_ud, rc->rc->L, err) != 0) return RR_ERROR;
+    return RR_OK;
+}
+
+static render_result reach_step(reach_ctx *rc, size_t idx)
+{
+    const ir_node *step = rc->path[idx];
+
+    if (step->element.is_chain_branch) {
+        long chosen = fragment_chain_selected(rc->rc,
+            step->element.chain_parent);
+        if (chosen == -2) return RR_ERROR;
+        if (chosen != (long)step->element.chain_branch) return RR_OK;
+    }
+    if (step->element.is_match_branch) {
+        long chosen = fragment_match_selected(rc->rc,
+            step->element.parent);
+        if (chosen == -2) return RR_ERROR;
+        if (chosen != (long)step->element.match_branch) return RR_OK;
+    }
+
+    const ir_directives *d = &step->element.directives;
+    if (d->for_spec != NULL) {
+        const ir_for_spec *fs = d->for_spec;
+        double stepv = fs->step;
+        bool ascending = stepv > 0;
+        for (double i = fs->start;
+             ascending ? i <= fs->stop : i >= fs->stop;
+             i += stepv) {
+            reflow_value item;
+            item.tag = RV_NUMBER;
+            item.number = i;
+            rv_prop pf = { .key = fs->var_name,
+                           .key_len = strlen(fs->var_name),
+                           .value = item };
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = &pf;
+            frame.object.len    = 1;
+            frame.object.cap    = 1;
+            scope_push_frame(&rc->rc->env, SCOPE_FRAME_LOOP, &frame);
+            size_t frames_before = rc->rc->env.n_frames - 1;
+            if (push_data_scope(rc->rc, d) != RR_OK ||
+                push_with_scope(rc->rc, d) != RR_OK) {
+                while (rc->rc->env.n_frames > frames_before) {
+                    scope_pop_frame(&rc->rc->env);
+                }
+                return RR_ERROR;
+            }
+            render_result inner = reach_walk(rc, idx + 1);
+            while (rc->rc->env.n_frames > frames_before) {
+                scope_pop_frame(&rc->rc->env);
+            }
+            if (inner == RR_ERROR) return RR_ERROR;
+        }
+        return RR_OK;
+    }
+    if (d->each_spec != NULL) {
+        const ir_each_spec *es = d->each_spec;
+        reflow_value coll;
+        if (eval_expr(rc->rc, es->collection, &coll) != RR_OK) return RR_ERROR;
+        if (coll.tag != RV_ARRAY && coll.tag != RV_OBJECT) {
+            render_errorf(rc->rc, "x-each: expected array or object");
+            return RR_ERROR;
+        }
+        size_t n = (coll.tag == RV_ARRAY) ? coll.array.len : coll.object.len;
+        for (size_t i = 0; i < n; i++) {
+            reflow_value item = (coll.tag == RV_ARRAY)
+                ? coll.array.items[i]
+                : coll.object.props[i].value;
+            rv_prop props[2];
+            size_t nprops = 0;
+            props[nprops].key     = es->item_name;
+            props[nprops].key_len = strlen(es->item_name);
+            props[nprops].value   = item;
+            nprops++;
+            if (es->index_name != NULL) {
+                reflow_value iv;
+                iv.tag = RV_NUMBER;
+                iv.number = (double)i;
+                props[nprops].key     = es->index_name;
+                props[nprops].key_len = strlen(es->index_name);
+                props[nprops].value   = iv;
+                nprops++;
+            }
+            reflow_value frame;
+            frame.tag           = RV_OBJECT;
+            frame.object.props  = props;
+            frame.object.len    = nprops;
+            frame.object.cap    = nprops;
+            scope_push_frame(&rc->rc->env, SCOPE_FRAME_LOOP, &frame);
+            size_t frames_before = rc->rc->env.n_frames - 1;
+            if (push_data_scope(rc->rc, d) != RR_OK ||
+                push_with_scope(rc->rc, d) != RR_OK) {
+                while (rc->rc->env.n_frames > frames_before) {
+                    scope_pop_frame(&rc->rc->env);
+                }
+                return RR_ERROR;
+            }
+            render_result inner = reach_walk(rc, idx + 1);
+            while (rc->rc->env.n_frames > frames_before) {
+                scope_pop_frame(&rc->rc->env);
+            }
+            if (inner == RR_ERROR) return RR_ERROR;
+        }
+        return RR_OK;
+    }
+
+    size_t frames_before = rc->rc->env.n_frames;
+    if (push_data_scope(rc->rc, d) != RR_OK ||
+        push_with_scope(rc->rc, d) != RR_OK) {
+        while (rc->rc->env.n_frames > frames_before) {
+            scope_pop_frame(&rc->rc->env);
+        }
+        return RR_ERROR;
+    }
+    render_result inner = reach_walk(rc, idx + 1);
+    while (rc->rc->env.n_frames > frames_before) {
+        scope_pop_frame(&rc->rc->env);
+    }
+    return inner;
+}
+
+static render_result reach_walk(reach_ctx *rc, size_t idx)
+{
+    if (idx >= rc->path_len) return reach_terminal(rc);
+    return reach_step(rc, idx);
+}
+
+int interpret_execute_at(arena_t *arena,
+                         const ir_node *target,
+                         reflow_value  *globals,
+                         lua_State     *L,
+                         int            helpers_ref,
+                         const char    *template_name,
+                         const char    *html,
+                         size_t         html_len,
+                         const interpret_include_hooks *hooks,
+                         interpret_reach_cb cb,
+                         void          *cb_ud,
+                         size_t        *out_reached,
+                         reflow_error  *err)
+{
+    const ir_node *chain_up[64];
+    size_t chain_len = 0;
+    for (const ir_node *cur = target->element.parent;
+         cur != NULL; cur = cur->element.parent) {
+        if (fragment_requires_execution(cur)) {
+            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
+                err->type    = "ReflowSelectorError";
+                err->message = "fragment control path exceeds depth limit";
+                err->reason  = "unsupported";
+                return -1;
+            }
+            chain_up[chain_len++] = cur;
+        }
+    }
+    const ir_node *path[64];
+    for (size_t i = 0; i < chain_len; i++) {
+        path[i] = chain_up[chain_len - 1 - i];
+    }
+
+    render_ctx rc = {
+        .arena         = arena,
+        .out           = NULL,
+        .L             = L,
+        .helpers_ref   = helpers_ref,
+        .err           = err,
+        .template_name = template_name,
+        .html          = html,
+        .html_len      = html_len,
+        .current_element = NULL,
+        .hooks         = hooks,
+        .include_depth = 0,
+    };
+    scope_env_init(&rc.env, globals);
+
+    reach_ctx rctx = {
+        .rc       = &rc,
+        .path     = path,
+        .path_len = chain_len,
+        .terminal = target,
+        .cb       = cb,
+        .cb_ud    = cb_ud,
+        .reached  = 0,
+    };
+    render_result rr = reach_walk(&rctx, 0);
+    if (out_reached) *out_reached = rctx.reached;
+    return (rr == RR_ERROR) ? -1 : 0;
+}
+
 interpret_fragment_result
 interpret_render_fragment_positional(
     arena_t *arena,
