@@ -51,26 +51,26 @@ end
 function testcase.include_not_found()
     local r = Reflow.new()
     r:compile('page', [[<div x-include="'missing'"></div>]])
-    local ok, err = pcall(function() r:render('page') end)
-    assert.is_false(ok)
-    assert.match(err, 'template not found')
+    local html, err = r:render('page')
+    assert.is_nil(html)
+    assert.match(err.message, 'template not found')
 end
 
 function testcase.include_cycle_direct()
     local r = Reflow.new()
     r:compile('a', [[<div x-include="'a'"></div>]])
-    local ok, err = pcall(function() r:render('a') end)
-    assert.is_false(ok)
-    assert.match(err, 'include cycle detected')
+    local html, err = r:render('a')
+    assert.is_nil(html)
+    assert.match(err.message, 'include cycle detected')
 end
 
 function testcase.include_cycle_indirect()
     local r = Reflow.new()
     r:compile('a', [[<div x-include="'b'"></div>]])
     r:compile('b', [[<div x-include="'a'"></div>]])
-    local ok, err = pcall(function() r:render('a') end)
-    assert.is_false(ok)
-    assert.match(err, 'include cycle')
+    local html, err = r:render('a')
+    assert.is_nil(html)
+    assert.match(err.message, 'include cycle')
 end
 
 function testcase.include_depth_exceeded()
@@ -80,9 +80,9 @@ function testcase.include_depth_exceeded()
                             (i + 1) .. '\'"></div>')
     end
     r:compile('t5', '<span>end</span>')
-    local ok, err = pcall(function() r:render('t1') end)
-    assert.is_false(ok)
-    assert.match(err, 'max include depth')
+    local html, err = r:render('t1')
+    assert.is_nil(html)
+    assert.match(err.message, 'max include depth')
 end
 
 function testcase.include_within_limit_ok()
@@ -99,9 +99,9 @@ end
 function testcase.include_non_string_value()
     local r = Reflow.new()
     r:compile('page', [[<div x-include="$.n"></div>]])
-    local ok, err = pcall(function() r:render('page', [[{n: 42}]]) end)
-    assert.is_false(ok)
-    assert.match(err, 'value must be a string')
+    local html, err = r:render('page', [[{n: 42}]])
+    assert.is_nil(html)
+    assert.match(err.message, 'value must be a string')
 end
 
 -- ===== helper visibility through include =====
