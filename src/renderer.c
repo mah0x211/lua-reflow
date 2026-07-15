@@ -438,45 +438,6 @@ static const ir_node *include_lookup(void *ud,
     return root;
 }
 
-/*
- * Return true when `el`'s ascent contains any ancestor that requires
- * runtime execution — chain / match branch, x-data, x-with, x-for,
- * x-each. Under the simple fragment path these unblock the emission
- * count / scope / branch semantics that the render step needs, and are
- * out of scope for now.
- */
-static bool element_has_active_ancestor(const ir_node *el)
-{
-    const ir_node *cur = el->element.parent;
-    while (cur != NULL) {
-        const ir_directives *d = &cur->element.directives;
-        if (d->data != NULL || d->data_raw != NULL) return true;
-        if (d->n_with > 0) return true;
-        if (d->for_spec != NULL) return true;
-        if (d->each_spec != NULL) return true;
-        if (d->match != NULL) return true;
-        if (cur->element.is_chain_branch) return true;
-        if (cur->element.is_match_branch) return true;
-        cur = cur->element.parent;
-    }
-    return false;
-}
-
-/*
- * Return true when `el` itself is a control-flow branch or declares
- * x-data / x-with. Such targets need the ancestor-execution path even
- * if their ancestors are inert.
- */
-static bool element_is_control_branch(const ir_node *el)
-{
-    if (el->element.is_chain_branch) return true;
-    if (el->element.is_match_branch) return true;
-    const ir_directives *d = &el->element.directives;
-    if (d->data != NULL || d->data_raw != NULL) return true;
-    if (d->n_with > 0) return true;
-    return false;
-}
-
 static int raise_fragment_unsupported(lua_State *L, const char *name,
                                       const char *sel_src, size_t sel_len,
                                       const char *feature,
@@ -535,7 +496,7 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
         return lua_error(L);
     }
 
-    /* Resolve against the index using the render arena — the candidate
+    /* Resolve against the index using a scratch arena — the candidate
      * list is short-lived and thrown away at the end of this call. */
     compile_arena *scratch = compile_arena_new(L, 1024);
     int scratch_pos = lua_gettop(L);
@@ -549,7 +510,8 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
         return lua_error(L);
     }
 
-    /* Enforce single-match contract. */
+    /* Zero static candidates — cross-template x-include recursion is
+     * out of scope for this stage. */
     if (cands->count == 0) {
         lua_pop(L, 1);
         reflow_error nferr = {
@@ -564,29 +526,10 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
         arena_destroy(rarena);
         return lua_error(L);
     }
-    if (cands->count > 1) {
-        lua_pop(L, 1);
-        reflow_error mmerr = {
-            .type          = "ReflowSelectorError",
-            .message       = "multiple elements match the selector",
-            .template_name = name,
-            .reason        = "multiple_matches",
-            .source        = sel->source,
-            .position      = 0,
-        };
-        push_reflow_error(L, &mmerr, name);
-        arena_destroy(rarena);
-        return lua_error(L);
-    }
 
-    const sel_candidate *cand = &cands->items[0];
-    const ir_node       *target = cand->element;
-
-    /* Simple-path guardrails.  Positional pseudos, ancestor control
-     * flow, and control-branch targets need the follow-up stages of
-     * the fragment renderer. Report them explicitly so callers can
-     * upgrade when those land. */
-    if (cand->n_positional > 0) {
+    /* Reject positional pseudos up front — every candidate would carry
+     * the same predicate set, so a single check suffices. */
+    if (cands->items[0].n_positional > 0) {
         lua_pop(L, 1);
         return raise_fragment_unsupported(
             L, name, sel->source, sel->source_len,
@@ -594,41 +537,94 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
             "fragment rendering of positional pseudo-classes is not yet "
             "implemented", rarena);
     }
-    if (element_has_active_ancestor(target)) {
-        lua_pop(L, 1);
-        return raise_fragment_unsupported(
-            L, name, sel->source, sel->source_len,
-            "fragment:ancestor-control",
-            "fragment rendering across an ancestor that carries a control "
-            "directive is not yet implemented", rarena);
-    }
-    if (element_is_control_branch(target)) {
-        lua_pop(L, 1);
-        return raise_fragment_unsupported(
-            L, name, sel->source, sel->source_len,
-            "fragment:branch-target",
-            "fragment rendering of a chain / match branch or an element "
-            "with x-data / x-with is not yet implemented", rarena);
-    }
 
-    /* Drop the scratch arena — the candidate list is no longer needed
-     * because target itself lives in the template's arena. */
-    lua_remove(L, scratch_pos);
-
+    /* Iterate every static candidate.  Each candidate runs through the
+     * ancestor walker which enforces branch selection at render time;
+     * across all candidates we accumulate the total emission count and
+     * apply the single-fragment contract on the sum.  This lets chain
+     * / match branches all be candidates while only the runtime-chosen
+     * one contributes output. */
     buf_t out;
     if (buf_init(&out) != 0) {
+        lua_pop(L, 1);
         arena_destroy(rarena);
         return luaL_error(L, "out of memory");
     }
-    reflow_error frerr = {0};
-    int rc = interpret_render_fragment(rarena, target, globals, L,
-                                       s->helpers_ref,
-                                       name, html, html_len,
-                                       hooks, &out, &frerr);
-    if (rc != 0) {
-        if (frerr.template_name == NULL) frerr.template_name = name;
-        push_reflow_error(L, &frerr, name);
+    size_t total_emissions = 0;
+    for (size_t ci = 0; ci < cands->count; ci++) {
+        const sel_candidate *cand = &cands->items[ci];
+        const ir_node       *target = cand->element;
+        buf_t local;
+        if (buf_init(&local) != 0) {
+            lua_pop(L, 1);
+            buf_free(&out);
+            arena_destroy(rarena);
+            return luaL_error(L, "out of memory");
+        }
+        reflow_error frerr = {0};
+        interpret_fragment_result fres =
+            interpret_render_fragment_at(rarena, target, globals, L,
+                                         s->helpers_ref,
+                                         name, html, html_len,
+                                         hooks, &local, &frerr);
+        if (fres == INTERPRET_FRAG_ERROR) {
+            if (frerr.template_name == NULL) frerr.template_name = name;
+            lua_pop(L, 1);
+            push_reflow_error(L, &frerr, name);
+            buf_free(&local);
+            buf_free(&out);
+            arena_destroy(rarena);
+            return lua_error(L);
+        }
+        if (fres == INTERPRET_FRAG_MULTIPLE_MATCHES) {
+            /* One candidate alone exceeded the single-match budget. */
+            total_emissions += 2;
+            buf_free(&local);
+            break;
+        }
+        if (fres == INTERPRET_FRAG_OK) {
+            if (total_emissions == 0) {
+                if (buf_put(&out, local.data, local.len) != 0) {
+                    lua_pop(L, 1);
+                    buf_free(&local);
+                    buf_free(&out);
+                    arena_destroy(rarena);
+                    return luaL_error(L, "out of memory");
+                }
+            }
+            total_emissions++;
+        }
+        buf_free(&local);
+        if (total_emissions > 1) break;
+    }
+    /* Drop the scratch arena — candidate list no longer needed. */
+    lua_remove(L, scratch_pos);
+
+    if (total_emissions == 0) {
+        reflow_error nferr = {
+            .type          = "ReflowSelectorError",
+            .message       = "no element matches the selector at render time",
+            .template_name = name,
+            .reason        = "no_match",
+            .source        = sel->source,
+            .position      = 0,
+        };
         buf_free(&out);
+        push_reflow_error(L, &nferr, name);
+        arena_destroy(rarena);
+        return lua_error(L);
+    }
+    if (total_emissions > 1) {
+        reflow_error mmerr = {
+            .type          = "ReflowSelectorError",
+            .message       = "multiple elements match the selector at render time",
+            .template_name = name,
+            .reason        = "multiple_matches",
+            .source        = sel->source,
+            .position      = 0,
+        };
+        buf_free(&out);
+        push_reflow_error(L, &mmerr, name);
         arena_destroy(rarena);
         return lua_error(L);
     }

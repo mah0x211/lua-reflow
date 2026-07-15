@@ -113,4 +113,45 @@ int interpret_render_fragment(arena_t *arena,
                               buf_t         *out,
                               reflow_error  *err);
 
+/*
+ * Reason codes describing how many target emissions the guarded
+ * fragment render observed.  Returned by
+ * interpret_render_fragment_at when emission count is not exactly one
+ * so the caller can raise the appropriate ReflowSelectorError.
+ */
+typedef enum {
+    INTERPRET_FRAG_OK              = 0,
+    INTERPRET_FRAG_NO_MATCH        = 1,
+    INTERPRET_FRAG_MULTIPLE_MATCHES= 2,
+    INTERPRET_FRAG_ERROR           = -1,
+} interpret_fragment_result;
+
+/*
+ * Render `target` into `out` while executing the ancestor control-flow
+ * (chain / match branch selection, x-for / x-each iteration,
+ * x-data / x-with scope frames).  Emission count is tallied at the
+ * terminal, and the function returns:
+ *
+ *   INTERPRET_FRAG_OK               — target emitted exactly once;
+ *                                     `out` contains its rendered HTML.
+ *   INTERPRET_FRAG_NO_MATCH         — no path reached the target
+ *                                     (branch check failed on the way).
+ *   INTERPRET_FRAG_MULTIPLE_MATCHES — more than one path reached the
+ *                                     target (e.g. ancestor x-for loops).
+ *   INTERPRET_FRAG_ERROR            — a runtime error fired during the
+ *                                     ancestor walk; err is populated.
+ */
+interpret_fragment_result
+interpret_render_fragment_at(arena_t *arena,
+                             const ir_node *target,
+                             reflow_value  *globals,
+                             lua_State     *L,
+                             int            helpers_ref,
+                             const char    *template_name,
+                             const char    *html,
+                             size_t         html_len,
+                             const interpret_include_hooks *hooks,
+                             buf_t         *out,
+                             reflow_error  *err);
+
 #endif /* REFLOW_INTERPRET_H */
