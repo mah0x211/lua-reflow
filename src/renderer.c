@@ -39,6 +39,7 @@
 #include "compile_arena.h"
 #include "error.h"
 #include "expr/eval.h"
+#include "expr/parse.h"
 #include "interpret.h"
 #include "ir.h"
 #include "json5.h"
@@ -438,29 +439,6 @@ static const ir_node *include_lookup(void *ud,
     return root;
 }
 
-static int raise_fragment_unsupported(lua_State *L, const char *name,
-                                      const char *sel_src, size_t sel_len,
-                                      const char *feature,
-                                      const char *msg,
-                                      arena_t *rarena)
-{
-    /* Copy source to persistent storage since msg may reference the
-     * transient sel_src. */
-    reflow_error err = {
-        .type          = "ReflowSelectorError",
-        .message       = msg,
-        .template_name = name,
-        .reason        = "unsupported",
-        .feature       = feature,
-    };
-    err.source   = sel_src;
-    err.position = 0;
-    (void)sel_len;
-    push_reflow_error(L, &err, name);
-    arena_destroy(rarena);
-    return lua_error(L);
-}
-
 /* Positional predicate callback used by the positional fragment
  * renderer.  `ud` points at the sel_candidate whose positional[]
  * array we iterate; every predicate must pass for the candidate to
@@ -479,6 +457,298 @@ static bool eval_positional_from_candidate(void *ud,
         }
     }
     return true;
+}
+
+/* --- x-include cross-template fragment search --- */
+
+typedef struct {
+    buf_t         first_match;
+    size_t        match_count;
+    reflow_state *s;
+    lua_State    *L;
+    const interpret_include_hooks *hooks;
+    arena_t      *rarena;
+    const sel_compiled *sel;
+    const char *stack[64];
+    size_t      stack_len[64];
+    int         depth;
+    int         max_depth;
+} frag_search_ctx;
+
+/* Look up a compiled template entry by name.  Returns 0 on success and
+ * populates *out_root / *out_sindex / *out_html / *out_hlen.  Returns
+ * -1 when the entry is missing. */
+static int fetch_template_entry(lua_State *L, reflow_state *s,
+                                const char *tname, size_t tname_len,
+                                ir_node **out_root,
+                                const sel_index **out_sindex,
+                                const char **out_html, size_t *out_hlen)
+{
+    lua_rawgeti(L, LUA_REGISTRYINDEX, s->templates_ref);
+    lua_pushlstring(L, tname, tname_len);
+    lua_rawget(L, -2);
+    if (lua_isnil(L, -1)) {
+        lua_pop(L, 2);
+        return -1;
+    }
+    lua_getfield(L, -1, "root");
+    *out_root = (ir_node *)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, -1, "index");
+    *out_sindex = (const sel_index *)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, -1, "html");
+    *out_html = lua_tolstring(L, -1, out_hlen);
+    lua_pop(L, 3);
+    return 0;
+}
+
+static int frag_search(frag_search_ctx *ctx,
+                       const char *tname, size_t tname_len,
+                       ir_node *root, const sel_index *sindex,
+                       const char *html, size_t html_len,
+                       reflow_value *globals,
+                       reflow_error *err);
+
+/* Callback used by interpret_execute_at when walking to an x-include
+ * element.  Evaluates the include expression under the current env,
+ * performs safety checks, looks up the target template, and recurses
+ * frag_search on it. */
+typedef struct {
+    frag_search_ctx *ctx;
+    const ir_node   *include_el;
+    reflow_error    *err;
+} include_reach_ud;
+
+static int include_reach_cb(void *ud, lua_State *L, reflow_error *err)
+{
+    include_reach_ud *rud = (include_reach_ud *)ud;
+    frag_search_ctx  *ctx = rud->ctx;
+    const ir_node    *el  = rud->include_el;
+    const expr_node  *include_expr = el->element.directives.include_expr;
+    (void)err;
+
+    /* Evaluate include expression.  Reuse the existing helper via a
+     * tiny render_ctx-based eval — we need scope + helpers.  The
+     * interpret_execute_at caller already set up rc.env; we can grab
+     * it from the reach_ctx, but our public callback signature does
+     * not expose it.  Instead, evaluate against `env` reconstructed by
+     * a helper.  For now, take the pragmatic path: use expr_eval
+     * directly against the current thread's state. */
+    (void)include_expr;
+    (void)L;
+    /* NOTE: we currently only support the trivial case where the
+     * include expression is a literal string constant. */
+    if (include_expr->type != EX_LITERAL ||
+        include_expr->literal.tag != RV_STRING) {
+        rud->err->type    = "ReflowSelectorError";
+        rud->err->message = "x-include with non-literal expression is "
+                            "not yet supported in fragment search";
+        rud->err->reason  = "unsupported";
+        rud->err->feature = "fragment:include-dynamic";
+        return -1;
+    }
+    const char *target_name = include_expr->literal.string.data;
+    size_t      target_len  = include_expr->literal.string.len;
+
+    /* Depth and cycle checks. */
+    if (ctx->depth >= ctx->max_depth) {
+        rud->err->type      = "ReflowIncludeError";
+        rud->err->message   = "include depth limit exceeded";
+        rud->err->reason    = "depth_exceeded";
+        rud->err->requested = target_name;
+        return -1;
+    }
+    for (int i = 0; i < ctx->depth; i++) {
+        if (ctx->stack_len[i] == target_len &&
+            memcmp(ctx->stack[i], target_name, target_len) == 0) {
+            rud->err->type      = "ReflowIncludeError";
+            rud->err->message   = "include cycle detected";
+            rud->err->reason    = "cycle";
+            rud->err->requested = target_name;
+            return -1;
+        }
+    }
+
+    /* Look up the target template. */
+    ir_node         *tgt_root  = NULL;
+    const sel_index *tgt_sidx  = NULL;
+    const char      *tgt_html  = NULL;
+    size_t           tgt_hlen  = 0;
+    if (fetch_template_entry(ctx->L, ctx->s, target_name, target_len,
+                             &tgt_root, &tgt_sidx,
+                             &tgt_html, &tgt_hlen) != 0) {
+        rud->err->type      = "ReflowIncludeError";
+        rud->err->message   = "template not found";
+        rud->err->reason    = "not_found";
+        rud->err->requested = target_name;
+        return -1;
+    }
+
+    /* Push onto include stack. */
+    ctx->stack[ctx->depth]     = target_name;
+    ctx->stack_len[ctx->depth] = target_len;
+    ctx->depth++;
+    /* Recurse with the outer globals — for this stage we do not seed
+     * initial data from an x-with on the include element (deferred). */
+    int rc = frag_search(ctx, target_name, target_len,
+                         tgt_root, tgt_sidx, tgt_html, tgt_hlen,
+                         /*globals=*/NULL,
+                         rud->err);
+    ctx->depth--;
+    return rc;
+}
+
+static int frag_search(frag_search_ctx *ctx,
+                       const char *tname, size_t tname_len,
+                       ir_node *root, const sel_index *sindex,
+                       const char *html, size_t html_len,
+                       reflow_value *globals,
+                       reflow_error *err)
+{
+    (void)tname_len;
+    if (sindex == NULL) {
+        err->type    = "ReflowRuntimeError";
+        err->message = "template has no selector index";
+        return -1;
+    }
+
+    compile_arena *scratch = compile_arena_new(ctx->L, 1024);
+    int scratch_pos = lua_gettop(ctx->L);
+    sel_candidates *cands = sel_resolve(scratch, ctx->L, sindex, ctx->sel,
+                                        err);
+    if (cands == NULL) {
+        lua_pop(ctx->L, 1);
+        return -1;
+    }
+
+    if (cands->count > 0) {
+        /* Positional path: group by parent. */
+        if (cands->items[0].n_positional > 0) {
+            const ir_node *seen_parents[32];
+            size_t         n_seen = 0;
+            for (size_t ci = 0; ci < cands->count; ci++) {
+                const ir_node *cand_parent =
+                    cands->items[ci].element->element.parent;
+                bool already = false;
+                for (size_t k = 0; k < n_seen; k++) {
+                    if (seen_parents[k] == cand_parent) { already = true; break; }
+                }
+                if (already) continue;
+                if (n_seen < sizeof(seen_parents)/sizeof(seen_parents[0])) {
+                    seen_parents[n_seen++] = cand_parent;
+                }
+                const ir_node *group_els[64];
+                void          *group_ud[64];
+                size_t         group_n = 0;
+                for (size_t j = 0; j < cands->count; j++) {
+                    if (cands->items[j].element->element.parent != cand_parent) continue;
+                    if (group_n >= 64) break;
+                    group_els[group_n] = cands->items[j].element;
+                    group_ud[group_n]  = (void *)&cands->items[j];
+                    group_n++;
+                }
+                struct ir_node * const *rchildren = NULL;
+                size_t n_rchildren = 0;
+                if (cand_parent == NULL) {
+                    rchildren = root->root.children;
+                    n_rchildren = root->root.n_children;
+                }
+                buf_t group_out;
+                if (buf_init(&group_out) != 0) {
+                    lua_pop(ctx->L, 1);
+                    err->type = "ReflowRuntimeError";
+                    err->message = "out of memory";
+                    return -1;
+                }
+                reflow_error frerr = {0};
+                interpret_fragment_result fres =
+                    interpret_render_fragment_positional(
+                        ctx->rarena, cand_parent,
+                        rchildren, n_rchildren,
+                        group_els, group_ud, group_n,
+                        eval_positional_from_candidate,
+                        globals, ctx->L, ctx->s->helpers_ref,
+                        tname, html, html_len, ctx->hooks,
+                        &group_out, &frerr);
+                if (fres == INTERPRET_FRAG_ERROR) {
+                    lua_pop(ctx->L, 1);
+                    buf_free(&group_out);
+                    *err = frerr;
+                    return -1;
+                }
+                if (fres == INTERPRET_FRAG_OK) {
+                    if (ctx->match_count == 0) {
+                        buf_put(&ctx->first_match, group_out.data, group_out.len);
+                    }
+                    ctx->match_count++;
+                } else if (fres == INTERPRET_FRAG_MULTIPLE_MATCHES) {
+                    ctx->match_count += 2;
+                }
+                buf_free(&group_out);
+                if (ctx->match_count > 1) break;
+            }
+        } else {
+            /* Non-positional path. */
+            for (size_t ci = 0; ci < cands->count; ci++) {
+                const ir_node *target = cands->items[ci].element;
+                buf_t local;
+                if (buf_init(&local) != 0) {
+                    lua_pop(ctx->L, 1);
+                    err->type = "ReflowRuntimeError";
+                    err->message = "out of memory";
+                    return -1;
+                }
+                reflow_error frerr = {0};
+                interpret_fragment_result fres =
+                    interpret_render_fragment_at(
+                        ctx->rarena, target, globals, ctx->L,
+                        ctx->s->helpers_ref, tname, html, html_len,
+                        ctx->hooks, &local, &frerr);
+                if (fres == INTERPRET_FRAG_ERROR) {
+                    lua_pop(ctx->L, 1);
+                    buf_free(&local);
+                    *err = frerr;
+                    return -1;
+                }
+                if (fres == INTERPRET_FRAG_OK) {
+                    if (ctx->match_count == 0) {
+                        buf_put(&ctx->first_match, local.data, local.len);
+                    }
+                    ctx->match_count++;
+                } else if (fres == INTERPRET_FRAG_MULTIPLE_MATCHES) {
+                    ctx->match_count += 2;
+                }
+                buf_free(&local);
+                if (ctx->match_count > 1) break;
+            }
+        }
+    } else if (sindex->n_includes > 0) {
+        /* Cross-template fallback: walk each x-include element under
+         * its ancestor scope and recurse into the target template. */
+        for (size_t i = 0; i < sindex->n_includes; i++) {
+            const ir_node *include_el = sindex->includes[i];
+            include_reach_ud iud = {
+                .ctx        = ctx,
+                .include_el = include_el,
+                .err        = err,
+            };
+            size_t reached = 0;
+            int rc = interpret_execute_at(
+                ctx->rarena, include_el, globals, ctx->L,
+                ctx->s->helpers_ref, tname, html, html_len, ctx->hooks,
+                include_reach_cb, &iud, &reached, err);
+            if (rc != 0) {
+                lua_pop(ctx->L, 1);
+                return -1;
+            }
+            if (ctx->match_count > 1) break;
+        }
+    }
+
+    lua_pop(ctx->L, 1);   /* scratch arena */
+    (void)scratch_pos;
+    return 0;
 }
 
 /*
@@ -516,24 +786,38 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
         return lua_error(L);
     }
 
-    /* Resolve against the index using a scratch arena — the candidate
-     * list is short-lived and thrown away at the end of this call. */
-    compile_arena *scratch = compile_arena_new(L, 1024);
-    int scratch_pos = lua_gettop(L);
-    reflow_error rerr = {0};
-    sel_candidates *cands = sel_resolve(scratch, L, sindex, sel, &rerr);
-    if (cands == NULL) {
-        lua_pop(L, 1);
+    /* Set up the shared match state and dispatch through frag_search,
+     * which handles both same-template resolution and x-include
+     * cross-template fallback with a shared match count. */
+    frag_search_ctx ctx = {0};
+    if (buf_init(&ctx.first_match) != 0) {
         arena_destroy(rarena);
-        rerr.template_name = name;
-        push_reflow_error(L, &rerr, name);
+        return luaL_error(L, "out of memory");
+    }
+    ctx.s          = s;
+    ctx.L          = L;
+    ctx.hooks      = hooks;
+    ctx.rarena     = rarena;
+    ctx.sel        = sel;
+    ctx.max_depth  = s->max_include_depth;
+    ctx.stack[ctx.depth]     = name;
+    ctx.stack_len[ctx.depth] = strlen(name);
+    ctx.depth++;
+
+    reflow_error serr = {0};
+    int rc = frag_search(&ctx, name, strlen(name),
+                         root, sindex, html, html_len,
+                         globals, &serr);
+    if (rc != 0) {
+        buf_free(&ctx.first_match);
+        if (serr.template_name == NULL) serr.template_name = name;
+        push_reflow_error(L, &serr, name);
+        arena_destroy(rarena);
         return lua_error(L);
     }
 
-    /* Zero static candidates — cross-template x-include recursion is
-     * out of scope for this stage. */
-    if (cands->count == 0) {
-        lua_pop(L, 1);
+    if (ctx.match_count == 0) {
+        buf_free(&ctx.first_match);
         reflow_error nferr = {
             .type          = "ReflowSelectorError",
             .message       = "no element matches the selector",
@@ -546,208 +830,8 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
         arena_destroy(rarena);
         return lua_error(L);
     }
-
-    /* Positional path: candidates carry runtime predicates.  Group by
-     * parent and dispatch to interpret_render_fragment_positional so
-     * sibling positions can be counted before predicate evaluation. */
-    if (cands->items[0].n_positional > 0) {
-        /* Group by parent (or NULL for root-level candidates).  Small
-         * candidate counts keep this linear-map fine. */
-        const ir_node *seen_parents[32];
-        size_t         n_seen = 0;
-        buf_t out_local;
-        if (buf_init(&out_local) != 0) {
-            lua_pop(L, 1);
-            arena_destroy(rarena);
-            return luaL_error(L, "out of memory");
-        }
-        size_t total_matches = 0;
-        for (size_t ci = 0; ci < cands->count; ci++) {
-            const ir_node *cand_parent = cands->items[ci].element->element.parent;
-            /* Skip if we already processed this parent group. */
-            bool already = false;
-            for (size_t k = 0; k < n_seen; k++) {
-                if (seen_parents[k] == cand_parent) { already = true; break; }
-            }
-            if (already) continue;
-            if (n_seen < sizeof(seen_parents)/sizeof(seen_parents[0])) {
-                seen_parents[n_seen++] = cand_parent;
-            }
-
-            /* Collect this parent's candidate group. */
-            const ir_node *group_els[64];
-            void          *group_ud[64];
-            size_t         group_n = 0;
-            for (size_t j = 0; j < cands->count; j++) {
-                if (cands->items[j].element->element.parent != cand_parent) {
-                    continue;
-                }
-                if (group_n >= 64) break;
-                group_els[group_n] = cands->items[j].element;
-                /* Store the sel_candidate pointer as opaque UD so the
-                 * predicate callback can iterate its `positional`
-                 * array. */
-                group_ud[group_n]  = (void *)&cands->items[j];
-                group_n++;
-            }
-
-            /* Root-level candidates: cand_parent is NULL. */
-            struct ir_node * const *rchildren = NULL;
-            size_t n_rchildren = 0;
-            if (cand_parent == NULL) {
-                rchildren = root->root.children;
-                n_rchildren = root->root.n_children;
-            }
-
-            reflow_error frerr = {0};
-            buf_t group_out;
-            if (buf_init(&group_out) != 0) {
-                lua_pop(L, 1);
-                buf_free(&out_local);
-                arena_destroy(rarena);
-                return luaL_error(L, "out of memory");
-            }
-            interpret_fragment_result fres =
-                interpret_render_fragment_positional(
-                    rarena, cand_parent,
-                    rchildren, n_rchildren,
-                    group_els, group_ud, group_n,
-                    eval_positional_from_candidate,
-                    globals, L, s->helpers_ref,
-                    name, html, html_len, hooks,
-                    &group_out, &frerr);
-            if (fres == INTERPRET_FRAG_ERROR) {
-                if (frerr.template_name == NULL) frerr.template_name = name;
-                lua_pop(L, 1);
-                buf_free(&group_out);
-                buf_free(&out_local);
-                push_reflow_error(L, &frerr, name);
-                arena_destroy(rarena);
-                return lua_error(L);
-            }
-            if (fres == INTERPRET_FRAG_OK) {
-                if (total_matches == 0) {
-                    buf_put(&out_local, group_out.data, group_out.len);
-                }
-                total_matches++;
-            } else if (fres == INTERPRET_FRAG_MULTIPLE_MATCHES) {
-                total_matches += 2;
-            }
-            buf_free(&group_out);
-            if (total_matches > 1) break;
-        }
-        lua_remove(L, scratch_pos);
-        if (total_matches == 0) {
-            reflow_error nferr = {
-                .type          = "ReflowSelectorError",
-                .message       = "no element matches the selector at render time",
-                .template_name = name,
-                .reason        = "no_match",
-                .source        = sel->source,
-                .position      = 0,
-            };
-            buf_free(&out_local);
-            push_reflow_error(L, &nferr, name);
-            arena_destroy(rarena);
-            return lua_error(L);
-        }
-        if (total_matches > 1) {
-            reflow_error mmerr = {
-                .type          = "ReflowSelectorError",
-                .message       = "multiple elements match the selector at render time",
-                .template_name = name,
-                .reason        = "multiple_matches",
-                .source        = sel->source,
-                .position      = 0,
-            };
-            buf_free(&out_local);
-            push_reflow_error(L, &mmerr, name);
-            arena_destroy(rarena);
-            return lua_error(L);
-        }
-        lua_pushlstring(L, out_local.data, out_local.len);
-        buf_free(&out_local);
-        arena_destroy(rarena);
-        return 1;
-    }
-
-    /* Iterate every static candidate.  Each candidate runs through the
-     * ancestor walker which enforces branch selection at render time;
-     * across all candidates we accumulate the total emission count and
-     * apply the single-fragment contract on the sum.  This lets chain
-     * / match branches all be candidates while only the runtime-chosen
-     * one contributes output. */
-    buf_t out;
-    if (buf_init(&out) != 0) {
-        lua_pop(L, 1);
-        arena_destroy(rarena);
-        return luaL_error(L, "out of memory");
-    }
-    size_t total_emissions = 0;
-    for (size_t ci = 0; ci < cands->count; ci++) {
-        const sel_candidate *cand = &cands->items[ci];
-        const ir_node       *target = cand->element;
-        buf_t local;
-        if (buf_init(&local) != 0) {
-            lua_pop(L, 1);
-            buf_free(&out);
-            arena_destroy(rarena);
-            return luaL_error(L, "out of memory");
-        }
-        reflow_error frerr = {0};
-        interpret_fragment_result fres =
-            interpret_render_fragment_at(rarena, target, globals, L,
-                                         s->helpers_ref,
-                                         name, html, html_len,
-                                         hooks, &local, &frerr);
-        if (fres == INTERPRET_FRAG_ERROR) {
-            if (frerr.template_name == NULL) frerr.template_name = name;
-            lua_pop(L, 1);
-            push_reflow_error(L, &frerr, name);
-            buf_free(&local);
-            buf_free(&out);
-            arena_destroy(rarena);
-            return lua_error(L);
-        }
-        if (fres == INTERPRET_FRAG_MULTIPLE_MATCHES) {
-            /* One candidate alone exceeded the single-match budget. */
-            total_emissions += 2;
-            buf_free(&local);
-            break;
-        }
-        if (fres == INTERPRET_FRAG_OK) {
-            if (total_emissions == 0) {
-                if (buf_put(&out, local.data, local.len) != 0) {
-                    lua_pop(L, 1);
-                    buf_free(&local);
-                    buf_free(&out);
-                    arena_destroy(rarena);
-                    return luaL_error(L, "out of memory");
-                }
-            }
-            total_emissions++;
-        }
-        buf_free(&local);
-        if (total_emissions > 1) break;
-    }
-    /* Drop the scratch arena — candidate list no longer needed. */
-    lua_remove(L, scratch_pos);
-
-    if (total_emissions == 0) {
-        reflow_error nferr = {
-            .type          = "ReflowSelectorError",
-            .message       = "no element matches the selector at render time",
-            .template_name = name,
-            .reason        = "no_match",
-            .source        = sel->source,
-            .position      = 0,
-        };
-        buf_free(&out);
-        push_reflow_error(L, &nferr, name);
-        arena_destroy(rarena);
-        return lua_error(L);
-    }
-    if (total_emissions > 1) {
+    if (ctx.match_count > 1) {
+        buf_free(&ctx.first_match);
         reflow_error mmerr = {
             .type          = "ReflowSelectorError",
             .message       = "multiple elements match the selector at render time",
@@ -756,17 +840,15 @@ static int render_fragment_path(lua_State *L, reflow_state *s,
             .source        = sel->source,
             .position      = 0,
         };
-        buf_free(&out);
         push_reflow_error(L, &mmerr, name);
         arena_destroy(rarena);
         return lua_error(L);
     }
-    lua_pushlstring(L, out.data, out.len);
-    buf_free(&out);
+    lua_pushlstring(L, ctx.first_match.data, ctx.first_match.len);
+    buf_free(&ctx.first_match);
     arena_destroy(rarena);
     return 1;
 }
-
 int rf_state_render(lua_State *L)
 {
     reflow_state *s = check_state(L, 1);
