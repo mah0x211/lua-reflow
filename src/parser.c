@@ -39,7 +39,11 @@
 
 // project
 #include "parser.h"
+#include "checked.h"
+#include "compile_arena.h"
 // depend
+#include "lexbor/core/base.h"
+#include "lexbor/core/lexbor.h"
 #include "lexbor/html/html.h"
 #include "lexbor/html/tokenizer.h"
 #include "lexbor/tag/const.h"
@@ -53,8 +57,85 @@
 #define PARSER_MAX_ATTRS  64
 #define PARSER_MAX_DEPTH  256
 
-/* Static buffer for parse error messages (single-threaded Lua, no leak). */
-static char g_parser_err[256];
+/* Lexbor exposes process-global callbacks without a context pointer. Reflow's
+ * public C entry points are serialized by contract, so a scoped context stack
+ * can safely route every dependency allocation to the currently protected Lua
+ * operation. The pcall wrapper below restores this pointer after a Lua OOM
+ * longjmp as well as after normal completion. */
+typedef struct lexbor_lua_context {
+    lua_State                 *L;
+    compile_arena             *arena;
+    struct lexbor_lua_context *previous;
+} lexbor_lua_context;
+
+typedef union lexbor_block_header {
+    size_t      size;
+    long double align_long_double;
+    void       *align_pointer;
+} lexbor_block_header;
+
+static lexbor_lua_context *g_lexbor_context;
+static bool g_lexbor_allocator_installed;
+
+static void *lexbor_lua_malloc(size_t size)
+{
+    lexbor_lua_context *ctx = g_lexbor_context;
+    size_t total = 0;
+    if (ctx == NULL ||
+        !reflow_size_add(sizeof(lexbor_block_header), size, &total)) {
+        return NULL;
+    }
+    lexbor_block_header *header = (lexbor_block_header *)
+        compile_arena_alloc(ctx->arena, ctx->L, total);
+    header->size = size;
+    return (void *)(header + 1);
+}
+
+static void *lexbor_lua_calloc(size_t count, size_t size)
+{
+    size_t bytes = 0;
+    if (!reflow_size_mul(count, size, &bytes)) return NULL;
+    void *ptr = lexbor_lua_malloc(bytes);
+    if (ptr != NULL) memset(ptr, 0, bytes);
+    return ptr;
+}
+
+static void *lexbor_lua_realloc(void *ptr, size_t size)
+{
+    if (ptr == NULL) return lexbor_lua_malloc(size);
+    if (size == 0) return NULL;
+    lexbor_block_header *old_header =
+        ((lexbor_block_header *)ptr) - 1;
+    void *replacement = lexbor_lua_malloc(size);
+    if (replacement != NULL) {
+        size_t copy_size = old_header->size < size ? old_header->size : size;
+        memcpy(replacement, ptr, copy_size);
+    }
+    return replacement;
+}
+
+static void lexbor_lua_free(void *ptr)
+{
+    (void)ptr;
+    /* Individual release is intentionally a no-op; the operation arena is
+     * reclaimed as a Lua-reachable ownership graph. */
+}
+
+static int ensure_lexbor_allocator(reflow_error *err)
+{
+    if (g_lexbor_allocator_installed) return 0;
+    if (lexbor_memory_setup(lexbor_lua_malloc, lexbor_lua_realloc,
+                            lexbor_lua_calloc, lexbor_lua_free) !=
+        LXB_STATUS_OK) {
+        if (err != NULL) {
+            err->type = "ReflowCompileError";
+            err->message = "failed to install Lua-backed HTML allocator";
+        }
+        return -1;
+    }
+    g_lexbor_allocator_installed = true;
+    return 0;
+}
 
 /* HTML5 void element tag ids. These never receive on_endtag. */
 static bool is_void_id(lxb_tag_id_t id)
@@ -80,6 +161,8 @@ typedef struct {
 typedef struct {
     const sax_handler *h;
     reflow_error      *err;
+    lua_State         *L;
+    compile_arena     *error_arena;
     const char        *src_base;
     size_t             src_len;
     int                next_token;
@@ -92,12 +175,17 @@ static void parser_error(parser_state *ps, const char *fmt, ...)
     if (ps->err == NULL || ps->err->message != NULL) {
         return;
     }
+    char message[256];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_parser_err, sizeof(g_parser_err), fmt, ap);
+    vsnprintf(message, sizeof(message), fmt, ap);
     va_end(ap);
+    size_t len = strlen(message);
+    char *owned = (char *)compile_arena_alloc(ps->error_arena, ps->L,
+                                              len + 1);
+    memcpy(owned, message, len + 1);
     ps->err->type    = "ReflowCompileError";
-    ps->err->message = g_parser_err;
+    ps->err->message = owned;
 }
 
 static size_t offset_of(parser_state *ps, const lxb_char_t *p)
@@ -278,16 +366,36 @@ static lxb_html_token_t *on_token_cb(lxb_html_tokenizer_t *tkz,
     return token;
 }
 
-int html_parse(const char *src, size_t len,
-               const sax_handler *handler, reflow_error *err)
+typedef struct html_parse_call {
+    const char        *src;
+    size_t             len;
+    const sax_handler *handler;
+    reflow_error      *err;
+    compile_arena     *error_arena;
+} html_parse_call;
+
+static int html_parse_protected(lua_State *L)
 {
+    /* html_parse() mirrors every value that was visible to its caller as a
+     * pcall argument.  Keep the call descriptor last so absolute stack
+     * indices captured by SAX test hooks continue to refer to the same Lua
+     * objects while dependency allocations are protected from longjmp. */
+    html_parse_call *call = (html_parse_call *)
+        lua_touserdata(L, lua_gettop(L));
+    const char *src = call->src;
+    size_t len = call->len;
+    const sax_handler *handler = call->handler;
+    reflow_error *err = call->err;
     if (handler == NULL) {
-        return -1;
+        lua_pushinteger(L, -1);
+        return 1;
     }
 
     parser_state ps = {
         .h          = handler,
         .err        = err,
+        .L          = L,
+        .error_arena = call->error_arena,
         .src_base   = src,
         .src_len    = len,
         .next_token = 0,
@@ -297,14 +405,16 @@ int html_parse(const char *src, size_t len,
     lxb_html_tokenizer_t *tkz = lxb_html_tokenizer_create();
     if (tkz == NULL) {
         parser_error(&ps, "failed to allocate HTML tokenizer");
-        return -1;
+        lua_pushinteger(L, -1);
+        return 1;
     }
 
     lxb_status_t s = lxb_html_tokenizer_init(tkz);
     if (s != LXB_STATUS_OK) {
         lxb_html_tokenizer_destroy(tkz);
         parser_error(&ps, "failed to initialize HTML tokenizer");
-        return -1;
+        lua_pushinteger(L, -1);
+        return 1;
     }
 
     /* Custom tag table so #text, #comment, #doctype, etc. reach us. */
@@ -312,7 +422,8 @@ int html_parse(const char *src, size_t len,
     if (s != LXB_STATUS_OK) {
         lxb_html_tokenizer_destroy(tkz);
         parser_error(&ps, "failed to create HTML tag table");
-        return -1;
+        lua_pushinteger(L, -1);
+        return 1;
     }
 
     lxb_html_tokenizer_callback_token_done_set(tkz, on_token_cb, &ps);
@@ -322,7 +433,8 @@ int html_parse(const char *src, size_t len,
         lxb_html_tokenizer_tags_destroy(tkz);
         lxb_html_tokenizer_destroy(tkz);
         parser_error(&ps, "failed to begin HTML tokenization");
-        return -1;
+        lua_pushinteger(L, -1);
+        return 1;
     }
 
     s = lxb_html_tokenizer_chunk(tkz, (const lxb_char_t *)src, len);
@@ -336,7 +448,8 @@ int html_parse(const char *src, size_t len,
     lxb_html_tokenizer_destroy(tkz);
 
     if (err != NULL && err->message != NULL) {
-        return -1;
+        lua_pushinteger(L, -1);
+        return 1;
     }
 
     /* Unclosed elements: report the innermost one. */
@@ -344,7 +457,59 @@ int html_parse(const char *src, size_t len,
         open_elem top = ps.stack[ps.depth - 1];
         parser_error(&ps, "unclosed element <%.*s>",
                      (int)top.tag_len, top.tag_name);
-        return -1;
+        lua_pushinteger(L, -1);
+        return 1;
     }
-    return 0;
+    lua_pushinteger(L, 0);
+    return 1;
+}
+
+int html_parse(lua_State *L, compile_arena *error_arena,
+               const char *src, size_t len,
+               const sax_handler *handler, reflow_error *err)
+{
+    if (ensure_lexbor_allocator(err) != 0) return -1;
+
+    compile_arena *scratch = compile_arena_new(L, 32768);
+    int scratch_index = lua_gettop(L);
+    lexbor_lua_context context = {
+        .L = L,
+        .arena = scratch,
+        .previous = g_lexbor_context,
+    };
+    html_parse_call call = {
+        .src = src,
+        .len = len,
+        .handler = handler,
+        .err = err,
+        .error_arena = error_arena,
+    };
+
+    /* A C function invoked by lua_pcall sees only its arguments.  Duplicate
+     * the current stack as arguments so callbacks holding absolute indices
+     * can still mutate caller-owned tables.  Do all potentially allocating
+     * stack growth before publishing the process-global allocator context. */
+    int visible_top = lua_gettop(L);
+    if (!lua_checkstack(L, visible_top + 2)) {
+        lua_remove(L, scratch_index);
+        lua_pushliteral(L, "HTML parser stack overflow");
+        return lua_error(L);
+    }
+    lua_pushcfunction(L, html_parse_protected);
+    for (int i = 1; i <= visible_top; i++) {
+        lua_pushvalue(L, i);
+    }
+    lua_pushlightuserdata(L, &call);
+    g_lexbor_context = &context;
+    int status = lua_pcall(L, visible_top + 1, 1, 0);
+    g_lexbor_context = context.previous;
+
+    if (status != 0) {
+        lua_remove(L, scratch_index);
+        return lua_error(L);
+    }
+    int result = (int)lua_tointeger(L, -1);
+    lua_pop(L, 1);
+    lua_remove(L, scratch_index);
+    return result;
 }

@@ -25,11 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "match.h"
+#include "../checked.h"
 
-/* Persistent error scratch — resolve is single-threaded like the rest
- * of the C core. */
-static char g_resolve_err[512];
-static char g_resolve_feature[128];
 
 /* --- Seed selection --------------------------------------------------- */
 
@@ -157,23 +154,34 @@ static const char *pseudo_name_str(sel_pseudo_name n)
  * emissions, which is outside the fragment-fetching model. Compound
  * position N-1 always carries the terminal pseudos.
  */
-static int reject_ancestor_positional(const sel_complex *complex,
+static int reject_ancestor_positional(compile_arena *arena, lua_State *L,
+                                      const sel_complex *complex,
                                       reflow_error *err)
 {
     for (size_t i = 0; i + 1 < complex->n_parts; i++) {
         const sel_compound *c = &complex->parts[i].compound;
         if (c->n_pseudos == 0) continue;
         const char *name = pseudo_name_str(c->pseudos[0].name);
-        snprintf(g_resolve_err, sizeof(g_resolve_err),
+        char message[512], feature[128];
+        snprintf(message, sizeof(message),
                  "positional pseudo-class \":%s\" is only supported on "
                  "the rightmost compound selector",
                  name);
-        snprintf(g_resolve_feature, sizeof(g_resolve_feature),
+        snprintf(feature, sizeof(feature),
                  "pseudo-ancestor:%s", name);
         err->type    = "ReflowSelectorError";
-        err->message = g_resolve_err;
+        size_t bytes;
+        if (!reflow_size_add(strlen(message), 1, &bytes)) return -1;
+        char *msg = compile_arena_alloc(arena, L, bytes);
+        if (!msg) return -1;
+        memcpy(msg, message, bytes);
+        if (!reflow_size_add(strlen(feature), 1, &bytes)) return -1;
+        char *feat = compile_arena_alloc(arena, L, bytes);
+        if (!feat) return -1;
+        memcpy(feat, feature, bytes);
+        err->message = msg;
         err->reason  = "unsupported";
-        err->feature = g_resolve_feature;
+        err->feature = feat;
         return -1;
     }
     return 0;
@@ -191,6 +199,8 @@ typedef struct {
     sel_candidate *items;
     size_t         count;
     size_t         cap;
+    compile_arena *arena;
+    lua_State *L;
 } merge_buf_t;
 
 static int merge_push(merge_buf_t *m, const ir_node *el,
@@ -200,10 +210,13 @@ static int merge_push(merge_buf_t *m, const ir_node *el,
         if (m->items[i].element == el) return 0;   /* dedup */
     }
     if (m->count == m->cap) {
-        size_t ncap = m->cap ? m->cap * 2 : 4;
-        sel_candidate *nb =
-            (sel_candidate *)realloc(m->items, ncap * sizeof(*nb));
+        size_t required, ncap, bytes;
+        if (!reflow_size_add(m->count, 1, &required) ||
+            !reflow_size_grow(m->cap ? m->cap : 4, required, &ncap) ||
+            !reflow_size_mul(ncap, sizeof(*m->items), &bytes)) return -1;
+        sel_candidate *nb = compile_arena_alloc(m->arena, m->L, bytes);
         if (!nb) return -1;
+        if (m->count) memcpy(nb, m->items, m->count * sizeof(*nb));
         m->items = nb;
         m->cap   = ncap;
     }
@@ -231,12 +244,12 @@ sel_candidates *sel_resolve(compile_arena *arena, lua_State *L,
     /* Reject positional pseudos on ancestor compounds up-front so we
      * never do wasted matching work when the selector is unsupported. */
     for (size_t si = 0; si < selector->n_selectors; si++) {
-        if (reject_ancestor_positional(&selector->selectors[si], err) != 0) {
+        if (reject_ancestor_positional(arena, L, &selector->selectors[si], err) != 0) {
             return NULL;
         }
     }
 
-    merge_buf_t buf = {0};
+    merge_buf_t buf = { .arena = arena, .L = L };
 
     for (size_t si = 0; si < selector->n_selectors; si++) {
         const sel_complex *complex = &selector->selectors[si];
@@ -253,7 +266,6 @@ sel_candidates *sel_resolve(compile_arena *arena, lua_State *L,
             if (!matches_complex(el, complex)) continue;
             if (merge_push(&buf, el, last->pseudos,
                            last->n_pseudos) != 0) {
-                free(buf.items);
                 err->type    = "ReflowSelectorError";
                 err->message = "selector resolve: out of memory";
                 err->reason  = "syntax";
@@ -263,17 +275,24 @@ sel_candidates *sel_resolve(compile_arena *arena, lua_State *L,
     }
 
     /* Copy the merged set into arena storage in document order. */
+    size_t out_count = buf.count == 0 ? 1 : buf.count;
+    size_t out_bytes;
+    if (!reflow_size_mul(sizeof(sel_candidate), out_count, &out_bytes)) {
+        err->type = "ReflowSelectorError";
+        err->message = "selector resolve: size overflow";
+        err->reason = "syntax";
+        return NULL;
+    }
     sel_candidates *out =
         (sel_candidates *)compile_arena_alloc(arena, L, sizeof(*out));
     out->count = buf.count;
     out->items = (sel_candidate *)compile_arena_alloc(
-        arena, L, sizeof(sel_candidate) * (buf.count == 0 ? 1 : buf.count));
+        arena, L, out_bytes);
     if (buf.count > 0) {
         qsort(buf.items, buf.count, sizeof(sel_candidate), cmp_by_order);
         memcpy(out->items, buf.items,
-               buf.count * sizeof(sel_candidate));
+               out_bytes);
     }
-    free(buf.items);
     return out;
 }
 

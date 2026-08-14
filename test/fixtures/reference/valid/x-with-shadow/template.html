@@ -1,0 +1,7 @@
+<section x-data="user: { name: 'Outer' }">
+<p x-text="@user.name"></p>
+<div x-with="user = { name: 'Inner' }">
+<p x-text="@user.name"></p>
+</div>
+<p x-text="@user.name"></p>
+</section>

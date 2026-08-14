@@ -27,6 +27,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#include "arena.h"
+
 /* JS value tag (see docs/design/02-value-model.md, 04-runtime.md §2.1). */
 typedef enum {
     RV_NULL,       /* JS null */
@@ -78,8 +80,8 @@ int rv_is_truthy(const reflow_value *v);
 /* === / !== ; arrays/objects compare by pointer identity. */
 int rv_strict_eq(const reflow_value *a, const reflow_value *b);
 int rv_strict_neq(const reflow_value *a, const reflow_value *b);
-/* < > <= >= : returns -1/0/1, or 2 for not-comparable (NaN / mixed types). */
-int rv_compare(const reflow_value *a, const reflow_value *b);
+/* < > <= >= : JS relational coercion; returns -1/0/1, or 2 for NaN. */
+int rv_compare(const reflow_value *a, const reflow_value *b, arena_t *arena);
 /* Array.isArray equivalent. */
 int rv_is_array(const reflow_value *v);
 

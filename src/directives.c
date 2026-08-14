@@ -23,12 +23,15 @@
 
 // project
 #include "directives.h"
+#include "checked.h"
 #include "expr/parse.h"
 #include "json5.h"
 // lua
+#include <lauxlib.h>
 #include <lua.h>
 // system
 #include <ctype.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,17 +39,24 @@
 
 /* ── Error helper ─────────────────────────────────────────── */
 
-static char g_dir_err[256];
-
-static void dir_error(reflow_error *err, const char *fmt, ...)
+static void dir_error(compile_arena *arena, lua_State *L,
+                      reflow_error *err, const char *fmt, ...)
 {
     if (err) {
+        char message[256];
         va_list ap;
         va_start(ap, fmt);
-        vsnprintf(g_dir_err, sizeof(g_dir_err), fmt, ap);
+        vsnprintf(message, sizeof(message), fmt, ap);
         va_end(ap);
+        size_t len = strlen(message);
+        size_t bytes = 0;
+        if (!reflow_size_add(len, 1, &bytes)) {
+            luaL_error(L, "directive error message is too large");
+        }
+        char *owned = (char *)compile_arena_alloc(arena, L, bytes);
+        memcpy(owned, message, bytes);
         err->type    = "ReflowCompileError";
-        err->message = g_dir_err;
+        err->message = owned;
     }
 }
 
@@ -77,7 +87,11 @@ static void skip_ws(const char **p, const char *end)
 static char *dup_str(compile_arena *arena, lua_State *L,
                      const char *src, size_t len)
 {
-    char *dst = (char *)compile_arena_alloc(arena, L, len + 1);
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        luaL_error(L, "directive string is too large");
+    }
+    char *dst = (char *)compile_arena_alloc(arena, L, bytes);
     memcpy(dst, src, len);
     dst[len] = '\0';
     return dst;
@@ -90,17 +104,15 @@ reflow_value *directives_parse_data(compile_arena *arena, lua_State *L,
                                     const char *value, size_t len,
                                     reflow_error *err)
 {
-    (void)arena;
-    (void)L;
     reflow_error jerr = {0};
     reflow_value *rv = json5_parse_data(value, len, rarena, &jerr);
     if (!rv) {
-        dir_error(err, "x-data: invalid JSON5: %s",
+        dir_error(arena, L, err, "x-data: invalid JSON5: %s",
                   jerr.message ? jerr.message : "parse error");
         return NULL;
     }
     if (rv->tag != RV_OBJECT) {
-        dir_error(err, "x-data: value must parse to an object");
+        dir_error(arena, L, err, "x-data: value must parse to an object");
         return NULL;
     }
     return rv;
@@ -109,7 +121,9 @@ reflow_value *directives_parse_data(compile_arena *arena, lua_State *L,
 /* ── x-with ───────────────────────────────────────────────── */
 
 static size_t skip_string_lit(const char *src, size_t pos, size_t len,
-                              const char *binding_name, reflow_error *err)
+                              const char *binding_name,
+                              compile_arena *arena, lua_State *L,
+                              reflow_error *err)
 {
     char quote = src[pos];
     pos++;
@@ -122,7 +136,8 @@ static size_t skip_string_lit(const char *src, size_t pos, size_t len,
         if (ch == quote) return pos + 1;
         pos++;
     }
-    dir_error(err, "x-with: unterminated string literal in binding \"%s\"",
+    dir_error(arena, L, err,
+              "x-with: unterminated string literal in binding \"%s\"",
               binding_name);
     return len;  /* will cause failure downstream */
 }
@@ -135,8 +150,12 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
     const char *src = value;
     const char *end = src + len;
     size_t cap = 4;
+    size_t initial_size = 0;
+    if (!reflow_size_mul(cap, sizeof(ir_with_binding), &initial_size)) {
+        luaL_error(L, "too many x-with bindings");
+    }
     ir_with_binding *bindings = (ir_with_binding *)
-        compile_arena_alloc(arena, L, cap * sizeof(ir_with_binding));
+        compile_arena_alloc(arena, L, initial_size);
     size_t n = 0;
     const char *p = src;
 
@@ -146,7 +165,8 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
 
         /* Binding name */
         if (!is_id_start((unsigned char)*p)) {
-            dir_error(err, "x-with: expected binding name at position %zu",
+            dir_error(arena, L, err,
+                      "x-with: expected binding name at position %zu",
                       (size_t)(p - src));
             return result;
         }
@@ -160,7 +180,8 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
             if (strlen(bindings[i].name) == name_len &&
                 memcmp(bindings[i].name, name_start, name_len) == 0) {
                 char *nm = dup_str(arena, L, name_start, name_len);
-                dir_error(err, "x-with: duplicate binding name \"%s\"", nm);
+                dir_error(arena, L, err,
+                          "x-with: duplicate binding name \"%s\"", nm);
                 return result;
             }
         }
@@ -168,7 +189,8 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
         skip_ws(&p, end);
         if (p >= end || *p != '=') {
             char *nm = dup_str(arena, L, name_start, name_len);
-            dir_error(err, "x-with: expected \"=\" after binding name \"%s\"",
+            dir_error(arena, L, err,
+                      "x-with: expected \"=\" after binding name \"%s\"",
                       nm);
             return result;
         }
@@ -183,7 +205,7 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
             if (ch == '"' || ch == '\'') {
                 char *nm = dup_str(arena, L, name_start, name_len);
                 size_t new_pos = skip_string_lit(src, (size_t)(p - src),
-                                                 len, nm, err);
+                                                 len, nm, arena, L, err);
                 if (err->message) return result;
                 p = src + new_pos;
                 continue;
@@ -192,7 +214,7 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
             if (ch == '}' || ch == ']' || ch == ')') {
                 if (depth == 0) {
                     char *nm = dup_str(arena, L, name_start, name_len);
-                    dir_error(err,
+                    dir_error(arena, L, err,
                         "x-with: unbalanced \"%c\" in binding \"%s\"", ch, nm);
                     return result;
                 }
@@ -203,7 +225,8 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
         }
         if (depth != 0) {
             char *nm = dup_str(arena, L, name_start, name_len);
-            dir_error(err, "x-with: unbalanced brackets in binding \"%s\"", nm);
+            dir_error(arena, L, err,
+                      "x-with: unbalanced brackets in binding \"%s\"", nm);
             return result;
         }
 
@@ -218,7 +241,7 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
         }
         if (expr_end == expr_start) {
             char *nm = dup_str(arena, L, name_start, name_len);
-            dir_error(err,
+            dir_error(arena, L, err,
                 "x-with: value expression is required for binding \"%s\"", nm);
             return result;
         }
@@ -229,17 +252,29 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
                                      (size_t)(expr_end - expr_start), &perr);
         if (!expr) {
             char *nm = dup_str(arena, L, name_start, name_len);
-            dir_error(err, "x-with: %s (in binding \"%s\")",
+            dir_error(arena, L, err, "x-with: %s (in binding \"%s\")",
                       perr.message ? perr.message : "parse error", nm);
             return result;
         }
 
         /* Grow if needed */
         if (n >= cap) {
-            size_t newcap = cap * 2;
+            size_t newcap = 0;
+            size_t required = 0;
+            size_t alloc_size = 0;
+            if (!reflow_size_add(n, 1, &required) ||
+                !reflow_size_grow(cap, required, &newcap) ||
+                !reflow_size_mul(newcap, sizeof(ir_with_binding),
+                                 &alloc_size)) {
+                luaL_error(L, "too many x-with bindings");
+            }
             ir_with_binding *nb = (ir_with_binding *)
-                compile_arena_alloc(arena, L, newcap * sizeof(ir_with_binding));
-            memcpy(nb, bindings, n * sizeof(ir_with_binding));
+                compile_arena_alloc(arena, L, alloc_size);
+            size_t copy_size = 0;
+            if (!reflow_size_mul(n, sizeof(ir_with_binding), &copy_size)) {
+                luaL_error(L, "too many x-with bindings");
+            }
+            memcpy(nb, bindings, copy_size);
             bindings = nb;
             cap = newcap;
         }
@@ -250,7 +285,8 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
         skip_ws(&p, end);
         if (p >= end) break;
         if (*p != ',') {
-            dir_error(err, "x-with: unexpected token \"%c\" at position %zu",
+            dir_error(arena, L, err,
+                      "x-with: unexpected token \"%c\" at position %zu",
                       *p, (size_t)(p - src));
             return result;
         }
@@ -258,7 +294,8 @@ ir_with_result directives_parse_with(compile_arena *arena, lua_State *L,
     }
 
     if (n == 0) {
-        dir_error(err, "x-with: at least one binding is required");
+        dir_error(arena, L, err,
+                  "x-with: at least one binding is required");
         return result;
     }
 
@@ -286,13 +323,13 @@ expr_node *directives_parse_expr(compile_arena *arena, lua_State *L,
             break;
     }
     if (start >= end) {
-        dir_error(err, "%s: value is required", directive_name);
+        dir_error(arena, L, err, "%s: value is required", directive_name);
         return NULL;
     }
     reflow_error perr = {0};
     expr_node *node = expr_parse(arena, L, start, (size_t)(end - start), &perr);
     if (!node) {
-        dir_error(err, "%s: %s", directive_name,
+        dir_error(arena, L, err, "%s: %s", directive_name,
                   perr.message ? perr.message : "parse error");
         return NULL;
     }
@@ -301,7 +338,8 @@ expr_node *directives_parse_expr(compile_arena *arena, lua_State *L,
 
 /* ── assertEmptyValue ─────────────────────────────────────── */
 
-int directives_assert_empty(const char *value, size_t len,
+int directives_assert_empty(compile_arena *arena, lua_State *L,
+                            const char *value, size_t len,
                             const char *directive_name,
                             reflow_error *err)
 {
@@ -309,7 +347,7 @@ int directives_assert_empty(const char *value, size_t len,
         for (size_t i = 0; i < len; i++) {
             unsigned char c = (unsigned char)value[i];
             if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
-                dir_error(err,
+                dir_error(arena, L, err,
                     "%s: must not have a value; got \"%s=\"%.*s\"",
                     directive_name, directive_name, (int)len, value);
                 return -1;
@@ -321,31 +359,41 @@ int directives_assert_empty(const char *value, size_t len,
 
 /* ── x-for ────────────────────────────────────────────────── */
 
-static int parse_int_strict(const char *s, size_t len, double *out,
+static int parse_int_strict(compile_arena *arena, lua_State *L,
+                            const char *s, size_t len, double *out,
                             const char *directive, reflow_error *err)
 {
     /* Validate: optional '-' followed by digits only */
     size_t i = 0;
     if (i < len && s[i] == '-') i++;
     if (i >= len || !isdigit((unsigned char)s[i])) {
-        dir_error(err, "%s: \"%.*s\" is not an integer",
+        dir_error(arena, L, err, "%s: \"%.*s\" is not an integer",
                   directive, (int)len, s);
         return -1;
     }
     while (i < len) {
         if (!isdigit((unsigned char)s[i])) {
-            dir_error(err, "%s: \"%.*s\" is not an integer",
+            dir_error(arena, L, err, "%s: \"%.*s\" is not an integer",
                       directive, (int)len, s);
             return -1;
         }
         i++;
     }
-    /* Parse */
-    char buf[32];
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    /* Parse the complete token. The former 32-byte scratch buffer silently
+     * truncated long input and could change loop bounds. */
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        dir_error(arena, L, err, "%s: integer is too large", directive);
+        return -1;
+    }
+    char *buf = (char *)compile_arena_alloc(arena, L, bytes);
     memcpy(buf, s, len);
     buf[len] = '\0';
-    *out = (double)strtoll(buf, NULL, 10);
+    *out = strtod(buf, NULL);
+    if (!isfinite(*out)) {
+        dir_error(arena, L, err, "%s: integer is out of range", directive);
+        return -1;
+    }
     return 0;
 }
 
@@ -359,7 +407,7 @@ ir_for_spec *directives_parse_for(compile_arena *arena, lua_State *L,
         if (value[i] == '=') { eq = value + i; break; }
     }
     if (!eq) {
-        dir_error(err, "x-for: missing \"=\", expected "
+        dir_error(arena, L, err, "x-for: missing \"=\", expected "
                   "\"<var> = <start>, <stop>[, <step>]\"");
         return NULL;
     }
@@ -374,7 +422,7 @@ ir_for_spec *directives_parse_for(compile_arena *arena, lua_State *L,
         else break;
     }
     if (vs >= ve || !is_id_start((unsigned char)*vs)) {
-        dir_error(err, "x-for: invalid variable name \"%.*s\"",
+        dir_error(arena, L, err, "x-for: invalid variable name \"%.*s\"",
                   (int)(ve - vs), vs);
         return NULL;
     }
@@ -382,7 +430,7 @@ ir_for_spec *directives_parse_for(compile_arena *arena, lua_State *L,
     const char *check = vs + 1;
     while (check < ve && is_id_cont((unsigned char)*check)) check++;
     if (check != ve) {
-        dir_error(err, "x-for: invalid variable name \"%.*s\"",
+        dir_error(arena, L, err, "x-for: invalid variable name \"%.*s\"",
                   (int)(ve - vs), vs);
         return NULL;
     }
@@ -405,10 +453,11 @@ ir_for_spec *directives_parse_for(compile_arena *arena, lua_State *L,
             else break;
         }
         if (part_end == part_start) {
-            dir_error(err, "x-for: empty argument");
+            dir_error(arena, L, err, "x-for: empty argument");
             return NULL;
         }
-        if (parse_int_strict(part_start, (size_t)(part_end - part_start),
+        if (parse_int_strict(arena, L, part_start,
+                             (size_t)(part_end - part_start),
                              &nums[n_nums], "x-for", err) != 0)
             return NULL;
         n_nums++;
@@ -416,7 +465,8 @@ ir_for_spec *directives_parse_for(compile_arena *arena, lua_State *L,
     }
 
     if (n_nums < 2 || n_nums > 3) {
-        dir_error(err, "x-for: expected 2 or 3 arguments after \"=\", got %d",
+        dir_error(arena, L, err,
+                  "x-for: expected 2 or 3 arguments after \"=\", got %d",
                   n_nums);
         return NULL;
     }
@@ -425,16 +475,18 @@ ir_for_spec *directives_parse_for(compile_arena *arena, lua_State *L,
     double step = (n_nums == 3) ? nums[2] : 1.0;
 
     if (step == 0) {
-        dir_error(err, "x-for: step must not be zero");
+        dir_error(arena, L, err, "x-for: step must not be zero");
         return NULL;
     }
     if (start < stop && step < 0) {
-        dir_error(err, "x-for: direction mismatch (start=%g < stop=%g "
+        dir_error(arena, L, err,
+                  "x-for: direction mismatch (start=%g < stop=%g "
                   "but step=%g < 0)", start, stop, step);
         return NULL;
     }
     if (start > stop && step > 0) {
-        dir_error(err, "x-for: direction mismatch (start=%g > stop=%g "
+        dir_error(arena, L, err,
+                  "x-for: direction mismatch (start=%g > stop=%g "
                   "but step=%g > 0)", start, stop, step);
         return NULL;
     }
@@ -459,7 +511,8 @@ ir_each_spec *directives_parse_each(compile_arena *arena, lua_State *L,
 
     skip_ws(&p, end);
     if (p >= end || !is_id_start((unsigned char)*p)) {
-        dir_error(err, "x-each: expected \"<item>[, <index>] in <collection>"
+        dir_error(arena, L, err,
+                  "x-each: expected \"<item>[, <index>] in <collection>"
                   "\", got \"%.*s\"", (int)len, value);
         return NULL;
     }
@@ -488,13 +541,15 @@ ir_each_spec *directives_parse_each(compile_arena *arena, lua_State *L,
     /* "in" keyword */
     skip_ws(&p, end);
     if (p + 2 > end || !(p[0] == 'i' && p[1] == 'n')) {
-        dir_error(err, "x-each: expected \"in\" keyword, got \"%.*s\"",
+        dir_error(arena, L, err,
+                  "x-each: expected \"in\" keyword, got \"%.*s\"",
                   (int)len, value);
         return NULL;
     }
     /* Check word boundary after "in" */
     if (p + 2 < end && is_id_cont((unsigned char)p[2])) {
-        dir_error(err, "x-each: expected \"in\" keyword, got \"%.*s\"",
+        dir_error(arena, L, err,
+                  "x-each: expected \"in\" keyword, got \"%.*s\"",
                   (int)len, value);
         return NULL;
     }
@@ -503,7 +558,8 @@ ir_each_spec *directives_parse_each(compile_arena *arena, lua_State *L,
     /* Collection expression */
     skip_ws(&p, end);
     if (p >= end) {
-        dir_error(err, "x-each: collection expression is required");
+        dir_error(arena, L, err,
+                  "x-each: collection expression is required");
         return NULL;
     }
     const char *coll_start = p;
@@ -518,7 +574,8 @@ ir_each_spec *directives_parse_each(compile_arena *arena, lua_State *L,
     /* Check item != index */
     if (index_len > 0 && index_len == item_len &&
         memcmp(index_start, item_start, item_len) == 0) {
-        dir_error(err, "x-each: item name and index name must differ");
+        dir_error(arena, L, err,
+                  "x-each: item name and index name must differ");
         return NULL;
     }
 
@@ -526,7 +583,7 @@ ir_each_spec *directives_parse_each(compile_arena *arena, lua_State *L,
     expr_node *coll = expr_parse(arena, L, coll_start,
                                  (size_t)(coll_end - coll_start), &perr);
     if (!coll) {
-        dir_error(err, "x-each: %s",
+        dir_error(arena, L, err, "x-each: %s",
                   perr.message ? perr.message : "parse error");
         return NULL;
     }

@@ -34,6 +34,18 @@ function testcase.compile_returns_self()
     assert.equal(self, r)
 end
 
+function testcase.duplicate_compile_is_atomic()
+    local r = Reflow.new()
+    assert.equal(r:compile('t', '<p>original</p>'), r)
+
+    local self, err = r:compile('t', '<p>replacement</p>')
+    assert.is_nil(self)
+    assert.equal(err.type, 'ReflowCompileError')
+    assert.equal(err.templateName, 't')
+    assert.match(err.message, 'already exists')
+    assert.equal(r:render('t'), '<p>original</p>')
+end
+
 function testcase.render_with_json5_data()
     local r = Reflow.new()
     r:compile('t', [[<span x-text="$.n"></span>]])
@@ -70,9 +82,20 @@ function testcase.templates_lists_registered()
     r:compile('a', '<a></a>')
     r:compile('b', '<b></b>')
     local names = r:templates()
-    table.sort(names)
     assert.equal(names[1], 'a')
     assert.equal(names[2], 'b')
+end
+
+function testcase.templates_and_clear_preserve_insertion_order()
+    local r = Reflow.new()
+    r:compile('a', '<a></a>')
+    r:compile('b', '<b></b>')
+    r:compile('c', '<c></c>')
+
+    assert.equal(r:clear('b')[1], 'b')
+    assert.equal(r:compile('b', '<b>again</b>'), r)
+    assert.equal(r:templates(), {'a', 'c', 'b'})
+    assert.equal(r:clear(), {'a', 'c', 'b'})
 end
 
 function testcase.templates_empty()

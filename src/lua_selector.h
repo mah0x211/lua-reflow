@@ -30,13 +30,12 @@
 /*
  * Lua-visible compiled CSS selector.
  *
- * Wraps a `sel_compiled` produced by the selector parser and anchors
- * the compile_arena that owns it.  Once obtained, a selector can be
+ * Wraps a `sel_compiled` produced by the selector parser and owns the
+ * compile_arena through a private uservalue/environment edge. Once obtained,
  * passed to `template:render(..., selector)` without triggering a
  * re-parse, and reused across renders.
  */
 typedef struct reflow_selector {
-    int                 arena_ref;   /* LUA_NOREF after __gc */
     const sel_compiled *sel;
 } reflow_selector;
 

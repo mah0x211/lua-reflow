@@ -3,6 +3,8 @@ local testcase = require('testcase')
 local assert = require('assert')
 
 local compiler = require('reflow.compiler')
+local new_template = require('reflow.template')
+local reflow = require('reflow')
 
 local function R(html, data, opts)
     return compiler.render(html, data, opts)
@@ -224,6 +226,28 @@ function testcase.each_object_iteration()
     assert.equal(out, '<ul><li>a</li><li>b</li></ul>')
 end
 
+function testcase.strict_equality_preserves_object_identity()
+    assert.equal(R(
+        '<p x-if="$.obj == $.obj">yes</p>',
+        '{obj: {value: 1}}'), '<p>yes</p>')
+    assert.equal(R(
+        '<p x-if="{value: 1} == {value: 1}">no</p>',
+        '{}'), '')
+end
+
+function testcase.bind_rejects_array_and_object_values()
+    for _, expression in ipairs({'$.array', '$.object'}) do
+        local template = assert(new_template(
+            '<p x-bind:data-value="' .. expression .. '"></p>'))
+        local html, err = template:render('{array: [], object: {}}')
+        assert.is_nil(html)
+        assert.equal(err.type, 'ReflowRuntimeError')
+        assert.equal(err.directive, 'x-bind')
+        assert.equal(err.attribute, 'data-value')
+        assert.match(err.message, 'value must be primitive')
+    end
+end
+
 function testcase.each_empty_array_no_output()
     assert.equal(R(
         [[<ul><li x-each="v in $.a" x-text=".v"></li></ul>]],
@@ -286,12 +310,15 @@ function testcase.helper_call()
 end
 
 function testcase.helper_error_propagates()
-    local r, err = R(
+    local r, err = reflow.render(
         [[<span x-text="boom($.n)"></span>]],
         [[{n: 1}]],
         { helpers = { boom = function() error("bang") end } })
     assert.is_nil(r)
-    assert.match(err, 'bang')
+    assert.equal(err.type, 'ReflowRuntimeError')
+    assert.equal(err.expression, 'boom($.n)')
+    assert.equal(type(err.cause), 'table')
+    assert.match(err.cause.message, 'bang')
 end
 
 -- ===== combined =====

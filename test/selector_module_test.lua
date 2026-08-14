@@ -36,6 +36,14 @@ function testcase.syntax_error_returns_error_table()
     assert.equal(err.source, '[a=]')
 end
 
+function testcase.syntax_error_at_first_byte_preserves_zero_position()
+    local s, err = new_selector('')
+    assert.equal(s, nil)
+    assert.equal(err.type, 'ReflowSelectorError')
+    assert.equal(err.reason, 'syntax')
+    assert.equal(err.position, 0)
+end
+
 function testcase.unsupported_pseudo_returns_feature_id()
     local s, err = new_selector(':not(.x)')
     assert.equal(s, nil)

@@ -30,6 +30,7 @@
 
 // project
 #include "../compile_arena.h"
+#include "../checked.h"
 #include "parse.h"
 #include "../value.h"
 // lua
@@ -76,17 +77,36 @@ typedef struct {
     lua_State     *L;
 } parser_t;
 
-/* Static buffer for error messages (single-threaded Lua, no leak). */
-static char g_err_msg[256];
+static char *parser_owned_string(parser_t *p, const char *src, size_t len)
+{
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        luaL_error(p->L, "expression token is too large");
+    }
+    char *owned = (char *)compile_arena_alloc(p->arena, p->L, bytes);
+    memcpy(owned, src, len);
+    owned[len] = '\0';
+    return owned;
+}
+
+static void *parser_alloc_array(parser_t *p, size_t count, size_t item_size)
+{
+    size_t bytes = 0;
+    if (!reflow_size_mul(count, item_size, &bytes)) {
+        luaL_error(p->L, "expression contains too many items");
+    }
+    return compile_arena_alloc(p->arena, p->L, bytes);
+}
 
 static void parse_error(parser_t *p, const char *msg)
 {
     if (p->err && !p->has_error) {
+        char message[256];
         p->has_error = true;
-        snprintf(g_err_msg, sizeof(g_err_msg),
+        snprintf(message, sizeof(message),
                  "expression parse error at position %zu: %s", p->pos, msg);
         p->err->type    = "ReflowCompileError";
-        p->err->message = g_err_msg;
+        p->err->message = parser_owned_string(p, message, strlen(message));
         p->err->column  = (long)(p->pos + 1);
     }
 }
@@ -95,15 +115,16 @@ static void parse_errorf(parser_t *p, const char *fmt, ...)
 {
     if (p->err && !p->has_error) {
         char detail[200];
+        char message[256];
         va_list ap;
         va_start(ap, fmt);
         vsnprintf(detail, sizeof(detail), fmt, ap);
         va_end(ap);
         p->has_error = true;
-        snprintf(g_err_msg, sizeof(g_err_msg),
+        snprintf(message, sizeof(message),
                  "expression parse error at position %zu: %s", p->pos, detail);
         p->err->type    = "ReflowCompileError";
-        p->err->message = g_err_msg;
+        p->err->message = parser_owned_string(p, message, strlen(message));
         p->err->column  = (long)(p->pos + 1);
     }
 }
@@ -176,17 +197,26 @@ static void nodevec_init(nodevec_t *v, parser_t *p)
 {
     v->cap   = 4;
     v->len   = 0;
-    v->items = (expr_node **)compile_arena_alloc(p->arena, p->L,
-                                     v->cap * sizeof(expr_node *));
+    v->items = (expr_node **)parser_alloc_array(
+        p, v->cap, sizeof(expr_node *));
 }
 
 static void nodevec_push(nodevec_t *v, parser_t *p, expr_node *node)
 {
     if (v->len >= v->cap) {
-        size_t newcap = v->cap * 2;
-        expr_node **ni = (expr_node **)compile_arena_alloc(p->arena, p->L,
-                                            newcap * sizeof(expr_node *));
-        memcpy(ni, v->items, v->len * sizeof(expr_node *));
+        size_t required = 0;
+        size_t newcap = 0;
+        if (!reflow_size_add(v->len, 1, &required) ||
+            !reflow_size_grow(v->cap, required, &newcap)) {
+            luaL_error(p->L, "expression contains too many items");
+        }
+        expr_node **ni = (expr_node **)parser_alloc_array(
+            p, newcap, sizeof(expr_node *));
+        size_t copy_size = 0;
+        if (!reflow_size_mul(v->len, sizeof(expr_node *), &copy_size)) {
+            luaL_error(p->L, "expression contains too many items");
+        }
+        memcpy(ni, v->items, copy_size);
         v->items = ni;
         v->cap   = newcap;
     }
@@ -199,17 +229,26 @@ static void entryvec_init(entryvec_t *v, parser_t *p)
 {
     v->cap     = 4;
     v->len     = 0;
-    v->entries = (obj_entry *)compile_arena_alloc(p->arena, p->L,
-                                     v->cap * sizeof(obj_entry));
+    v->entries = (obj_entry *)parser_alloc_array(
+        p, v->cap, sizeof(obj_entry));
 }
 
 static void entryvec_push(entryvec_t *v, parser_t *p, obj_entry *e)
 {
     if (v->len >= v->cap) {
-        size_t newcap = v->cap * 2;
-        obj_entry *ne = (obj_entry *)compile_arena_alloc(p->arena, p->L,
-                                            newcap * sizeof(obj_entry));
-        memcpy(ne, v->entries, v->len * sizeof(obj_entry));
+        size_t required = 0;
+        size_t newcap = 0;
+        if (!reflow_size_add(v->len, 1, &required) ||
+            !reflow_size_grow(v->cap, required, &newcap)) {
+            luaL_error(p->L, "expression contains too many object entries");
+        }
+        obj_entry *ne = (obj_entry *)parser_alloc_array(
+            p, newcap, sizeof(obj_entry));
+        size_t copy_size = 0;
+        if (!reflow_size_mul(v->len, sizeof(obj_entry), &copy_size)) {
+            luaL_error(p->L, "expression contains too many object entries");
+        }
+        memcpy(ne, v->entries, copy_size);
         v->entries = ne;
         v->cap     = newcap;
     }
@@ -677,9 +716,7 @@ static int parse_object_key(parser_t *p, obj_entry *entry)
         if (!lit) return -1;
         char numbuf[32];
         size_t nlen = number_to_string(lit->literal.number, numbuf);
-        char *key = (char *)compile_arena_alloc(p->arena, p->L, nlen + 1);
-        memcpy(key, numbuf, nlen);
-        key[nlen] = '\0';
+        char *key = parser_owned_string(p, numbuf, nlen);
         entry->key  = key;
         entry->klen = nlen;
         entry->computed = false;
@@ -840,7 +877,11 @@ static expr_node *read_string_literal(parser_t *p, size_t start)
     }
 
     /* Pass 2: decode into arena-allocated buffer */
-    char *data = (char *)compile_arena_alloc(p->arena, p->L, decoded_len + 1);
+    size_t decoded_bytes = 0;
+    if (!reflow_size_add(decoded_len, 1, &decoded_bytes)) {
+        luaL_error(p->L, "expression string is too large");
+    }
+    char *data = (char *)compile_arena_alloc(p->arena, p->L, decoded_bytes);
     size_t di = 0;
     while (p->pos < scan) {
         unsigned char ch = (unsigned char)p->src[p->pos];
@@ -897,7 +938,11 @@ static expr_node *read_number_literal(parser_t *p, size_t start)
     char stackbuf[64];
     char *buf = stackbuf;
     if (textlen >= sizeof(stackbuf)) {
-        buf = (char *)compile_arena_alloc(p->arena, p->L, textlen + 1);
+        size_t bytes = 0;
+        if (!reflow_size_add(textlen, 1, &bytes)) {
+            luaL_error(p->L, "number literal is too large");
+        }
+        buf = (char *)compile_arena_alloc(p->arena, p->L, bytes);
     }
     memcpy(buf, p->src + begin, textlen);
     buf[textlen] = '\0';
@@ -924,10 +969,7 @@ static char *read_identifier(parser_t *p)
         p->pos++;
 
     size_t len = p->pos - begin;
-    char *name = (char *)compile_arena_alloc(p->arena, p->L, len + 1);
-    memcpy(name, p->src + begin, len);
-    name[len] = '\0';
-    return name;
+    return parser_owned_string(p, p->src + begin, len);
 }
 
 /* ============================================================ */
@@ -963,5 +1005,7 @@ expr_node *expr_parse(compile_arena *arena, lua_State *L,
         return NULL;
     }
 
+    expr->source = parser_owned_string(&p, src, len);
+    expr->source_len = len;
     return expr;
 }

@@ -68,6 +68,9 @@ typedef struct obj_entry {
 typedef struct expr_node {
     enum ex_type type;
     size_t       offset;         /* source byte offset for error reporting */
+    /* Set on the root node to an arena-owned copy of the full expression. */
+    char        *source;
+    size_t       source_len;
 
     union {
         /* EX_LITERAL: holds a reflow_value (number/string/bool/null) */

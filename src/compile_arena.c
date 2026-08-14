@@ -32,35 +32,29 @@
 
 // project
 #include "compile_arena.h"
+#include "checked.h"
 // lua
 #include <lauxlib.h>
 // system
 #include <string.h>
 
 #define DEFAULT_CHUNK_SIZE 4096
-#define ALIGN_MASK         ((size_t)7)
-
-/* ── __gc metamethod ──────────────────────────────────────── */
-
-static int arena_gc(lua_State *L)
-{
-    compile_arena *a = (compile_arena *)lua_touserdata(L, 1);
-    if (a && a->thread_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, a->thread_ref);
-        a->thread_ref = LUA_NOREF;
-        a->LT         = NULL;
-    }
-    return 0;
-}
+#define ARENA_ALIGNMENT    ((size_t)16)
 
 /* Ensure the metatable exists in the registry. */
 static void ensure_metatable(lua_State *L)
 {
-    if (luaL_newmetatable(L, "reflow.compile_arena")) {
-        lua_pushcfunction(L, arena_gc);
-        lua_setfield(L, -2, "__gc");
-    }
+    luaL_newmetatable(L, "reflow.compile_arena");
     lua_pop(L, 1);
+}
+
+static void set_private_owner(lua_State *L, int owner_index)
+{
+#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 502
+    lua_setuservalue(L, owner_index);
+#else
+    lua_setfenv(L, owner_index);
+#endif
 }
 
 /* ── public API ───────────────────────────────────────────── */
@@ -77,9 +71,13 @@ compile_arena *compile_arena_new(lua_State *L, size_t chunk_size)
     luaL_getmetatable(L, "reflow.compile_arena");
     lua_setmetatable(L, -2);
 
-    /* 2. Thread for chunk storage */
+    /* The private table is the only ownership edge needed: arena -> thread.
+     * Both values remain stack-rooted throughout construction, so an error at
+     * any throwing step cannot strand a manual registry reference. */
+    lua_newtable(L);
     lua_State *LT = lua_newthread(L);
-    a->thread_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    lua_rawseti(L, -2, 1);
+    set_private_owner(L, -2);
     a->LT         = LT;
     a->chunk_size = chunk_size;
     a->current    = NULL;
@@ -90,25 +88,30 @@ compile_arena *compile_arena_new(lua_State *L, size_t chunk_size)
 
 void *compile_arena_alloc(compile_arena *a, lua_State *L, size_t n)
 {
-    /* Align to 8 bytes */
-    n = (n + ALIGN_MASK) & ~ALIGN_MASK;
-    if (n == 0) n = ALIGN_MASK + 1;
+    size_t aligned = 0;
+    if (!reflow_size_align(n == 0 ? 1 : n, ARENA_ALIGNMENT, &aligned)) {
+        luaL_error(L, "reflow arena allocation size overflow");
+    }
+    n = aligned;
 
     if (n > a->remaining) {
         size_t alloc_size = a->chunk_size;
-        if (n > alloc_size) alloc_size = n;
-
-        /* Allocate on L (has pcall frame), then move to LT */
-        char *chunk = (char *)lua_newuserdata(L, alloc_size);
-
-        if (!lua_checkstack(a->LT, 1)) {
-            lua_pop(L, 1);   /* remove chunk from L's stack */
-            return NULL;      /* cannot grow LT's stack */
+        if (n > alloc_size) {
+            reflow_size_grow(alloc_size, n, &alloc_size);
         }
-        lua_xmove(L, a->LT, 1);   /* move chunk onto LT's stack */
+
+        /* Reserve the non-throwing transfer destination before allocation.
+         * The allocation itself must occur on protected L, never on LT. */
+        if (!lua_checkstack(a->LT, 1)) {
+            luaL_error(L, "reflow arena child stack exhausted");
+        }
+        char *chunk = (char *)lua_newuserdata(L, alloc_size);
+        memset(chunk, 0, alloc_size);
+        lua_xmove(L, a->LT, 1);
 
         a->current   = chunk;
         a->remaining = alloc_size;
+        a->chunk_size = alloc_size;
     }
 
     void *ptr    = a->current;

@@ -1,0 +1,1 @@
+{ "phase": "compile", "class": "ReflowCompileError", "messagePattern": "outside of x-for or x-each" }

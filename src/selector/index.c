@@ -21,7 +21,7 @@
  *
  */
 #include "index.h"
-#include <stdlib.h>
+#include "../checked.h"
 #include <string.h>
 
 /* --- Bucket construction --------------------------------------------- */
@@ -38,18 +38,11 @@ typedef struct {
     bucket_entry_t *entries;
     size_t          count;
     size_t          cap;
+    compile_arena   *arena;
+    lua_State       *L;
 } bucket_builder_t;
 
-static void bb_free(bucket_builder_t *bb)
-{
-    for (size_t i = 0; i < bb->count; i++) {
-        free((void *)bb->entries[i].items);
-    }
-    free(bb->entries);
-    bb->entries = NULL;
-    bb->count   = 0;
-    bb->cap     = 0;
-}
+static void bb_free(bucket_builder_t *bb) { (void)bb; }
 
 static bucket_entry_t *bb_find_or_new(bucket_builder_t *bb,
                                       const char *key, size_t key_len)
@@ -61,10 +54,13 @@ static bucket_entry_t *bb_find_or_new(bucket_builder_t *bb,
         }
     }
     if (bb->count == bb->cap) {
-        size_t ncap = bb->cap ? bb->cap * 2 : 8;
-        bucket_entry_t *nb =
-            (bucket_entry_t *)realloc(bb->entries, ncap * sizeof(*nb));
+        size_t required, ncap, bytes;
+        if (!reflow_size_add(bb->count, 1, &required) ||
+            !reflow_size_grow(bb->cap ? bb->cap : 8, required, &ncap) ||
+            !reflow_size_mul(ncap, sizeof(*bb->entries), &bytes)) return NULL;
+        bucket_entry_t *nb = compile_arena_alloc(bb->arena, bb->L, bytes);
         if (!nb) return NULL;
+        if (bb->count) memcpy(nb, bb->entries, bb->count * sizeof(*nb));
         bb->entries = nb;
         bb->cap     = ncap;
     }
@@ -83,11 +79,13 @@ static int bb_push(bucket_builder_t *bb, const char *key, size_t key_len,
     bucket_entry_t *e = bb_find_or_new(bb, key, key_len);
     if (!e) return -1;
     if (e->count == e->cap) {
-        size_t ncap = e->cap ? e->cap * 2 : 4;
-        const ir_node **nb =
-            (const ir_node **)realloc((void *)e->items,
-                                      ncap * sizeof(*nb));
+        size_t required, ncap, bytes;
+        if (!reflow_size_add(e->count, 1, &required) ||
+            !reflow_size_grow(e->cap ? e->cap : 4, required, &ncap) ||
+            !reflow_size_mul(ncap, sizeof(*e->items), &bytes)) return -1;
+        const ir_node **nb = compile_arena_alloc(bb->arena, bb->L, bytes);
         if (!nb) return -1;
+        if (e->count) memcpy((void *)nb, e->items, e->count * sizeof(*nb));
         e->items = nb;
         e->cap   = ncap;
     }
@@ -96,18 +94,26 @@ static int bb_push(bucket_builder_t *bb, const char *key, size_t key_len,
 }
 
 /* Commit the builder into arena-owned sel_bucket storage. */
-static void bb_commit(bucket_builder_t *bb, compile_arena *arena,
-                      lua_State *L, sel_bucket *out)
+static int bb_commit(bucket_builder_t *bb, compile_arena *arena,
+                     lua_State *L, sel_bucket *out)
 {
     size_t total = 0;
-    for (size_t i = 0; i < bb->count; i++) total += bb->entries[i].count;
+    for (size_t i = 0; i < bb->count; i++)
+        if (!reflow_size_add(total, bb->entries[i].count, &total)) return -1;
+
+    size_t nkeys = bb->count == 0 ? 1 : bb->count;
+    size_t nentries = total == 0 ? 1 : total;
+    size_t key_bytes, entry_bytes;
+    if (!reflow_size_mul(sizeof(sel_bucket_key), nkeys, &key_bytes) ||
+        !reflow_size_mul(sizeof(const ir_node *), nentries, &entry_bytes))
+        return -1;
 
     out->n_keys    = bb->count;
     out->n_entries = total;
     out->keys      = (sel_bucket_key *)compile_arena_alloc(
-        arena, L, sizeof(sel_bucket_key) * (bb->count == 0 ? 1 : bb->count));
+        arena, L, key_bytes);
     out->entries = (const ir_node **)compile_arena_alloc(
-        arena, L, sizeof(const ir_node *) * (total == 0 ? 1 : total));
+        arena, L, entry_bytes);
 
     size_t off = 0;
     for (size_t i = 0; i < bb->count; i++) {
@@ -116,7 +122,11 @@ static void bb_commit(bucket_builder_t *bb, compile_arena *arena,
          * (helper strings, source spans) whose lifetime differs from the
          * arena. All existing callers already pass arena-owned keys, but
          * copying here removes an easy-to-miss aliasing hazard. */
-        char *kdup = (char *)compile_arena_alloc(arena, L, e->key_len + 1);
+        size_t key_len_nul, copy_bytes;
+        if (!reflow_size_add(e->key_len, 1, &key_len_nul) ||
+            !reflow_size_mul(e->count, sizeof(const ir_node *), &copy_bytes))
+            return -1;
+        char *kdup = (char *)compile_arena_alloc(arena, L, key_len_nul);
         memcpy(kdup, e->key, e->key_len);
         kdup[e->key_len]      = '\0';
         out->keys[i].key      = kdup;
@@ -124,9 +134,10 @@ static void bb_commit(bucket_builder_t *bb, compile_arena *arena,
         out->keys[i].offset   = off;
         out->keys[i].count    = e->count;
         memcpy(&out->entries[off], e->items,
-               e->count * sizeof(const ir_node *));
-        off += e->count;
+               copy_bytes);
+        if (!reflow_size_add(off, e->count, &off)) return -1;
     }
+    return 0;
 }
 
 const ir_node **sel_bucket_lookup(const sel_bucket *b,
@@ -310,6 +321,10 @@ sel_index *sel_build_index(compile_arena *arena, lua_State *L,
     walker_t w = {0};
     w.arena = arena;
     w.L     = L;
+    w.by_id.arena = w.by_class.arena = w.by_tag.arena = arena;
+    w.by_attr_name.arena = w.all_bb.arena = w.includes_bb.arena = arena;
+    w.by_id.L = w.by_class.L = w.by_tag.L = L;
+    w.by_attr_name.L = w.all_bb.L = w.includes_bb.L = L;
 
     int rc = 0;
     if (root != NULL && root->type == IR_ROOT) {
@@ -328,29 +343,34 @@ sel_index *sel_build_index(compile_arena *arena, lua_State *L,
 
     sel_index *idx = (sel_index *)compile_arena_alloc(arena, L, sizeof(*idx));
     memset(idx, 0, sizeof(*idx));
-    bb_commit(&w.by_id,       arena, L, &idx->by_id);
-    bb_commit(&w.by_class,    arena, L, &idx->by_class);
-    bb_commit(&w.by_tag,      arena, L, &idx->by_tag);
-    bb_commit(&w.by_attr_name,arena, L, &idx->by_attr_name);
+    if (bb_commit(&w.by_id, arena, L, &idx->by_id) != 0 ||
+        bb_commit(&w.by_class, arena, L, &idx->by_class) != 0 ||
+        bb_commit(&w.by_tag, arena, L, &idx->by_tag) != 0 ||
+        bb_commit(&w.by_attr_name, arena, L, &idx->by_attr_name) != 0)
+        return NULL;
 
     /* Flatten the single-bucket `all` and `includes` builders. */
     size_t all_n = 0;
     if (w.all_bb.count > 0) all_n = w.all_bb.entries[0].count;
-    idx->all = (const ir_node **)compile_arena_alloc(
-        arena, L, sizeof(const ir_node *) * (all_n == 0 ? 1 : all_n));
+    size_t all_bytes;
+    if (!reflow_size_mul(sizeof(const ir_node *), all_n == 0 ? 1 : all_n,
+                         &all_bytes)) return NULL;
+    idx->all = (const ir_node **)compile_arena_alloc(arena, L, all_bytes);
     if (all_n > 0) {
         memcpy(idx->all, w.all_bb.entries[0].items,
-               all_n * sizeof(const ir_node *));
+               all_bytes);
     }
     idx->n_all = all_n;
 
     size_t inc_n = 0;
     if (w.includes_bb.count > 0) inc_n = w.includes_bb.entries[0].count;
-    idx->includes = (const ir_node **)compile_arena_alloc(
-        arena, L, sizeof(const ir_node *) * (inc_n == 0 ? 1 : inc_n));
+    size_t inc_bytes;
+    if (!reflow_size_mul(sizeof(const ir_node *), inc_n == 0 ? 1 : inc_n,
+                         &inc_bytes)) return NULL;
+    idx->includes = (const ir_node **)compile_arena_alloc(arena, L, inc_bytes);
     if (inc_n > 0) {
         memcpy(idx->includes, w.includes_bb.entries[0].items,
-               inc_n * sizeof(const ir_node *));
+               inc_bytes);
     }
     idx->n_includes = inc_n;
 

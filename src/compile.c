@@ -41,21 +41,21 @@
 
 // project
 #include "compile.h"
+#include "checked.h"
 #include "directives.h"
 #include "expr/eval.h"
 #include "expr/parse.h"
 #include "ir.h"
 #include "parser.h"
 #include "snippet.h"
+// lua
+#include <lauxlib.h>
 // system
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #define COMPILE_MAX_DEPTH 256
-
-/* Static buffer for compile-time error messages (single-threaded Lua). */
-static char g_compile_err[512];
 
 typedef struct {
     compile_arena *arena;
@@ -83,6 +83,28 @@ typedef struct {
     size_t  text_cap;
 } compile_ctx;
 
+static char *compile_owned_string(compile_ctx *cc, const char *src, size_t len)
+{
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        luaL_error(cc->L, "compiled string is too large");
+    }
+    char *owned = (char *)compile_arena_alloc(cc->arena, cc->L, bytes);
+    memcpy(owned, src, len);
+    owned[len] = '\0';
+    return owned;
+}
+
+static void *compile_alloc_array(compile_ctx *cc, size_t count,
+                                 size_t item_size, const char *what)
+{
+    size_t bytes = 0;
+    if (!reflow_size_mul(count, item_size, &bytes)) {
+        luaL_error(cc->L, "%s is too large", what);
+    }
+    return compile_arena_alloc(cc->arena, cc->L, bytes);
+}
+
 /* Reconstruct an element open tag from its non-directive attributes.
  * Directive attributes (x-*) are omitted because they have been moved
  * to element.directives by the time we build this string. */
@@ -91,8 +113,10 @@ static char *reconstruct_open_tag(compile_ctx *cc, const ir_node *el)
     if (el == NULL || el->type != IR_ELEMENT) {
         return NULL;
     }
+    arena_t storage;
+    arena_bind(&storage, cc->L, cc->arena, NULL, 0);
     buf_t buf;
-    if (buf_init(&buf) != 0) return NULL;
+    if (buf_init(&buf, &storage) != 0) return NULL;
     buf_putc(&buf, '<');
     buf_put(&buf, el->element.tag_name, strlen(el->element.tag_name));
     for (size_t i = 0; i < el->element.n_attrs; i++) {
@@ -106,9 +130,7 @@ static char *reconstruct_open_tag(compile_ctx *cc, const ir_node *el)
         }
     }
     buf_putc(&buf, '>');
-    char *out = (char *)compile_arena_alloc(cc->arena, cc->L, buf.len + 1);
-    memcpy(out, buf.data, buf.len);
-    out[buf.len] = '\0';
+    char *out = compile_owned_string(cc, buf.data, buf.len);
     buf_free(&buf);
     return out;
 }
@@ -125,15 +147,14 @@ static void compile_error_populate_at(compile_ctx *cc, const ir_node *at)
                           at->element.source_start, &line, &col);
         cc->err->line   = line;
         cc->err->column = col;
+        arena_t storage;
+        arena_bind(&storage, cc->L, cc->arena, NULL, 0);
         buf_t snip;
-        if (buf_init(&snip) == 0) {
+        if (buf_init(&snip, &storage) == 0) {
             make_snippet(cc->html, cc->html_len,
                          at->element.source_start,
                          at->element.source_end, &snip);
-            char *dst = (char *)compile_arena_alloc(
-                cc->arena, cc->L, snip.len + 1);
-            memcpy(dst, snip.data, snip.len);
-            dst[snip.len] = '\0';
+            char *dst = compile_owned_string(cc, snip.data, snip.len);
             cc->err->snippet = dst;
             buf_free(&snip);
         }
@@ -146,12 +167,13 @@ static void compile_errorf(compile_ctx *cc, const char *fmt, ...)
     if (cc->err == NULL || cc->err->message != NULL) {
         return;
     }
+    char message[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_compile_err, sizeof(g_compile_err), fmt, ap);
+    vsnprintf(message, sizeof(message), fmt, ap);
     va_end(ap);
     cc->err->type    = "ReflowCompileError";
-    cc->err->message = g_compile_err;
+    cc->err->message = compile_owned_string(cc, message, strlen(message));
     /* Attach source context from whatever element is currently being
      * processed (set by cb_element / post_process). NULL is fine — it
      * simply leaves the location fields unset. */
@@ -165,12 +187,13 @@ static void compile_error_at(compile_ctx *cc, const ir_node *at,
     if (cc->err == NULL || cc->err->message != NULL) {
         return;
     }
+    char message[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_compile_err, sizeof(g_compile_err), fmt, ap);
+    vsnprintf(message, sizeof(message), fmt, ap);
     va_end(ap);
     cc->err->type    = "ReflowCompileError";
-    cc->err->message = g_compile_err;
+    cc->err->message = compile_owned_string(cc, message, strlen(message));
     compile_error_populate_at(cc, at);
 }
 
@@ -181,12 +204,17 @@ static ir_node *current_parent(compile_ctx *cc)
 
 static void text_reserve(compile_ctx *cc, size_t need)
 {
-    if (cc->text_len + need <= cc->text_cap) {
+    size_t required = 0;
+    if (!reflow_size_add(cc->text_len, need, &required)) {
+        luaL_error(cc->L, "template text is too large");
+    }
+    if (required <= cc->text_cap) {
         return;
     }
-    size_t new_cap = cc->text_cap > 0 ? cc->text_cap : 64;
-    while (new_cap < cc->text_len + need) {
-        new_cap *= 2;
+    size_t new_cap = 0;
+    if (!reflow_size_grow(cc->text_cap > 0 ? cc->text_cap : 64,
+                          required, &new_cap)) {
+        luaL_error(cc->L, "template text is too large");
     }
     char *buf = (char *)compile_arena_alloc(cc->arena, cc->L, new_cap);
     if (cc->text_len > 0) {
@@ -208,10 +236,7 @@ static void flush_text(compile_ctx *cc)
     if (cc->text_len == 0) {
         return;
     }
-    char *text = (char *)compile_arena_alloc(cc->arena, cc->L,
-                                             cc->text_len + 1);
-    memcpy(text, cc->text_buf, cc->text_len);
-    text[cc->text_len] = '\0';
+    char *text = compile_owned_string(cc, cc->text_buf, cc->text_len);
     ir_node *node = ir_make_text(cc->arena, cc->L, text, cc->text_len);
     ir_add_child(cc->arena, cc->L, current_parent(cc), node);
     cc->text_len = 0;
@@ -222,10 +247,7 @@ static char *dup_str(compile_ctx *cc, const char *s, size_t n)
     if (s == NULL) {
         return NULL;
     }
-    char *out = (char *)compile_arena_alloc(cc->arena, cc->L, n + 1);
-    memcpy(out, s, n);
-    out[n] = '\0';
-    return out;
+    return compile_owned_string(cc, s, n);
 }
 
 /* Duplicate `s` into arena while lowercasing ASCII letters.  HTML
@@ -237,7 +259,11 @@ static char *dup_lower_str(compile_ctx *cc, const char *s, size_t n)
     if (s == NULL) {
         return NULL;
     }
-    char *out = (char *)compile_arena_alloc(cc->arena, cc->L, n + 1);
+    size_t bytes = 0;
+    if (!reflow_size_add(n, 1, &bytes)) {
+        luaL_error(cc->L, "compiled string is too large");
+    }
+    char *out = (char *)compile_arena_alloc(cc->arena, cc->L, bytes);
     for (size_t i = 0; i < n; i++) {
         char c = s[i];
         if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
@@ -318,14 +344,20 @@ static void add_bind(compile_ctx *cc, ir_directives *d,
                      const char *attr_name, size_t attr_name_len,
                      expr_node *expr)
 {
-    size_t new_cap = d->n_binds + 1;
-    if (d->n_binds > 0) {
-        new_cap = d->n_binds * 2;
+    size_t required = 0;
+    size_t new_cap = 0;
+    if (!reflow_size_add(d->n_binds, 1, &required) ||
+        !reflow_size_grow(d->n_binds, required, &new_cap)) {
+        luaL_error(cc->L, "too many x-bind directives");
     }
-    ir_bind *nb = (ir_bind *)compile_arena_alloc(
-        cc->arena, cc->L, new_cap * sizeof(ir_bind));
+    ir_bind *nb = (ir_bind *)compile_alloc_array(
+        cc, new_cap, sizeof(ir_bind), "x-bind directive list");
     if (d->n_binds > 0) {
-        memcpy(nb, d->binds, d->n_binds * sizeof(ir_bind));
+        size_t copy_bytes = 0;
+        if (!reflow_size_mul(d->n_binds, sizeof(ir_bind), &copy_bytes)) {
+            luaL_error(cc->L, "too many x-bind directives");
+        }
+        memcpy(nb, d->binds, copy_bytes);
     }
     d->binds = nb;
     d->binds[d->n_binds].attr_name = dup_str(cc, attr_name, attr_name_len);
@@ -407,7 +439,7 @@ static int process_x_directive(compile_ctx *cc, ir_node *element,
          * render-time can re-parse into the render arena. */
         char scratch[8192];
         arena_t validation;
-        arena_init(&validation, scratch, sizeof(scratch));
+        arena_bind(&validation, cc->L, cc->arena, scratch, sizeof(scratch));
         if (directives_parse_data(cc->arena, cc->L, &validation,
                                   value, value_len, cc->err) == NULL) {
             return -1;
@@ -447,7 +479,8 @@ static int process_x_directive(compile_ctx *cc, ir_node *element,
         return check_helpers(cc, d->elseif_expr, full_name);
     }
     if (strcmp(nameBuf, "else") == 0) {
-        if (directives_assert_empty(value, value_len, full_name,
+        if (directives_assert_empty(cc->arena, cc->L,
+                                    value, value_len, full_name,
                                     cc->err) != 0) return -1;
         d->else_mark = true;
         return 0;
@@ -467,7 +500,8 @@ static int process_x_directive(compile_ctx *cc, ir_node *element,
         return check_helpers(cc, d->case_expr, full_name);
     }
     if (strcmp(nameBuf, "nocase") == 0) {
-        if (directives_assert_empty(value, value_len, full_name,
+        if (directives_assert_empty(cc->arena, cc->L,
+                                    value, value_len, full_name,
                                     cc->err) != 0) return -1;
         d->nocase_mark = true;
         return 0;
@@ -505,7 +539,8 @@ static int process_x_directive(compile_ctx *cc, ir_node *element,
         return check_helpers(cc, d->include_expr, full_name);
     }
     if (strcmp(nameBuf, "break") == 0) {
-        if (directives_assert_empty(value, value_len, full_name,
+        if (directives_assert_empty(cc->arena, cc->L,
+                                    value, value_len, full_name,
                                     cc->err) != 0) return -1;
         d->break_mark = true;
         return 0;
@@ -584,7 +619,7 @@ static int validate_combinations(compile_ctx *cc, ir_directives *d,
     if (d->data_raw != NULL && d->with_bindings != NULL) {
         char scratch[8192];
         arena_t validation;
-        arena_init(&validation, scratch, sizeof(scratch));
+        arena_bind(&validation, cc->L, cc->arena, scratch, sizeof(scratch));
         reflow_error verr = {0};
         reflow_value *data_val = directives_parse_data(
             cc->arena, cc->L, &validation,
@@ -656,8 +691,8 @@ static int consolidate_chains(compile_ctx *cc, ir_node *parent)
     size_t old_n = *n_children_p;
     if (old_n == 0) return 0;
 
-    ir_node **out = (ir_node **)compile_arena_alloc(
-        cc->arena, cc->L, old_n * sizeof(ir_node *));
+    ir_node **out = (ir_node **)compile_alloc_array(
+        cc, old_n, sizeof(ir_node *), "chain child list");
     size_t out_n = 0;
     size_t i = 0;
     while (i < old_n) {
@@ -670,8 +705,8 @@ static int consolidate_chains(compile_ctx *cc, ir_node *parent)
         }
 
         /* Start of a chain. */
-        ir_branch *branches = (ir_branch *)compile_arena_alloc(
-            cc->arena, cc->L, sizeof(ir_branch) * (old_n - i));
+        ir_branch *branches = (ir_branch *)compile_alloc_array(
+            cc, old_n - i, sizeof(ir_branch), "conditional branch list");
         size_t nb = 0;
         branches[nb].cond = child->element.directives.if_expr;
         branches[nb].node = child;
@@ -747,8 +782,12 @@ static int collect_match_branches(compile_ctx *cc, ir_node *parent)
     }
 
     size_t old_n = parent->element.n_children;
-    ir_branch *branches = (ir_branch *)compile_arena_alloc(
-        cc->arena, cc->L, sizeof(ir_branch) * (old_n + 1));
+    size_t branch_capacity = 0;
+    if (!reflow_size_add(old_n, 1, &branch_capacity)) {
+        luaL_error(cc->L, "match branch list is too large");
+    }
+    ir_branch *branches = (ir_branch *)compile_alloc_array(
+        cc, branch_capacity, sizeof(ir_branch), "match branch list");
     size_t nb = 0;
     bool saw_nocase = false;
 
@@ -1058,7 +1097,7 @@ ir_node *compile_template(compile_arena *arena, lua_State *L,
         .on_comment = cb_comment,
     };
 
-    int rc = html_parse(html, html_len, &handler, err);
+    int rc = html_parse(L, arena, html, html_len, &handler, err);
     if (rc != 0 || (err != NULL && err->message != NULL)) {
         return NULL;
     }

@@ -96,6 +96,9 @@ function testcase.multiple_matches_raises()
     local r = make('<ul><li>1</li><li>2</li></ul>')
     local err = fail(r, 't', nil, 'li')
     assert.equal(err.reason, 'multiple_matches')
+    assert.equal(#err.matches, 2)
+    assert.equal(err.matches[1].templateName, 't')
+    assert.equal(err.matches[2].templateName, 't')
 end
 
 -- ============================================================
@@ -113,6 +116,13 @@ function testcase.selector_syntax_error_bubbles()
     local r = make('<a>x</a>')
     local err = fail(r, 't', nil, '[a=]')
     assert.equal(err.reason, 'syntax')
+end
+
+function testcase.selector_error_at_first_byte_preserves_zero_position()
+    local r = make('<a>x</a>')
+    local err = fail(r, 't', nil, '')
+    assert.equal(err.reason, 'syntax')
+    assert.equal(err.position, 0)
 end
 
 -- ============================================================
@@ -144,6 +154,28 @@ function testcase.cross_template_fragment_via_include()
         [[<div><div x-include="'child'"></div></div>]])
     assert.equal(r:render('parent', nil, '#c'),
         '<article id="c"><h1>Child</h1></article>')
+end
+
+function testcase.dynamic_include_fragment_preserves_globals()
+    local r = reflow.new()
+    r:compile('child',
+        '<article id="hit"><span x-text="$.label"></span></article>')
+    r:compile('parent',
+        [[<main><div x-include="$.target"></div></main>]])
+    assert.equal(r:render('parent',
+        [[{target: "child", label: "Hello"}]], '#hit'),
+        '<article id="hit"><span>Hello</span></article>')
+end
+
+function testcase.same_element_with_is_forwarded_to_included_fragment()
+    local r = reflow.new()
+    r:compile('child',
+        '<article id="hit"><span x-text="@title"></span></article>')
+    r:compile('parent',
+        [[<main><div x-with="title = $.label" ]] ..
+        [[x-include="'child'"></div></main>]])
+    assert.equal(r:render('parent', [[{label: "Hello"}]], '#hit'),
+        '<article id="hit"><span>Hello</span></article>')
 end
 
 function testcase.outer_match_wins_over_include_search()
@@ -244,14 +276,12 @@ function testcase.ancestor_x_each_single_iteration_ok()
 end
 
 -- ============================================================
--- cache is populated after render
+-- repeated selector rendering
 -- ============================================================
 
-function testcase.selector_cache_hit_reuses_parse()
-    -- With cache disabled every render re-parses. This test just
-    -- confirms the two calls do not blow up and produce identical
-    -- output; direct cache observation is covered by the C-level cache
-    -- test suite.
+function testcase.repeated_selector_render_is_stable()
+    -- Public LRU behavior is covered by coordinator_test; this guards the
+    -- rendered result across a cache miss followed by a cache hit.
     local r = make('<a id="only">hi</a>')
     local h1 = r:render('t', nil, '#only')
     local h2 = r:render('t', nil, '#only')

@@ -25,6 +25,7 @@
 #define REFLOW_SCOPE_H
 
 #include <stddef.h>
+#include "arena.h"
 #include "value.h"
 
 typedef enum {
@@ -37,16 +38,16 @@ typedef struct {
     reflow_value      *vars;   /* RV_OBJECT (owned by caller / arena) */
 } scope_frame;
 
-#define SCOPE_MAX_FRAMES 64
-
 typedef struct {
-    scope_frame   frames[SCOPE_MAX_FRAMES];
+    scope_frame  *frames;
     size_t        n_frames;
+    size_t        frame_capacity;
+    arena_t      *arena;
     reflow_value *globals;     /* the $ value (render data) */
 } scope_env;
 
 /* Initialize env with the given globals (the $ value). */
-void scope_env_init(scope_env *env, reflow_value *globals);
+void scope_env_init(scope_env *env, arena_t *arena, reflow_value *globals);
 
 /* Push / pop a frame.  vars must be an RV_OBJECT. */
 void scope_push_frame(scope_env *env, scope_frame_kind kind,

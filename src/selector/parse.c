@@ -21,6 +21,7 @@
  *
  */
 #include "parse.h"
+#include "../checked.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,9 +37,6 @@ static const char *const ATTR_OP_STR[] = {
 /* Persistent buffer for the most recently formatted error message so the
  * const char* stored on reflow_error stays valid after the parser returns.
  * Single-threaded consumers only (mirrors g_compile_err in compile.c). */
-static char g_selector_err[512];
-static char g_selector_source[1024];
-static char g_selector_feature[128];
 
 static const char *POSITIONAL_PSEUDOS_LC[] = {
     "first-child", "last-child", "only-child",
@@ -64,31 +62,34 @@ typedef struct {
     size_t  count;
     size_t  cap;
     size_t  elem_size;
+    compile_arena *arena;
+    lua_State *L;
 } plist_t;
 
-static int plist_init(plist_t *l, size_t elem_size)
+static int plist_init(plist_t *l, compile_arena *arena, lua_State *L,
+                      size_t elem_size)
 {
     l->items     = NULL;
     l->count     = 0;
     l->cap       = 0;
     l->elem_size = elem_size;
+    l->arena = arena;
+    l->L = L;
     return 0;
 }
 
-static void plist_free(plist_t *l)
-{
-    free(l->items);
-    l->items = NULL;
-    l->count = 0;
-    l->cap   = 0;
-}
+static void plist_free(plist_t *l) { (void)l; }
 
 static int plist_push(plist_t *l, const void *elem)
 {
     if (l->count == l->cap) {
-        size_t ncap = l->cap ? l->cap * 2 : 4;
-        void  *nb   = realloc(l->items, ncap * l->elem_size);
+        size_t required, ncap, bytes;
+        if (!reflow_size_add(l->count, 1, &required) ||
+            !reflow_size_grow(l->cap ? l->cap : 4, required, &ncap) ||
+            !reflow_size_mul(ncap, l->elem_size, &bytes)) return -1;
+        void *nb = compile_arena_alloc(l->arena, l->L, bytes);
         if (!nb) return -1;
+        if (l->count) memcpy(nb, l->items, l->count * l->elem_size);
         l->items = nb;
         l->cap   = ncap;
     }
@@ -97,18 +98,14 @@ static int plist_push(plist_t *l, const void *elem)
     return 0;
 }
 
-/* Copy the collected elements into arena and free the heap buffer. */
+/* Items already live in the arena. */
 static void *plist_commit(plist_t *l, compile_arena *a, lua_State *L)
 {
     if (l->count == 0) {
-        plist_free(l);
         return NULL;
     }
-    size_t bytes = l->count * l->elem_size;
-    void  *dst   = compile_arena_alloc(a, L, bytes);
-    memcpy(dst, l->items, bytes);
-    plist_free(l);
-    return dst;
+    (void)a; (void)L;
+    return l->items;
 }
 
 static int is_ws(char c)
@@ -175,23 +172,21 @@ static int p_skip_combinator_ws(parser_t *p)
 /* Snapshot the parser source into the persistent buffer so reflow_error's
  * const char* pointers stay valid after the parser returns. Truncates on
  * overflow — the truncated view is still useful for humans. */
-static const char *snapshot_source(const char *src, size_t src_len)
+static const char *arena_copy(parser_t *p, const char *src, size_t len)
 {
-    size_t n = src_len < sizeof(g_selector_source) - 1
-               ? src_len : sizeof(g_selector_source) - 1;
-    memcpy(g_selector_source, src, n);
-    g_selector_source[n] = '\0';
-    return g_selector_source;
+    size_t bytes;
+    if (!reflow_size_add(len, 1, &bytes)) return NULL;
+    char *dst = compile_arena_alloc(p->arena, p->L, bytes);
+    if (!dst) return NULL;
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
 }
 
-static const char *snapshot_feature(const char *s)
+static const char *snapshot_feature(parser_t *p, const char *s)
 {
     if (s == NULL) return NULL;
-    size_t n = strlen(s);
-    if (n >= sizeof(g_selector_feature)) n = sizeof(g_selector_feature) - 1;
-    memcpy(g_selector_feature, s, n);
-    g_selector_feature[n] = '\0';
-    return g_selector_feature;
+    return arena_copy(p, s, strlen(s));
 }
 
 /* Compute 1-based line/column for a 0-based offset in source. */
@@ -212,22 +207,23 @@ static void offset_to_linecol(const char *src, size_t src_len, size_t off,
     *out_col  = col;
 }
 
-/* Format an error into g_selector_err and fill err with the given reason,
- * plus a source snapshot and 0-based position. Returns 0 for convenience. */
+/* Format an arena-owned error and retain the full source snapshot. */
 static int fail(parser_t *p, const char *reason, size_t position,
                 const char *feature, const char *fmt, ...)
 {
     if (p->err == NULL) return -1;
+    char message[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_selector_err, sizeof(g_selector_err), fmt, ap);
+    vsnprintf(message, sizeof(message), fmt, ap);
     va_end(ap);
     p->err->type     = "ReflowSelectorError";
-    p->err->message  = g_selector_err;
+    p->err->message  = arena_copy(p, message, strlen(message));
     p->err->reason   = reason;
-    p->err->source   = snapshot_source(p->source, p->source_len);
+    p->err->source   = arena_copy(p, p->source, p->source_len);
     p->err->position = (long)position;
-    p->err->feature  = feature ? snapshot_feature(feature) : NULL;
+    p->err->has_position = true;
+    p->err->feature  = feature ? snapshot_feature(p, feature) : NULL;
     long line, col;
     offset_to_linecol(p->source, p->source_len, position, &line, &col);
     p->err->line   = line;
@@ -240,7 +236,11 @@ static int fail(parser_t *p, const char *reason, size_t position,
 static const char *arena_lowerdup(compile_arena *a, lua_State *L,
                                   const char *src, size_t len)
 {
-    char *dst = (char *)compile_arena_alloc(a, L, len + 1);
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        luaL_error(L, "selector token is too large");
+    }
+    char *dst = (char *)compile_arena_alloc(a, L, bytes);
     for (size_t i = 0; i < len; i++) {
         char c = src[i];
         if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
@@ -254,7 +254,11 @@ static const char *arena_lowerdup(compile_arena *a, lua_State *L,
 static const char *arena_strdup(compile_arena *a, lua_State *L,
                                 const char *src, size_t len)
 {
-    char *dst = (char *)compile_arena_alloc(a, L, len + 1);
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        luaL_error(L, "selector token is too large");
+    }
+    char *dst = (char *)compile_arena_alloc(a, L, bytes);
     memcpy(dst, src, len);
     dst[len] = '\0';
     return dst;
@@ -291,39 +295,39 @@ static int read_string(parser_t *p, char quote,
         if (c == quote) {
             const char *dst = arena_strdup(p->arena, p->L, buf ? buf : "",
                                            blen);
-            free(buf);
             *out_value = dst;
             *out_len   = blen;
             return 0;
         }
         if (c == '\\') {
             if (p_eof(p)) {
-                free(buf);
                 return fail(p, "syntax", p->pos, NULL,
                             "selector syntax error: "
                             "unterminated string escape");
             }
             c = p_next(p);
         } else if (c == '\n' || c == '\r') {
-            free(buf);
             return fail(p, "syntax", p->pos - 1, NULL,
                         "selector syntax error: "
                         "unterminated string literal");
         }
         if (blen + 1 > bcap) {
-            size_t ncap = bcap ? bcap * 2 : 32;
-            char  *nb   = (char *)realloc(buf, ncap);
+            size_t required, ncap;
+            if (!reflow_size_add(blen, 1, &required) ||
+                !reflow_size_grow(bcap ? bcap : 32, required, &ncap))
+                return fail(p, "syntax", p->pos, NULL,
+                            "selector syntax error: out of memory");
+            char *nb = (char *)compile_arena_alloc(p->arena, p->L, ncap);
             if (!nb) {
-                free(buf);
                 return fail(p, "syntax", p->pos, NULL,
                             "selector syntax error: out of memory");
             }
+            if (blen) memcpy(nb, buf, blen);
             buf  = nb;
             bcap = ncap;
         }
         buf[blen++] = c;
     }
-    free(buf);
     return fail(p, "syntax", p->pos, NULL,
                 "selector syntax error: unterminated string literal");
 }
@@ -534,12 +538,12 @@ static int parse_compound(parser_t *p, sel_compound *out)
     int count = 0;
 
     plist_t classes, attrs, pseudos;
-    plist_init(&classes, sizeof(const char *));
+    plist_init(&classes, p->arena, p->L, sizeof(const char *));
     /* class_lens shadows classes; we build it in parallel */
     plist_t class_lens;
-    plist_init(&class_lens, sizeof(size_t));
-    plist_init(&attrs, sizeof(sel_attr_cond));
-    plist_init(&pseudos, sizeof(sel_pseudo_cond));
+    plist_init(&class_lens, p->arena, p->L, sizeof(size_t));
+    plist_init(&attrs, p->arena, p->L, sizeof(sel_attr_cond));
+    plist_init(&pseudos, p->arena, p->L, sizeof(sel_pseudo_cond));
 
     if (!p_eof(p) && p_peek(p) == '*') {
         p_next(p);
@@ -657,7 +661,7 @@ static int parse_complex(parser_t *p, sel_complex *out)
 {
     memset(out, 0, sizeof(*out));
     plist_t parts;
-    plist_init(&parts, sizeof(sel_complex_part));
+    plist_init(&parts, p->arena, p->L, sizeof(sel_complex_part));
 
     p_skip_ws(p);
     sel_complex_part first;
@@ -736,7 +740,7 @@ sel_compiled *selector_parse(compile_arena *arena, lua_State *L,
     parser_t p = {source, source_len, 0, arena, L, err};
 
     plist_t sels;
-    plist_init(&sels, sizeof(sel_complex));
+    plist_init(&sels, arena, L, sizeof(sel_complex));
 
     sel_complex first_c;
     if (parse_complex(&p, &first_c) != 0) {

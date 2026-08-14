@@ -38,6 +38,7 @@
 
 // project
 #include "interpret.h"
+#include "checked.h"
 #include "escape.h"
 #include "expr/eval.h"
 #include "expr/parse.h"
@@ -61,7 +62,7 @@ typedef struct {
     buf_t        *out;
     scope_env     env;
     lua_State    *L;
-    int           helpers_ref;
+    int           helpers_idx;
     reflow_error *err;
     /* Source context for error location; may be NULL/0 when unavailable. */
     const char   *template_name;
@@ -71,8 +72,9 @@ typedef struct {
     const ir_node *current_element;
     /* x-include state. */
     const interpret_include_hooks *hooks;
-    const char *include_stack[64];
-    size_t      include_stack_len[64];
+    const char **include_stack;
+    size_t      *include_stack_len;
+    size_t       include_capacity;
     int         include_depth;
 } render_ctx;
 
@@ -96,7 +98,7 @@ static char *render_reconstruct_open_tag(render_ctx *rc, const ir_node *el)
 {
     if (el == NULL || el->type != IR_ELEMENT) return NULL;
     buf_t buf;
-    if (buf_init(&buf) != 0) return NULL;
+    if (buf_init(&buf, rc->arena) != 0) return NULL;
     buf_putc(&buf, '<');
     buf_put(&buf, el->element.tag_name, strlen(el->element.tag_name));
     for (size_t i = 0; i < el->element.n_attrs; i++) {
@@ -124,6 +126,9 @@ static char *render_reconstruct_open_tag(render_ctx *rc, const ir_node *el)
 static void render_error_populate(render_ctx *rc)
 {
     if (rc->err == NULL) return;
+    rc->err->include_stack = rc->include_stack;
+    rc->err->include_stack_len = rc->include_stack_len;
+    rc->err->include_stack_count = (size_t)rc->include_depth;
     if (rc->template_name != NULL) {
         rc->err->template_name = rc->template_name;
     }
@@ -135,7 +140,7 @@ static void render_error_populate(render_ctx *rc)
         rc->err->line   = line;
         rc->err->column = col;
         buf_t snip;
-        if (buf_init(&snip) == 0) {
+        if (buf_init(&snip, rc->arena) == 0) {
             make_snippet(rc->html, rc->html_len,
                          at->element.source_start,
                          at->element.source_end, &snip);
@@ -151,7 +156,29 @@ static void render_error_populate(render_ctx *rc)
     }
 }
 
-static char g_render_err[512];
+static char *render_owned_message(render_ctx *rc, const char *message)
+{
+    size_t len = strlen(message);
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) return NULL;
+    char *owned = (char *)arena_alloc(rc->arena, bytes);
+    if (owned != NULL) memcpy(owned, message, bytes);
+    return owned;
+}
+
+/* Retain the exact requested include value in operation-arena storage so the
+ * public error marshaler can preserve non-string values as well as names. */
+static void render_error_set_requested(render_ctx *rc,
+                                       const reflow_value *requested)
+{
+    if (rc->err == NULL || requested == NULL) return;
+    reflow_value *owned = (reflow_value *)arena_alloc(rc->arena,
+                                                       sizeof(*owned));
+    if (owned != NULL) {
+        *owned = *requested;
+        rc->err->requested_value = owned;
+    }
+}
 
 /* Format an error with a specific type and populate location. */
 static void render_error_typed(render_ctx *rc, const char *type,
@@ -160,12 +187,16 @@ static void render_error_typed(render_ctx *rc, const char *type,
     if (rc->err == NULL || rc->err->message != NULL) {
         return;
     }
+    char message[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_render_err, sizeof(g_render_err), fmt, ap);
+    vsnprintf(message, sizeof(message), fmt, ap);
     va_end(ap);
     rc->err->type    = type;
-    rc->err->message = g_render_err;
+    rc->err->message = render_owned_message(rc, message);
+    if (rc->err->message == NULL) {
+        rc->err->message = "runtime error message is too large";
+    }
     render_error_populate(rc);
 }
 
@@ -174,13 +205,53 @@ static void render_errorf(render_ctx *rc, const char *fmt, ...)
     if (rc->err == NULL || rc->err->message != NULL) {
         return;
     }
+    char message[512];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_render_err, sizeof(g_render_err), fmt, ap);
+    vsnprintf(message, sizeof(message), fmt, ap);
     va_end(ap);
     rc->err->type    = "ReflowRuntimeError";
-    rc->err->message = g_render_err;
+    rc->err->message = render_owned_message(rc, message);
+    if (rc->err->message == NULL) {
+        rc->err->message = "runtime error message is too large";
+    }
     render_error_populate(rc);
+}
+
+/* Size the cycle-detection stack from the user-visible recursion limit.
+ * Keeping this storage in the operation arena makes it subject to the Lua
+ * allocator and removes the former implicit 64-entry memory-safety ceiling. */
+static bool render_ctx_prepare_includes(render_ctx *rc)
+{
+    rc->include_stack = NULL;
+    rc->include_stack_len = NULL;
+    rc->include_capacity = 0;
+    if (rc->hooks == NULL) return true;
+
+    size_t capacity = rc->hooks->max_depth > 0
+        ? (size_t)rc->hooks->max_depth : 1;
+    size_t names_size = 0;
+    size_t lengths_size = 0;
+    if (!reflow_size_mul(capacity, sizeof(*rc->include_stack),
+                         &names_size) ||
+        !reflow_size_mul(capacity, sizeof(*rc->include_stack_len),
+                         &lengths_size)) {
+        render_errorf(rc, "max include depth is too large");
+        return false;
+    }
+    rc->include_stack = (const char **)arena_alloc(rc->arena, names_size);
+    rc->include_stack_len = (size_t *)arena_alloc(rc->arena, lengths_size);
+    if (rc->include_stack == NULL || rc->include_stack_len == NULL) {
+        render_errorf(rc, "max include depth is too large");
+        return false;
+    }
+    rc->include_capacity = capacity;
+    if (rc->template_name != NULL && capacity > 0) {
+        rc->include_stack[0] = rc->template_name;
+        rc->include_stack_len[0] = strlen(rc->template_name);
+        rc->include_depth = 1;
+    }
+    return true;
 }
 
 /* --- forward declarations --- */
@@ -198,10 +269,19 @@ static render_result eval_expr(render_ctx *rc, const expr_node *n,
                                reflow_value *out)
 {
     reflow_error eerr = {0};
-    reflow_value v = expr_eval(n, &rc->env, rc->L, rc->helpers_ref,
+    reflow_value v = expr_eval(n, &rc->env, rc->L, rc->helpers_idx,
                                rc->arena, &eerr);
     if (eerr.message != NULL) {
         render_errorf(rc, "%s", eerr.message);
+        if (rc->err != NULL) {
+            rc->err->expression = n->source;
+            reflow_error *cause = (reflow_error *)arena_alloc(
+                rc->arena, sizeof(*cause));
+            if (cause != NULL) {
+                *cause = eerr;
+                rc->err->cause = cause;
+            }
+        }
         return RR_ERROR;
     }
     *out = v;
@@ -243,6 +323,16 @@ static render_result emit_open_tag(render_ctx *rc, const ir_node *el)
                 buf_putc(rc->out, ' ');
                 buf_put(rc->out, a->name, strlen(a->name));
                 continue;
+            }
+            if (v.tag == RV_ARRAY || v.tag == RV_OBJECT) {
+                render_errorf(rc, "x-bind:%s: value must be primitive, got %s",
+                              a->name,
+                              v.tag == RV_ARRAY ? "array" : "object");
+                if (rc->err != NULL) {
+                    rc->err->directive = "x-bind";
+                    rc->err->attribute = a->name;
+                }
+                return RR_ERROR;
             }
             char scratch[64];
             size_t n = rv_to_js_string(&v, scratch);
@@ -291,6 +381,16 @@ static render_result emit_open_tag(render_ctx *rc, const ir_node *el)
             buf_putc(rc->out, ' ');
             buf_put(rc->out, bind->attr_name, strlen(bind->attr_name));
             continue;
+        }
+        if (v.tag == RV_ARRAY || v.tag == RV_OBJECT) {
+            render_errorf(rc, "x-bind:%s: value must be primitive, got %s",
+                          bind->attr_name,
+                          v.tag == RV_ARRAY ? "array" : "object");
+            if (rc->err != NULL) {
+                rc->err->directive = "x-bind";
+                rc->err->attribute = bind->attr_name;
+            }
+            return RR_ERROR;
         }
         buf_putc(rc->out, ' ');
         buf_put(rc->out, bind->attr_name, strlen(bind->attr_name));
@@ -492,7 +592,11 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                         nv.tag == RV_BOOL ? "boolean" :
                         nv.tag == RV_ARRAY ? "array" :
                         nv.tag == RV_OBJECT ? "object" : "value");
-                    if (rc->err) rc->err->directive = "x-include";
+                    if (rc->err) {
+                        rc->err->directive = "x-include";
+                        rc->err->reason = "invalid";
+                        render_error_set_requested(rc, &nv);
+                    }
                     rr = RR_ERROR;
                 } else if (rc->include_depth >= rc->hooks->max_depth) {
                     render_error_typed(rc, "ReflowIncludeError",
@@ -501,6 +605,7 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                     if (rc->err) {
                         rc->err->directive = "x-include";
                         rc->err->reason    = "depth_exceeded";
+                        render_error_set_requested(rc, &nv);
                     }
                     rr = RR_ERROR;
                 } else {
@@ -515,6 +620,7 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                             if (rc->err) {
                                 rc->err->directive = "x-include";
                                 rc->err->reason    = "cycle";
+                                render_error_set_requested(rc, &nv);
                             }
                             rr = RR_ERROR;
                             break;
@@ -541,6 +647,7 @@ static render_result render_element_body(render_ctx *rc, const ir_node *el)
                                 if (rc->err) {
                                     rc->err->directive = "x-include";
                                     rc->err->reason    = "not_found";
+                                    render_error_set_requested(rc, &nv);
                                     /* Copy name into arena so caller
                                      * lifetime is safe when raising. */
                                     char *req = (char *)arena_alloc(
@@ -890,7 +997,7 @@ int interpret_render(arena_t *arena,
                      const ir_node *root,
                      reflow_value  *globals,
                      lua_State     *L,
-                     int            helpers_ref,
+                     int            helpers_idx,
                      const char    *template_name,
                      const char    *html,
                      size_t         html_len,
@@ -902,7 +1009,7 @@ int interpret_render(arena_t *arena,
         .arena         = arena,
         .out           = out,
         .L             = L,
-        .helpers_ref   = helpers_ref,
+        .helpers_idx   = helpers_idx,
         .err           = err,
         .template_name = template_name,
         .html          = html,
@@ -911,7 +1018,8 @@ int interpret_render(arena_t *arena,
         .hooks         = hooks,
         .include_depth = 0,
     };
-    scope_env_init(&rc.env, globals);
+    if (!render_ctx_prepare_includes(&rc)) return -1;
+    scope_env_init(&rc.env, arena, globals);
 
     render_result rr = render_node(&rc, root);
     if (rr == RR_BREAK) {
@@ -942,7 +1050,7 @@ int interpret_render_fragment(arena_t *arena,
                               const ir_node *target,
                               reflow_value  *globals,
                               lua_State     *L,
-                              int            helpers_ref,
+                              int            helpers_idx,
                               const char    *template_name,
                               const char    *html,
                               size_t         html_len,
@@ -954,7 +1062,7 @@ int interpret_render_fragment(arena_t *arena,
         .arena         = arena,
         .out           = out,
         .L             = L,
-        .helpers_ref   = helpers_ref,
+        .helpers_idx   = helpers_idx,
         .err           = err,
         .template_name = template_name,
         .html          = html,
@@ -963,7 +1071,8 @@ int interpret_render_fragment(arena_t *arena,
         .hooks         = hooks,
         .include_depth = 0,
     };
-    scope_env_init(&rc.env, globals);
+    if (!render_ctx_prepare_includes(&rc)) return -1;
+    scope_env_init(&rc.env, arena, globals);
 
     render_result rr = render_element(&rc, target);
     if (rr == RR_BREAK) {
@@ -995,6 +1104,46 @@ static bool fragment_requires_execution(const ir_node *el)
     if (d->for_spec != NULL) return true;
     if (d->each_spec != NULL) return true;
     return false;
+}
+
+/* Build the root-to-leaf control path without imposing a fixed C-stack
+ * capacity. The returned vector is operation-arena owned. */
+static int fragment_build_path(arena_t *arena, const ir_node *start,
+                               const ir_node ***out_path,
+                               size_t *out_path_len,
+                               reflow_error *err)
+{
+    size_t count = 0;
+    for (const ir_node *cur = start; cur != NULL;
+         cur = cur->element.parent) {
+        if (fragment_requires_execution(cur)) {
+            if (count == SIZE_MAX) goto overflow;
+            count++;
+        }
+    }
+    if (count == 0) {
+        *out_path = NULL;
+        *out_path_len = 0;
+        return 0;
+    }
+    size_t bytes = 0;
+    if (!reflow_size_mul(count, sizeof(**out_path), &bytes)) goto overflow;
+    const ir_node **path = (const ir_node **)arena_alloc(arena, bytes);
+    if (path == NULL) goto overflow;
+    size_t index = count;
+    for (const ir_node *cur = start; cur != NULL;
+         cur = cur->element.parent) {
+        if (fragment_requires_execution(cur)) path[--index] = cur;
+    }
+    *out_path = path;
+    *out_path_len = count;
+    return 0;
+
+overflow:
+    err->type = "ReflowSelectorError";
+    err->message = "fragment control path is too large";
+    err->reason = "unsupported";
+    return -1;
 }
 
 typedef struct {
@@ -1072,7 +1221,7 @@ static render_result fragment_walk(fragment_ctx *fc, size_t idx);
 static render_result fragment_capture_once(fragment_ctx *fc)
 {
     buf_t local;
-    if (buf_init(&local) != 0) {
+    if (buf_init(&local, fc->rc->arena) != 0) {
         render_errorf(fc->rc, "out of memory");
         return RR_ERROR;
     }
@@ -1226,7 +1375,7 @@ static render_result fragment_emit_target(fragment_ctx *fc)
     } else {
         /* Use render_element to honor x-match on the target. */
         buf_t local;
-        if (buf_init(&local) != 0) {
+        if (buf_init(&local, fc->rc->arena) != 0) {
             while (fc->rc->env.n_frames > frames_before) {
                 scope_pop_frame(&fc->rc->env);
             }
@@ -1397,8 +1546,9 @@ interpret_fragment_result
 interpret_render_fragment_at(arena_t *arena,
                              const ir_node *target,
                              reflow_value  *globals,
+                             reflow_value  *initial_frame,
                              lua_State     *L,
-                             int            helpers_ref,
+                             int            helpers_idx,
                              const char    *template_name,
                              const char    *html,
                              size_t         html_len,
@@ -1406,30 +1556,18 @@ interpret_render_fragment_at(arena_t *arena,
                              buf_t         *out,
                              reflow_error  *err)
 {
-    const ir_node *chain_up[64];
-    size_t chain_len = 0;
-    for (const ir_node *cur = target->element.parent;
-         cur != NULL; cur = cur->element.parent) {
-        if (fragment_requires_execution(cur)) {
-            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
-                err->type    = "ReflowSelectorError";
-                err->message = "fragment control path exceeds depth limit";
-                err->reason  = "unsupported";
-                return INTERPRET_FRAG_ERROR;
-            }
-            chain_up[chain_len++] = cur;
-        }
-    }
-    const ir_node *path[64];
-    for (size_t i = 0; i < chain_len; i++) {
-        path[i] = chain_up[chain_len - 1 - i];
+    const ir_node **path = NULL;
+    size_t path_len = 0;
+    if (fragment_build_path(arena, target->element.parent,
+                            &path, &path_len, err) != 0) {
+        return INTERPRET_FRAG_ERROR;
     }
 
     render_ctx rc = {
         .arena         = arena,
         .out           = out,
         .L             = L,
-        .helpers_ref   = helpers_ref,
+        .helpers_idx   = helpers_idx,
         .err           = err,
         .template_name = template_name,
         .html          = html,
@@ -1438,7 +1576,13 @@ interpret_render_fragment_at(arena_t *arena,
         .hooks         = hooks,
         .include_depth = 0,
     };
-    scope_env_init(&rc.env, globals);
+    if (!render_ctx_prepare_includes(&rc)) {
+        return INTERPRET_FRAG_ERROR;
+    }
+    scope_env_init(&rc.env, arena, globals);
+    if (initial_frame != NULL) {
+        scope_push_frame(&rc.env, SCOPE_FRAME_DATA, initial_frame);
+    }
 
     fragment_ctx fc = {
         .rc             = &rc,
@@ -1446,7 +1590,7 @@ interpret_render_fragment_at(arena_t *arena,
         .out            = out,
         .emission_count = 0,
         .path           = path,
-        .path_len       = chain_len,
+        .path_len       = path_len,
     };
     render_result rr = fragment_walk(&fc, 0);
     if (rr == RR_ERROR) return INTERPRET_FRAG_ERROR;
@@ -1489,8 +1633,9 @@ typedef struct {
     size_t             n_records;
     size_t             cap_records;
     size_t             total_index;
-    tag_counter        tag_counts[64];
+    tag_counter       *tag_counts;
     size_t             n_tag_counts;
+    size_t             cap_tag_counts;
 } positional_ctx;
 
 /* Return the 1-based position (this emission's rank) among siblings of
@@ -1502,9 +1647,32 @@ static size_t pctx_increment_of_type(positional_ctx *pctx, const char *tag)
             return ++pctx->tag_counts[i].count;
         }
     }
-    if (pctx->n_tag_counts >= sizeof(pctx->tag_counts)/sizeof(pctx->tag_counts[0])) {
-        /* Overflow: rare, fall through as untracked (still gives count=1). */
-        return 1;
+    if (pctx->n_tag_counts >= pctx->cap_tag_counts) {
+        size_t required = 0;
+        size_t capacity = 0;
+        size_t bytes = 0;
+        size_t copy_bytes = 0;
+        if (!reflow_size_add(pctx->n_tag_counts, 1, &required) ||
+            !reflow_size_grow(pctx->cap_tag_counts, required, &capacity) ||
+            !reflow_size_mul(capacity, sizeof(tag_counter), &bytes) ||
+            !reflow_size_mul(pctx->n_tag_counts, sizeof(tag_counter),
+                             &copy_bytes)) {
+            lua_pushliteral(pctx->rc->L,
+                            "too many sibling element types");
+            lua_error(pctx->rc->L);
+        }
+        tag_counter *counts =
+            (tag_counter *)arena_alloc(pctx->rc->arena, bytes);
+        if (counts == NULL) {
+            lua_pushliteral(pctx->rc->L,
+                            "too many sibling element types");
+            lua_error(pctx->rc->L);
+        }
+        if (copy_bytes != 0) {
+            memcpy(counts, pctx->tag_counts, copy_bytes);
+        }
+        pctx->tag_counts = counts;
+        pctx->cap_tag_counts = capacity;
     }
     pctx->tag_counts[pctx->n_tag_counts].tag   = tag;
     pctx->tag_counts[pctx->n_tag_counts].count = 1;
@@ -1540,19 +1708,32 @@ static render_result pctx_record_emission(positional_ctx *pctx,
                                           const ir_node *el, void *ud)
 {
     if (pctx->n_records == pctx->cap_records) {
-        size_t ncap = pctx->cap_records ? pctx->cap_records * 2 : 4;
-        positional_record *nb = (positional_record *)realloc(
-            pctx->records, ncap * sizeof(*nb));
-        if (!nb) {
+        size_t required = 0;
+        size_t ncap = 0;
+        size_t bytes = 0;
+        if (!reflow_size_add(pctx->n_records, 1, &required) ||
+            !reflow_size_grow(pctx->cap_records ? pctx->cap_records : 4,
+                              required, &ncap) ||
+            !reflow_size_mul(ncap, sizeof(*pctx->records), &bytes)) {
             render_errorf(pctx->rc, "out of memory");
             return RR_ERROR;
+        }
+        positional_record *nb = (positional_record *)arena_alloc(
+            pctx->rc->arena, bytes);
+        if (nb == NULL) {
+            render_errorf(pctx->rc, "out of memory");
+            return RR_ERROR;
+        }
+        if (pctx->n_records > 0) {
+            memcpy(nb, pctx->records,
+                   pctx->n_records * sizeof(*pctx->records));
         }
         pctx->records     = nb;
         pctx->cap_records = ncap;
     }
     /* Capture render output. */
     buf_t local;
-    if (buf_init(&local) != 0) {
+    if (buf_init(&local, pctx->rc->arena) != 0) {
         render_errorf(pctx->rc, "out of memory");
         return RR_ERROR;
     }
@@ -1572,8 +1753,14 @@ static render_result pctx_record_emission(positional_ctx *pctx,
     positional_record *rec = &pctx->records[pctx->n_records++];
     rec->element       = el;
     rec->predicate_ud  = ud;
-    rec->captured      = (char *)malloc(local.len + 1);
-    if (!rec->captured) {
+    size_t captured_size = 0;
+    if (!reflow_size_add(local.len, 1, &captured_size)) {
+        buf_free(&local);
+        render_errorf(pctx->rc, "out of memory");
+        return RR_ERROR;
+    }
+    rec->captured = (char *)arena_alloc(pctx->rc->arena, captured_size);
+    if (rec->captured == NULL) {
         buf_free(&local);
         render_errorf(pctx->rc, "out of memory");
         return RR_ERROR;
@@ -1708,48 +1895,6 @@ static render_result process_sibling(positional_ctx *pctx,
     return RR_OK;
 }
 
-/* Compute the parent's control path (ancestors requiring execution)
- * and set up the render env with their scopes / branch selection.
- * On success, invokes `fn` with the env prepared and pops frames on
- * return.  Returns RR_OK / RR_ERROR forwarded from fn. */
-static render_result with_parent_control_env(fragment_ctx *fc,
-                                             const ir_node *parent,
-                                             render_result (*fn)(fragment_ctx *))
-{
-    /* Reuse fragment_step / fragment_walk by pointing target at parent
-     * and running until "path idx == path_len", but that also emits
-     * the parent — not what we want.  Instead build a mini control
-     * path just for the parent's ancestors and invoke fn once at the
-     * end. */
-    const ir_node *chain_up[64];
-    size_t chain_len = 0;
-    for (const ir_node *cur = parent ? parent->element.parent : NULL;
-         cur != NULL; cur = cur->element.parent) {
-        if (fragment_requires_execution(cur)) {
-            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
-                render_errorf(fc->rc,
-                    "fragment parent control path exceeds depth limit");
-                return RR_ERROR;
-            }
-            chain_up[chain_len++] = cur;
-        }
-    }
-    const ir_node *path[64];
-    for (size_t i = 0; i < chain_len; i++) {
-        path[i] = chain_up[chain_len - 1 - i];
-    }
-    /* Use fragment_walk with a special target-emitter that just calls
-     * fn instead of rendering.  Hack: temporarily override
-     * emission via a flag; simpler to inline the walk here. */
-    fc->path     = path;
-    fc->path_len = chain_len;
-    /* Store fn in fc via type-punning is ugly — instead do inline. */
-    (void)fn;
-    /* Not used: this function is a scaffold; positional entry point
-     * runs the walk directly. */
-    return RR_OK;
-}
-
 /*
  * ============================================================
  * Callback-based execute-at
@@ -1782,7 +1927,9 @@ static render_result reach_terminal(reach_ctx *rc)
 {
     rc->reached++;
     reflow_error *err = rc->rc->err;
-    if (rc->cb(rc->cb_ud, rc->rc->L, err) != 0) return RR_ERROR;
+    if (rc->cb(rc->cb_ud, rc->rc->L, &rc->rc->env, err) != 0) {
+        return RR_ERROR;
+    }
     return RR_OK;
 }
 
@@ -1914,8 +2061,9 @@ static render_result reach_walk(reach_ctx *rc, size_t idx)
 int interpret_execute_at(arena_t *arena,
                          const ir_node *target,
                          reflow_value  *globals,
+                         reflow_value  *initial_frame,
                          lua_State     *L,
-                         int            helpers_ref,
+                         int            helpers_idx,
                          const char    *template_name,
                          const char    *html,
                          size_t         html_len,
@@ -1925,30 +2073,18 @@ int interpret_execute_at(arena_t *arena,
                          size_t        *out_reached,
                          reflow_error  *err)
 {
-    const ir_node *chain_up[64];
-    size_t chain_len = 0;
-    for (const ir_node *cur = target->element.parent;
-         cur != NULL; cur = cur->element.parent) {
-        if (fragment_requires_execution(cur)) {
-            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
-                err->type    = "ReflowSelectorError";
-                err->message = "fragment control path exceeds depth limit";
-                err->reason  = "unsupported";
-                return -1;
-            }
-            chain_up[chain_len++] = cur;
-        }
-    }
-    const ir_node *path[64];
-    for (size_t i = 0; i < chain_len; i++) {
-        path[i] = chain_up[chain_len - 1 - i];
+    const ir_node **path = NULL;
+    size_t path_len = 0;
+    if (fragment_build_path(arena, target->element.parent,
+                            &path, &path_len, err) != 0) {
+        return -1;
     }
 
     render_ctx rc = {
         .arena         = arena,
         .out           = NULL,
         .L             = L,
-        .helpers_ref   = helpers_ref,
+        .helpers_idx   = helpers_idx,
         .err           = err,
         .template_name = template_name,
         .html          = html,
@@ -1957,12 +2093,16 @@ int interpret_execute_at(arena_t *arena,
         .hooks         = hooks,
         .include_depth = 0,
     };
-    scope_env_init(&rc.env, globals);
+    if (!render_ctx_prepare_includes(&rc)) return -1;
+    scope_env_init(&rc.env, arena, globals);
+    if (initial_frame != NULL) {
+        scope_push_frame(&rc.env, SCOPE_FRAME_DATA, initial_frame);
+    }
 
     reach_ctx rctx = {
         .rc       = &rc,
         .path     = path,
-        .path_len = chain_len,
+        .path_len = path_len,
         .terminal = target,
         .cb       = cb,
         .cb_ud    = cb_ud,
@@ -1984,8 +2124,9 @@ interpret_render_fragment_positional(
     size_t         n_candidates,
     interpret_fragment_positional_eval_fn eval_fn,
     reflow_value  *globals,
+    reflow_value  *initial_frame,
     lua_State     *L,
-    int            helpers_ref,
+    int            helpers_idx,
     const char    *template_name,
     const char    *html,
     size_t         html_len,
@@ -1993,47 +2134,19 @@ interpret_render_fragment_positional(
     buf_t         *out,
     reflow_error  *err)
 {
-    (void)with_parent_control_env;  /* scaffold, unused */
-
     /* Build parent's ancestor control path so we render inside the
      * correct scope / branch state. */
-    const ir_node *chain_up[64];
-    size_t chain_len = 0;
-    for (const ir_node *cur = parent ? parent->element.parent : NULL;
-         cur != NULL; cur = cur->element.parent) {
-        if (fragment_requires_execution(cur)) {
-            if (chain_len >= sizeof(chain_up)/sizeof(chain_up[0])) {
-                err->type    = "ReflowSelectorError";
-                err->message = "fragment parent control path exceeds depth limit";
-                err->reason  = "unsupported";
-                return INTERPRET_FRAG_ERROR;
-            }
-            chain_up[chain_len++] = cur;
-        }
-    }
-    /* If parent itself is on a chain/match branch or has iteration /
-     * data / with, include parent as the innermost element on the
-     * control path (its children are what we walk). */
-    const ir_node *path[64];
+    const ir_node **path = NULL;
     size_t path_len = 0;
-    for (size_t i = 0; i < chain_len; i++) {
-        path[path_len++] = chain_up[chain_len - 1 - i];
-    }
-    if (parent != NULL && fragment_requires_execution(parent)) {
-        if (path_len >= sizeof(path)/sizeof(path[0])) {
-            err->type    = "ReflowSelectorError";
-            err->message = "fragment parent control path exceeds depth limit";
-            err->reason  = "unsupported";
-            return INTERPRET_FRAG_ERROR;
-        }
-        path[path_len++] = parent;
+    if (fragment_build_path(arena, parent, &path, &path_len, err) != 0) {
+        return INTERPRET_FRAG_ERROR;
     }
 
     render_ctx rc = {
         .arena         = arena,
         .out           = out,
         .L             = L,
-        .helpers_ref   = helpers_ref,
+        .helpers_idx   = helpers_idx,
         .err           = err,
         .template_name = template_name,
         .html          = html,
@@ -2042,7 +2155,13 @@ interpret_render_fragment_positional(
         .hooks         = hooks,
         .include_depth = 0,
     };
-    scope_env_init(&rc.env, globals);
+    if (!render_ctx_prepare_includes(&rc)) {
+        return INTERPRET_FRAG_ERROR;
+    }
+    scope_env_init(&rc.env, arena, globals);
+    if (initial_frame != NULL) {
+        scope_push_frame(&rc.env, SCOPE_FRAME_DATA, initial_frame);
+    }
 
     positional_ctx pctx = {0};
     pctx.rc            = &rc;
@@ -2134,8 +2253,6 @@ after_walk:
     }
 
     if (walk_rc == RR_ERROR) {
-        for (size_t i = 0; i < pctx.n_records; i++) free(pctx.records[i].captured);
-        free(pctx.records);
         return INTERPRET_FRAG_ERROR;
     }
 
@@ -2154,9 +2271,6 @@ after_walk:
             matches++;
         }
     }
-    for (size_t i = 0; i < pctx.n_records; i++) free(pctx.records[i].captured);
-    free(pctx.records);
-
     if (matches == 0) return INTERPRET_FRAG_NO_MATCH;
     if (matches > 1)  return INTERPRET_FRAG_MULTIPLE_MATCHES;
     return INTERPRET_FRAG_OK;

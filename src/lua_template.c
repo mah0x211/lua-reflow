@@ -23,14 +23,16 @@
 #include "lua_template.h"
 #include "arena.h"
 #include "buf.h"
+#include "checked.h"
 #include "compile.h"
 #include "compile_arena.h"
 #include "error.h"
+#include "expr/eval.h"
 #include "interpret.h"
 #include "json5.h"
 #include "lua_selector.h"
+#include "lua_owner.h"
 #include "renderer.h"
-#include "selector/cache.h"
 #include "selector/parse.h"
 #include "selector/resolve.h"
 #include "value.h"
@@ -55,15 +57,29 @@ reflow_template *reflow_template_check(lua_State *L, int idx)
 #endif
 }
 
-static int template_gc(lua_State *L)
+static void *template_alloc_array(lua_State *L, compile_arena *arena,
+                                  size_t count, size_t item_size,
+                                  const char *what)
 {
-    reflow_template *t = (reflow_template *)luaL_checkudata(
-        L, 1, REFLOW_TEMPLATE_MT);
-    if (t->arena_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, t->arena_ref);
-        t->arena_ref = LUA_NOREF;
+    size_t bytes = 0;
+    if (!reflow_size_mul(count, item_size, &bytes)) {
+        luaL_error(L, "%s is too large", what);
     }
-    return 0;
+    return compile_arena_alloc(arena, L, bytes);
+}
+
+static char *template_dup_string(lua_State *L, compile_arena *arena,
+                                 const char *src, size_t len,
+                                 const char *what)
+{
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        luaL_error(L, "%s is too large", what);
+    }
+    char *dst = (char *)compile_arena_alloc(arena, L, bytes);
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
 }
 
 /* ------------------------------------------------------------------
@@ -91,16 +107,14 @@ static const char **collect_helper_names(lua_State *L, int idx,
         *n = 0;
         return NULL;
     }
-    const char **arr = (const char **)compile_arena_alloc(
-        carena, L, count * sizeof(const char *));
+    const char **arr = (const char **)template_alloc_array(
+        L, carena, count, sizeof(const char *), "helper list");
     size_t i = 0;
     lua_pushnil(L);
     while (lua_next(L, idx)) {
         size_t nl = 0;
         const char *nm = lua_tolstring(L, -2, &nl);
-        char *dup = (char *)compile_arena_alloc(carena, L, nl + 1);
-        memcpy(dup, nm, nl);
-        dup[nl] = '\0';
+        char *dup = template_dup_string(L, carena, nm, nl, "helper name");
         arr[i++] = dup;
         lua_pop(L, 1);
     }
@@ -214,15 +228,14 @@ static int template_new(lua_State *L)
         alen = (size_t)lua_objlen(L, helpers_pos);
 #endif
         if (alen > 0) {
-            helpers = (const char **)compile_arena_alloc(
-                carena, L, alen * sizeof(const char *));
+            helpers = (const char **)template_alloc_array(
+                L, carena, alen, sizeof(const char *), "helper list");
             for (size_t i = 0; i < alen; i++) {
                 lua_rawgeti(L, helpers_pos, (int)(i + 1));
                 size_t nl = 0;
                 const char *nm = luaL_checklstring(L, -1, &nl);
-                char *dup = (char *)compile_arena_alloc(carena, L, nl + 1);
-                memcpy(dup, nm, nl);
-                dup[nl] = '\0';
+                char *dup = template_dup_string(
+                    L, carena, nm, nl, "helper name");
                 helpers[i] = dup;
                 lua_pop(L, 1);
             }
@@ -240,17 +253,17 @@ static int template_new(lua_State *L)
                                      helpers, n_helpers, &err);
     if (root == NULL) {
         lua_settop(L, arena_stack_pos);
-        lua_pop(L, 1);
         lua_pushnil(L);
         push_compile_error(L, &err);
+        /* Keep the compile arena live until its strings are in Lua. */
+        lua_remove(L, arena_stack_pos);
         return 2;
     }
 
     /* Copy html and prefix into arena so the userdata's pointers stay
      * alive with the arena. */
-    char *html_copy = (char *)compile_arena_alloc(carena, L, hlen + 1);
-    memcpy(html_copy, html, hlen);
-    html_copy[hlen] = '\0';
+    char *html_copy = template_dup_string(
+        L, carena, html, hlen, "template source");
 
     sel_index *sindex = sel_build_index(carena, L, root);
     if (sindex == NULL) {
@@ -263,15 +276,8 @@ static int template_new(lua_State *L)
         return 2;
     }
 
-    /* Move the arena userdata from the stack into a registry ref so
-     * the template userdata keeps it alive. */
-    lua_pushvalue(L, arena_stack_pos);
-    int arena_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    lua_remove(L, arena_stack_pos);
-
     reflow_template_register(L);
     reflow_template *t = (reflow_template *)lua_newuserdata(L, sizeof(*t));
-    t->arena_ref  = arena_ref;
     t->root       = root;
     t->sindex     = sindex;
     t->html       = html_copy;
@@ -281,6 +287,8 @@ static int template_new(lua_State *L)
     t->prefix_len = prefix_len;
     luaL_getmetatable(L, REFLOW_TEMPLATE_MT);
     lua_setmetatable(L, -2);
+    reflow_lua_own(L, -1, arena_stack_pos);
+    lua_remove(L, arena_stack_pos);
     /* Also drop the anchor to helpers uservalue we may have introduced. */
     if (helpers_pos > 0) {
         /* helpers table stays on stack — we don't need it after
@@ -360,8 +368,9 @@ static int template_dict_fetch(void *ud, lua_State *L,
  * Error push
  * ------------------------------------------------------------------ */
 
-static void push_render_error(lua_State *L, const reflow_error *err,
-                              const char *fallback_name)
+static void push_render_error_value(lua_State *L, const reflow_error *err,
+                                    const char *fallback_name,
+                                    unsigned int depth)
 {
     /* Reuse the renderer's push_reflow_error via its module boundary
      * if exposed; but the current renderer.c keeps it static.  Build
@@ -391,13 +400,34 @@ static void push_render_error(lua_State *L, const reflow_error *err,
     if (err->attribute) { lua_pushstring(L, err->attribute); lua_setfield(L, -2, "attribute"); }
     if (err->expression){ lua_pushstring(L, err->expression); lua_setfield(L, -2, "expression"); }
     if (err->reason)    { lua_pushstring(L, err->reason);    lua_setfield(L, -2, "reason"); }
-    if (err->requested) { lua_pushstring(L, err->requested); lua_setfield(L, -2, "requested"); }
+    if (err->requested_value) {
+        rv_to_lua(L, err->requested_value);
+        lua_setfield(L, -2, "requested");
+    } else if (err->requested) {
+        lua_pushstring(L, err->requested);
+        lua_setfield(L, -2, "requested");
+    }
+    if (err->include_stack != NULL && err->include_stack_count > 0) {
+        lua_createtable(L, (int)err->include_stack_count, 0);
+        for (size_t i = 0; i < err->include_stack_count; i++) {
+            size_t len = err->include_stack_len != NULL
+                ? err->include_stack_len[i]
+                : strlen(err->include_stack[i]);
+            lua_pushlstring(L, err->include_stack[i], len);
+            lua_rawseti(L, -2, (int)(i + 1));
+        }
+        lua_setfield(L, -2, "includeStack");
+    }
     if (err->source)    { lua_pushstring(L, err->source);    lua_setfield(L, -2, "source"); }
-    if (err->position > 0) {
+    if (err->has_position) {
         lua_pushinteger(L, (lua_Integer)err->position);
         lua_setfield(L, -2, "position");
     }
     if (err->feature)   { lua_pushstring(L, err->feature);   lua_setfield(L, -2, "feature"); }
+    if (err->cause != NULL && depth < 16) {
+        push_render_error_value(L, err->cause, NULL, depth + 1);
+        lua_setfield(L, -2, "cause");
+    }
     luaL_getmetatable(L, "reflow.error");
     if (!lua_isnil(L, -1)) {
         lua_setmetatable(L, -2);
@@ -406,14 +436,21 @@ static void push_render_error(lua_State *L, const reflow_error *err,
     }
 }
 
+static void push_render_error(lua_State *L, const reflow_error *err,
+                              const char *fallback_name)
+{
+    push_render_error_value(L, err, fallback_name, 0);
+}
+
 /* ------------------------------------------------------------------
- * :render(data, helpers, templates, max_depth, selector)
+ * :render(data, helpers, templates, max_depth, selector, template_name)
  *
  * All arguments are optional except `self`.  Data may be a JSON5 string
  * or nil.  Helpers is a table {name = function}.  Templates is a table
  * {name = template_userdata} used for x-include resolution.
  * Max_depth defaults to 50.  Selector may be a string (parsed on the
- * fly) or a reflow.selector userdata.
+ * fly) or a reflow.selector userdata. template_name is an internal
+ * coordinator argument used for include stacks and structured errors.
  *
  * Returns html_string, nil on success; nil, err_table on failure.
  * ------------------------------------------------------------------ */
@@ -422,24 +459,30 @@ static int template_render(lua_State *L)
 {
     reflow_template *t = (reflow_template *)luaL_checkudata(
         L, 1, REFLOW_TEMPLATE_MT);
-    /* Positional args: 2=data, 3=helpers, 4=templates, 5=max_depth, 6=selector */
+    /* Positional args: 2=data, 3=helpers, 4=templates, 5=max_depth,
+     * 6=selector, 7=template_name. */
+    int nargs = lua_gettop(L);
+    size_t template_name_len = 0;
+    const char *template_name =
+        (nargs >= 7 && lua_type(L, 7) == LUA_TSTRING)
+            ? lua_tolstring(L, 7, &template_name_len) : NULL;
 
     /* Set up render arena. */
     arena_t rarena;
-    arena_init(&rarena, NULL, 0);
+    arena_init(&rarena, L, NULL, 0);
 
     /* Parse data (JSON5 string). */
     reflow_error derr = {0};
     reflow_value *globals = NULL;
-    int t2 = lua_type(L, 2);
+    int t2 = nargs >= 2 ? lua_type(L, 2) : LUA_TNONE;
     if (t2 == LUA_TSTRING) {
         size_t dlen = 0;
         const char *ds = lua_tolstring(L, 2, &dlen);
         globals = json5_parse(ds, dlen, &rarena, &derr);
         if (derr.message != NULL) {
-            arena_destroy(&rarena);
             lua_pushnil(L);
-            push_render_error(L, &derr, NULL);
+            push_render_error(L, &derr, template_name);
+            arena_destroy(&rarena);
             return 2;
         }
     } else if (t2 != LUA_TNIL && t2 != LUA_TNONE) {
@@ -453,25 +496,22 @@ static int template_render(lua_State *L)
         return 2;
     }
 
-    /* Helpers: ref into registry so the render can call them. */
-    int helpers_ref = LUA_NOREF;
-    if (lua_type(L, 3) == LUA_TTABLE) {
-        lua_pushvalue(L, 3);
-        helpers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
+    /* The argument table is already strongly reachable for this C call. */
+    int helpers_idx =
+        (nargs >= 3 && lua_type(L, 3) == LUA_TTABLE) ? 3 : 0;
 
     /* Templates table for x-include lookup. */
     int templates_idx = 0;
-    if (lua_type(L, 4) == LUA_TTABLE) {
+    if (nargs >= 4 && lua_type(L, 4) == LUA_TTABLE) {
         templates_idx = 4;
     }
 
     /* Max depth. */
-    int max_depth = (int)luaL_optinteger(L, 5, 50);
+    int max_depth = nargs >= 5 ? (int)luaL_checkinteger(L, 5) : 50;
 
     /* Selector (optional).  Accept string or reflow.selector userdata. */
     const sel_compiled *sel = NULL;
-    int selector_type = lua_type(L, 6);
+    int selector_type = nargs >= 6 ? lua_type(L, 6) : LUA_TNONE;
     if (selector_type == LUA_TSTRING) {
         /* Parse via ad-hoc compile_arena — the AST outlives this call
          * only for as long as the userdata; we do NOT cache here since
@@ -479,16 +519,15 @@ static int template_render(lua_State *L)
         size_t slen = 0;
         const char *ssrc = lua_tolstring(L, 6, &slen);
         compile_arena *sarena = compile_arena_new(L, 512);
+        int sarena_stack_pos = lua_gettop(L);
         reflow_error perr = {0};
         sel_compiled *sp = selector_parse(sarena, L, ssrc, slen, &perr);
         if (sp == NULL) {
-            lua_pop(L, 1);    /* arena */
-            if (helpers_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-            }
-            arena_destroy(&rarena);
             lua_pushnil(L);
-            push_render_error(L, &perr, NULL);
+            push_render_error(L, &perr, template_name);
+            /* Copy the parse error before releasing either Lua owner. */
+            lua_remove(L, sarena_stack_pos);
+            arena_destroy(&rarena);
             return 2;
         }
         sel = sp;
@@ -497,9 +536,6 @@ static int template_render(lua_State *L)
     } else if (selector_type == LUA_TUSERDATA) {
         reflow_selector *rs = reflow_selector_check(L, 6);
         if (rs == NULL) {
-            if (helpers_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-            }
             arena_destroy(&rarena);
             lua_pushnil(L);
             lua_newtable(L);
@@ -511,9 +547,6 @@ static int template_render(lua_State *L)
         }
         sel = rs->sel;
     } else if (selector_type != LUA_TNIL && selector_type != LUA_TNONE) {
-        if (helpers_ref != LUA_NOREF) {
-            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-        }
         arena_destroy(&rarena);
         lua_pushnil(L);
         lua_newtable(L);
@@ -534,10 +567,7 @@ static int template_render(lua_State *L)
 
     /* Dispatch. */
     buf_t out;
-    if (buf_init(&out) != 0) {
-        if (helpers_ref != LUA_NOREF) {
-            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-        }
+    if (buf_init(&out, &rarena) != 0) {
         arena_destroy(&rarena);
         lua_pushnil(L);
         lua_newtable(L);
@@ -553,11 +583,8 @@ static int template_render(lua_State *L)
         /* Fragment path.  Reuse the shared reflow_frag_search with a
          * template-userdata-aware fetch adapter. */
         frag_search_pub ctx = {0};
-        if (buf_init(&ctx.first_match) != 0) {
+        if (buf_init(&ctx.first_match, &rarena) != 0) {
             buf_free(&out);
-            if (helpers_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-            }
             arena_destroy(&rarena);
             lua_pushnil(L);
             lua_newtable(L);
@@ -568,7 +595,7 @@ static int template_render(lua_State *L)
             return 2;
         }
         ctx.L           = L;
-        ctx.helpers_ref = helpers_ref;
+        ctx.helpers_idx = helpers_idx;
         ctx.hooks       = &hooks;
         ctx.rarena      = &rarena;
         ctx.sel         = sel;
@@ -577,27 +604,22 @@ static int template_render(lua_State *L)
         ctx.max_depth   = max_depth;
 
         reflow_error serr = {0};
-        int frc = reflow_frag_search(&ctx, "", 0,
+        int frc = reflow_frag_search(&ctx, template_name,
+                                     template_name_len,
                                      (ir_node *)t->root, t->sindex,
                                      t->html, t->html_len,
-                                     globals, &serr);
+                                     globals, NULL, &serr);
         if (frc != 0) {
             buf_free(&ctx.first_match);
             buf_free(&out);
-            if (helpers_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-            }
-            arena_destroy(&rarena);
             lua_pushnil(L);
-            push_render_error(L, &serr, NULL);
+            push_render_error(L, &serr, template_name);
+            arena_destroy(&rarena);
             return 2;
         }
         if (ctx.match_count == 0) {
             buf_free(&ctx.first_match);
             buf_free(&out);
-            if (helpers_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-            }
             arena_destroy(&rarena);
             lua_pushnil(L);
             lua_newtable(L);
@@ -614,10 +636,6 @@ static int template_render(lua_State *L)
         if (ctx.match_count > 1) {
             buf_free(&ctx.first_match);
             buf_free(&out);
-            if (helpers_ref != LUA_NOREF) {
-                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-            }
-            arena_destroy(&rarena);
             lua_pushnil(L);
             lua_newtable(L);
             lua_pushliteral(L, "ReflowSelectorError");
@@ -628,28 +646,34 @@ static int template_render(lua_State *L)
             lua_setfield(L, -2, "reason");
             lua_pushlstring(L, sel->source, sel->source_len);
             lua_setfield(L, -2, "source");
+            lua_createtable(L, (int)ctx.match_count, 0);
+            for (size_t i = 0; i < ctx.match_count; i++) {
+                lua_newtable(L);
+                if (ctx.match_template_names[i] != NULL) {
+                    lua_pushlstring(L, ctx.match_template_names[i],
+                                    ctx.match_template_name_len[i]);
+                    lua_setfield(L, -2, "templateName");
+                }
+                lua_rawseti(L, -2, (int)(i + 1));
+            }
+            lua_setfield(L, -2, "matches");
+            arena_destroy(&rarena);
             return 2;
         }
         lua_pushlstring(L, ctx.first_match.data, ctx.first_match.len);
         buf_free(&ctx.first_match);
         buf_free(&out);
-        if (helpers_ref != LUA_NOREF) {
-            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-        }
         arena_destroy(&rarena);
         return 1;
     }
 
     int ok = interpret_render(&rarena, t->root, globals, L,
-                              helpers_ref, NULL,
+                              helpers_idx, template_name,
                               t->html, t->html_len,
                               &hooks, &out, &rerr);
 
     if (ok != 0) {
-        if (helpers_ref != LUA_NOREF) {
-            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-        }
-        push_render_error(L, &rerr, NULL);
+        push_render_error(L, &rerr, template_name);
         buf_free(&out);
         arena_destroy(&rarena);
         /* Nil first, then the error table — swap to (nil, err). */
@@ -659,9 +683,6 @@ static int template_render(lua_State *L)
     }
     lua_pushlstring(L, out.data, out.len);
     buf_free(&out);
-    if (helpers_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-    }
     arena_destroy(&rarena);
     return 1;
 }
@@ -693,9 +714,6 @@ static int template_prefix(lua_State *L)
 void reflow_template_register(lua_State *L)
 {
     if (luaL_newmetatable(L, REFLOW_TEMPLATE_MT)) {
-        lua_pushcfunction(L, template_gc);
-        lua_setfield(L, -2, "__gc");
-
         /* __index — table of methods */
         lua_newtable(L);
         lua_pushcfunction(L, template_render);

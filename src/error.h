@@ -2,7 +2,10 @@
 #ifndef REFLOW_ERROR_H
 #define REFLOW_ERROR_H
 
+#include <stdbool.h>
 #include <stddef.h>
+
+#include "value.h"
 
 typedef struct reflow_error {
     const char              *type;          /* "ReflowCompileError" etc. */
@@ -17,16 +20,15 @@ typedef struct reflow_error {
     const char              *expression;
     const char              *reason;        /* "cycle" | "not_found" | ... */
     const char              *requested;
+    const reflow_value      *requested_value;
+    const char             **include_stack;
+    const size_t            *include_stack_len;
+    size_t                   include_stack_count;
     const char              *source;        /* selector source text */
     long                     position;      /* 0-based offset in source */
+    bool                     has_position;
     const char              *feature;       /* unsupported feature id */
     struct reflow_error     *cause;         /* chained error (yyjson/helper) */
 } reflow_error;
-
-/* Allocate a zero-initialized reflow_error with the given type and message. */
-reflow_error *reflow_error_new(const char *type, const char *message);
-
-/* Free a reflow_error and its cause chain (does not free string fields). */
-void reflow_error_free(reflow_error *err);
 
 #endif

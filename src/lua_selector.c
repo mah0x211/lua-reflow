@@ -23,6 +23,7 @@
 #include "lua_selector.h"
 #include "compile_arena.h"
 #include "error.h"
+#include "lua_owner.h"
 #include <lauxlib.h>
 
 reflow_selector *reflow_selector_check(lua_State *L, int idx)
@@ -37,17 +38,6 @@ reflow_selector *reflow_selector_check(lua_State *L, int idx)
     lua_pop(L, 2);
     return eq ? (reflow_selector *)lua_touserdata(L, idx) : NULL;
 #endif
-}
-
-static int selector_gc(lua_State *L)
-{
-    reflow_selector *s = (reflow_selector *)luaL_checkudata(
-        L, 1, REFLOW_SELECTOR_MT);
-    if (s->arena_ref != LUA_NOREF) {
-        luaL_unref(L, LUA_REGISTRYINDEX, s->arena_ref);
-        s->arena_ref = LUA_NOREF;
-    }
-    return 0;
 }
 
 static int selector_source(lua_State *L)
@@ -78,7 +68,6 @@ static int selector_new(lua_State *L)
     sel_compiled *sel = selector_parse(carena, L, src, slen, &err);
     if (sel == NULL) {
         lua_settop(L, arena_stack_pos);
-        lua_pop(L, 1);
         lua_pushnil(L);
         lua_newtable(L);
         lua_pushstring(L, err.type ? err.type : "ReflowSelectorError");
@@ -88,7 +77,7 @@ static int selector_new(lua_State *L)
         if (err.reason)   { lua_pushstring(L, err.reason);   lua_setfield(L, -2, "reason"); }
         if (err.feature)  { lua_pushstring(L, err.feature);  lua_setfield(L, -2, "feature"); }
         if (err.source)   { lua_pushstring(L, err.source);   lua_setfield(L, -2, "source"); }
-        if (err.position > 0) {
+        if (err.has_position) {
             lua_pushinteger(L, (lua_Integer)err.position);
             lua_setfield(L, -2, "position");
         }
@@ -97,27 +86,24 @@ static int selector_new(lua_State *L)
         luaL_getmetatable(L, "reflow.error");
         if (!lua_isnil(L, -1)) lua_setmetatable(L, -2);
         else                    lua_pop(L, 1);
+        /* All arena-backed strings have now been copied into Lua. */
+        lua_remove(L, arena_stack_pos);
         return 2;
     }
 
-    lua_pushvalue(L, arena_stack_pos);
-    int arena_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    lua_remove(L, arena_stack_pos);
-
     reflow_selector_register(L);
     reflow_selector *s = (reflow_selector *)lua_newuserdata(L, sizeof(*s));
-    s->arena_ref = arena_ref;
     s->sel       = sel;
     luaL_getmetatable(L, REFLOW_SELECTOR_MT);
     lua_setmetatable(L, -2);
+    reflow_lua_own(L, -1, arena_stack_pos);
+    lua_remove(L, arena_stack_pos);
     return 1;
 }
 
 void reflow_selector_register(lua_State *L)
 {
     if (luaL_newmetatable(L, REFLOW_SELECTOR_MT)) {
-        lua_pushcfunction(L, selector_gc);
-        lua_setfield(L, -2, "__gc");
         lua_newtable(L);
         lua_pushcfunction(L, selector_source);
         lua_setfield(L, -2, "source");

@@ -30,10 +30,9 @@
  * Growable bump-allocation arena backed by lua_newuserdata chunks.
  *
  * Memory is allocated as GC-tracked userdata chunks and stored on a
- * dedicated lua_newthread's stack.  When the arena userdata is collected
- * by GC, __gc releases the thread reference (luaL_unref); the thread
- * becomes unreachable, its stack is cleared, and every chunk on it is
- * collected — all through Lua's normal GC cycle.
+ * dedicated lua_newthread's stack. The arena userdata owns the thread
+ * through its private uservalue (Lua 5.2+) or environment (Lua 5.1), so
+ * collection of the owner makes the thread and all chunks collectible.
  *
  * Design guarantees:
  *   - All memory is GC-visible (incremental GC, memory caps work)
@@ -43,7 +42,6 @@
  */
 
 typedef struct compile_arena {
-    int       thread_ref;   /* luaL_ref in registry (LUA_NOREF after __gc) */
     lua_State *LT;          /* cached thread state for stack storage */
     char     *current;      /* bump pointer into current chunk */
     size_t    remaining;    /* bytes left in current chunk */
@@ -52,7 +50,6 @@ typedef struct compile_arena {
 
 /*
  * Create a new arena as a lua_newuserdata on L's stack.
- * The userdata has a __gc metamethod that releases the thread ref.
  * chunk_size is the internal chunk size (0 = default 4096).
  *
  * On success: arena userdata is on top of L's stack; returns arena pointer.
@@ -66,8 +63,8 @@ compile_arena *compile_arena_new(lua_State *L, size_t chunk_size);
  * lua_newuserdata on L (which has the pcall frame), then moved to
  * the thread's stack via lua_xmove.
  *
- * Returns pointer to memory, or NULL if lua_checkstack(LT) fails.
- * On OOM: lua_newuserdata throws (longjmp to nearest pcall on L).
+ * Returns an aligned, zero-initialized pointer. Allocation overflow,
+ * child-stack exhaustion, and OOM raise through L's protected caller.
  */
 void *compile_arena_alloc(compile_arena *a, lua_State *L, size_t n);
 

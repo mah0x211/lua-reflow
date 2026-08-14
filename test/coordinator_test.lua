@@ -122,6 +122,53 @@ function testcase.selector_cached_across_renders()
     assert.equal(next(r._selectors) ~= nil, true)
 end
 
+function testcase.selector_cache_size_zero_disables_retention()
+    local r = reflow.new({ selector_cache_size = 0 })
+    r:compile('t', '<div><p id="a">A</p></div>')
+    assert.equal(r:render('t', nil, '#a'), '<p id="a">A</p>')
+    assert.equal(next(r._selectors), nil)
+    assert.equal(#r._selector_order, 0)
+end
+
+function testcase.selector_cache_size_one_evicts_oldest()
+    local r = reflow.new({ selector_cache_size = 1 })
+    r:compile('t', '<div><p id="a">A</p><p id="b">B</p></div>')
+    r:render('t', nil, '#a')
+    r:render('t', nil, '#b')
+    assert.equal(r._selectors['#a'], nil)
+    assert(r._selectors['#b'] ~= nil)
+    assert.equal(r._selector_order, {'#b'})
+end
+
+function testcase.selector_cache_hit_promotes_before_eviction()
+    local r = reflow.new({ selector_cache_size = 2 })
+    r:compile('t', '<div><p id="a">A</p><p id="b">B</p><p id="c">C</p></div>')
+    r:render('t', nil, '#a')
+    r:render('t', nil, '#b')
+    r:render('t', nil, '#a')
+    assert.equal(r._selector_order, {'#b', '#a'})
+
+    r:render('t', nil, '#c')
+    assert.equal(r._selectors['#b'], nil)
+    assert(r._selectors['#a'] ~= nil)
+    assert(r._selectors['#c'] ~= nil)
+    assert.equal(r._selector_order, {'#a', '#c'})
+end
+
+function testcase.selector_cache_size_rejects_invalid_values()
+    local ok_negative, err_negative = pcall(reflow.new, {
+        selector_cache_size = -1,
+    })
+    assert.equal(ok_negative, false)
+    assert.match(tostring(err_negative), 'non-negative integer')
+
+    local ok_fraction, err_fraction = pcall(reflow.new, {
+        selector_cache_size = 1.5,
+    })
+    assert.equal(ok_fraction, false)
+    assert.match(tostring(err_fraction), 'non-negative integer')
+end
+
 function testcase.userdata_selector_passes_through()
     local r = reflow.new()
     r:compile('t', '<div><p id="a">A</p></div>')

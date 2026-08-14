@@ -30,6 +30,7 @@
 #include "buf.h"
 #include "error.h"
 #include "ir.h"
+#include "scope.h"
 
 /*
  * x-include hooks supplied by higher layers.
@@ -67,8 +68,8 @@ typedef struct interpret_include_hooks {
  *                   arena_destroy after render).
  *   root          : IR tree returned by compile_template.
  *   globals       : $ scope; may be NULL for none.
- *   L, helpers_ref: helper registry table stored in the Lua registry via
- *                   luaL_ref; pass LUA_NOREF when no helpers are registered.
+ *   L, helpers_idx: absolute stack index of the helper table owned by the
+ *                   active Lua call; pass 0 when no helpers are registered.
  *   template_name : the current template's name, used to annotate
  *                   runtime errors; may be NULL.
  *   html, html_len: the current template's source, used for snippet
@@ -82,7 +83,7 @@ int interpret_render(arena_t *arena,
                      const ir_node *root,
                      reflow_value  *globals,
                      lua_State     *L,
-                     int            helpers_ref,
+                     int            helpers_idx,
                      const char    *template_name,
                      const char    *html,
                      size_t         html_len,
@@ -105,7 +106,7 @@ int interpret_render_fragment(arena_t *arena,
                               const ir_node *target,
                               reflow_value  *globals,
                               lua_State     *L,
-                              int            helpers_ref,
+                              int            helpers_idx,
                               const char    *template_name,
                               const char    *html,
                               size_t         html_len,
@@ -145,8 +146,9 @@ interpret_fragment_result
 interpret_render_fragment_at(arena_t *arena,
                              const ir_node *target,
                              reflow_value  *globals,
+                             reflow_value  *initial_frame,
                              lua_State     *L,
-                             int            helpers_ref,
+                             int            helpers_idx,
                              const char    *template_name,
                              const char    *html,
                              size_t         html_len,
@@ -193,8 +195,9 @@ interpret_render_fragment_positional(
     size_t         n_candidates,
     interpret_fragment_positional_eval_fn eval_fn,
     reflow_value  *globals,
+    reflow_value  *initial_frame,
     lua_State     *L,
-    int            helpers_ref,
+    int            helpers_idx,
     const char    *template_name,
     const char    *html,
     size_t         html_len,
@@ -214,14 +217,15 @@ interpret_render_fragment_positional(
  *
  * Returns 0 on success (including "no reach"), -1 on runtime error.
  */
-typedef int (*interpret_reach_cb)(void *ud, lua_State *L,
+typedef int (*interpret_reach_cb)(void *ud, lua_State *L, scope_env *env,
                                   reflow_error *err);
 
 int interpret_execute_at(arena_t *arena,
                          const ir_node *target,
                          reflow_value  *globals,
+                         reflow_value  *initial_frame,
                          lua_State     *L,
-                         int            helpers_ref,
+                         int            helpers_idx,
                          const char    *template_name,
                          const char    *html,
                          size_t         html_len,

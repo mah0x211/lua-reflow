@@ -1,0 +1,5 @@
+<div x-data="user: {name: 'outer'}">
+<ul>
+<li x-each="user in $.items"><span x-text=".user"></span>|<span x-text="@user.name"></span></li>
+</ul>
+</div>

@@ -54,6 +54,9 @@ function testcase.include_not_found()
     local html, err = r:render('page')
     assert.is_nil(html)
     assert.match(err.message, 'template not found')
+    assert.equal(err.reason, 'not_found')
+    assert.equal(err.requested, 'missing')
+    assert.equal(err.includeStack, {'page'})
 end
 
 function testcase.include_cycle_direct()
@@ -62,6 +65,9 @@ function testcase.include_cycle_direct()
     local html, err = r:render('a')
     assert.is_nil(html)
     assert.match(err.message, 'include cycle detected')
+    assert.equal(err.reason, 'cycle')
+    assert.equal(err.requested, 'a')
+    assert.equal(err.includeStack, {'a'})
 end
 
 function testcase.include_cycle_indirect()
@@ -71,6 +77,9 @@ function testcase.include_cycle_indirect()
     local html, err = r:render('a')
     assert.is_nil(html)
     assert.match(err.message, 'include cycle')
+    assert.equal(err.reason, 'cycle')
+    assert.equal(err.requested, 'a')
+    assert.equal(err.includeStack, {'a', 'b'})
 end
 
 function testcase.include_depth_exceeded()
@@ -83,6 +92,9 @@ function testcase.include_depth_exceeded()
     local html, err = r:render('t1')
     assert.is_nil(html)
     assert.match(err.message, 'max include depth')
+    assert.equal(err.reason, 'depth_exceeded')
+    assert.equal(err.requested, 't4')
+    assert.equal(err.includeStack, {'t1', 't2', 't3'})
 end
 
 function testcase.include_within_limit_ok()
@@ -96,12 +108,32 @@ function testcase.include_within_limit_ok()
                  '<div><div><div><span>end</span></div></div></div>')
 end
 
+function testcase.include_depth_limit_counts_active_templates()
+    local within = Reflow.new({ max_include_depth = 2 })
+    within:compile('a', [[<div x-include="'b'"></div>]])
+    within:compile('b', '<span>end</span>')
+    assert.equal(within:render('a'), '<div><span>end</span></div>')
+
+    local exceeded = Reflow.new({ max_include_depth = 2 })
+    exceeded:compile('a', [[<div x-include="'b'"></div>]])
+    exceeded:compile('b', [[<div x-include="'c'"></div>]])
+    exceeded:compile('c', '<span>end</span>')
+    local html, err = exceeded:render('a')
+    assert.is_nil(html)
+    assert.equal(err.reason, 'depth_exceeded')
+    assert.equal(err.requested, 'c')
+    assert.equal(err.includeStack, {'a', 'b'})
+end
+
 function testcase.include_non_string_value()
     local r = Reflow.new()
     r:compile('page', [[<div x-include="$.n"></div>]])
     local html, err = r:render('page', [[{n: 42}]])
     assert.is_nil(html)
     assert.match(err.message, 'value must be a string')
+    assert.equal(err.reason, 'invalid')
+    assert.equal(err.requested, 42)
+    assert.equal(err.includeStack, {'page'})
 end
 
 -- ===== helper visibility through include =====
@@ -112,4 +144,17 @@ function testcase.helpers_visible_in_included_template()
     r:compile('outer', [[<div x-include="'inner'"></div>]])
     assert.equal(r:render('outer', [[{n: "hi"}]]),
                  '<div><span>HI</span></div>')
+end
+
+function testcase.nested_runtime_error_reports_include_context()
+    local r = Reflow.new({
+        helpers = { boom = function() error('bang') end },
+    })
+    r:compile('inner', [[<span x-text="boom($.n)"></span>]])
+    r:compile('outer', [[<div x-include="'inner'"></div>]])
+    local html, err = r:render('outer', [[{n: 1}]])
+    assert.is_nil(html)
+    assert.equal(err.type, 'ReflowRuntimeError')
+    assert.equal(err.templateName, 'inner')
+    assert.equal(err.includeStack, {'outer', 'inner'})
 end

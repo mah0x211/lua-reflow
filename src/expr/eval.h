@@ -36,11 +36,12 @@
  *
  * Returns the result as a reflow_value (by value).
  * On error: sets *err and returns rv_undef().
- * L / helpers_ref are needed for helper calls (EX_CALL).
- * Pass L = NULL, helpers_ref = LUA_NOREF if no helpers are needed.
+ * L / helpers_idx are needed for helper calls (EX_CALL). helpers_idx is an
+ * absolute stack index whose table remains owned by the active Lua call.
+ * Pass L = NULL, helpers_idx = 0 if no helpers are available.
  */
 reflow_value expr_eval(const expr_node *node, scope_env *env,
-                       lua_State *L, int helpers_ref,
+                       lua_State *L, int helpers_idx,
                        arena_t *arena, reflow_error *err);
 
 /*

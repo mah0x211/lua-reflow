@@ -34,41 +34,12 @@
 #include "selector/index.h"
 #include "selector/parse.h"
 
-/*
- * Public Lua entry points implemented in renderer.c.  They are registered
- * into the reflow.compiler module by luaopen_reflow_compiler.
- *
- * All functions receive a reflow_state userdata as their first argument.
- * The userdata carries its own __gc that releases the Lua-registry refs
- * for the internal templates and helpers tables.
- */
-
-/* new(prefix, max_include_depth) -> state userdata */
-int rf_state_new(lua_State *L);
-
 /* Register the reflow.error metatable (idempotent). Called from
  * luaopen_reflow_compiler so tostring() on an error table works. */
 void reflow_register_error_metatable(lua_State *L);
 
-/* add_helper(state, name, function) -> state */
-int rf_state_add_helper(lua_State *L);
-
-/* compile(state, name, html) -> state (raises on error) */
-int rf_state_compile(lua_State *L);
-
-/* render(state, name, data) -> html string; data may be nil, a string
- * (interpreted as JSON5), or a table. */
-int rf_state_render(lua_State *L);
-
-/* clear(state[, name]) -> array of names actually removed. */
-int rf_state_clear(lua_State *L);
-
-/* templates(state) -> array of names */
-int rf_state_templates(lua_State *L);
-
 /* ============================================================
- * Fragment search — shared between the state-based path and any
- * caller that already has a compiled template (e.g. lua_template).
+ * Fragment search for callers that already own compiled templates.
  * ============================================================ */
 
 /* Include-target fetch callback used by frag_search when the outer
@@ -86,15 +57,21 @@ typedef int (*frag_fetch_fn_pub)(void *ud, lua_State *L,
 typedef struct frag_search_pub {
     buf_t         first_match;
     size_t        match_count;
+    /* Fragment search deliberately stops after two matches: uniqueness is
+     * already disproved, and the public error mirrors the JS stopAfter=2
+     * contract. Names are retained for the structured `matches` field. */
+    const char   *match_template_names[2];
+    size_t        match_template_name_len[2];
     lua_State    *L;
-    int           helpers_ref;
+    int           helpers_idx;
     const interpret_include_hooks *hooks;
     arena_t      *rarena;
     const sel_compiled *sel;
     frag_fetch_fn_pub fetch;
     void         *fetch_ud;
-    const char *stack[64];
-    size_t      stack_len[64];
+    const char **stack;
+    size_t      *stack_len;
+    size_t       stack_capacity;
     int         depth;
     int         max_depth;
 } frag_search_pub;
@@ -110,6 +87,7 @@ int reflow_frag_search(frag_search_pub *ctx,
                        ir_node *root, const sel_index *sindex,
                        const char *html, size_t html_len,
                        reflow_value *globals,
+                       reflow_value *initial_frame,
                        reflow_error *err);
 
 #endif /* REFLOW_RENDERER_H */

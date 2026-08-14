@@ -23,7 +23,9 @@
 
 // project
 #include "ir.h"
+#include "checked.h"
 // lua
+#include <lauxlib.h>
 #include <lua.h>
 // system
 #include <string.h>
@@ -112,14 +114,24 @@ void ir_add_child(compile_arena *arena, lua_State *L,
 
     /* Grow: allocate new array with doubled capacity, copy, replace */
     size_t old_n = *np;
-    size_t new_cap = old_n + 1;
-    /* Round up to power-of-2-ish for amortized growth */
-    if (old_n > 0) new_cap = old_n * 2;
+    size_t required = 0;
+    size_t new_cap = 0;
+    size_t bytes = 0;
+    if (!reflow_size_add(old_n, 1, &required) ||
+        !reflow_size_grow(old_n, required, &new_cap) ||
+        !reflow_size_mul(new_cap, sizeof(ir_node *), &bytes)) {
+        luaL_error(L, "too many IR children");
+    }
 
     ir_node **ni = (ir_node **)compile_arena_alloc(
-        arena, L, new_cap * sizeof(ir_node *));
-    if (old_n > 0)
-        memcpy(ni, *childrenp, old_n * sizeof(ir_node *));
+        arena, L, bytes);
+    if (old_n > 0) {
+        size_t copy_bytes = 0;
+        if (!reflow_size_mul(old_n, sizeof(ir_node *), &copy_bytes)) {
+            luaL_error(L, "too many IR children");
+        }
+        memcpy(ni, *childrenp, copy_bytes);
+    }
     *childrenp = ni;
     (*childrenp)[old_n] = child;
     *np = old_n + 1;
@@ -129,13 +141,24 @@ void ir_add_attr(compile_arena *arena, lua_State *L,
                  ir_node *element, const char *name, const char *value)
 {
     size_t old_n = element->element.n_attrs;
-    size_t new_cap = old_n + 1;
-    if (old_n > 0) new_cap = old_n * 2;
+    size_t required = 0;
+    size_t new_cap = 0;
+    size_t bytes = 0;
+    if (!reflow_size_add(old_n, 1, &required) ||
+        !reflow_size_grow(old_n, required, &new_cap) ||
+        !reflow_size_mul(new_cap, sizeof(ir_attr), &bytes)) {
+        luaL_error(L, "too many IR attributes");
+    }
 
     ir_attr *na = (ir_attr *)compile_arena_alloc(
-        arena, L, new_cap * sizeof(ir_attr));
-    if (old_n > 0)
-        memcpy(na, element->element.attrs, old_n * sizeof(ir_attr));
+        arena, L, bytes);
+    if (old_n > 0) {
+        size_t copy_bytes = 0;
+        if (!reflow_size_mul(old_n, sizeof(ir_attr), &copy_bytes)) {
+            luaL_error(L, "too many IR attributes");
+        }
+        memcpy(na, element->element.attrs, copy_bytes);
+    }
     element->element.attrs = na;
     na[old_n].name  = name;
     na[old_n].value = value;

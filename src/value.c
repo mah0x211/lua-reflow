@@ -23,6 +23,7 @@
 
 // project
 #include "value.h"
+#include "checked.h"
 // system
 #include <math.h>
 #include <stdio.h>
@@ -205,8 +206,9 @@ int rv_strict_eq(const reflow_value *a, const reflow_value *b)
         return a->string.len == b->string.len &&
                memcmp(a->string.data, b->string.data, a->string.len) == 0;
     case RV_ARRAY:
+        return a->array.items == b->array.items;
     case RV_OBJECT:
-        return a == b; /* reference identity */
+        return a->object.props == b->object.props;
     default:
         return 0;
     }
@@ -217,7 +219,101 @@ int rv_strict_neq(const reflow_value *a, const reflow_value *b)
     return !rv_strict_eq(a, b);
 }
 
-int rv_compare(const reflow_value *a, const reflow_value *b)
+static bool ascii_trim_space(unsigned char c)
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
+           c == '\v' || c == '\f';
+}
+
+/* ECMAScript ToNumber subset used by relational string/number comparisons.
+ * Expression string literals are byte strings; validate the entire trimmed
+ * token before delegating decimal conversion to strtod. */
+static bool string_to_number(const reflow_value *value, arena_t *arena,
+                             double *out)
+{
+    size_t begin = 0;
+    size_t end = value->string.len;
+    const char *src = value->string.data;
+    while (begin < end && ascii_trim_space((unsigned char)src[begin])) begin++;
+    while (end > begin && ascii_trim_space((unsigned char)src[end - 1])) end--;
+    if (begin == end) {
+        *out = 0.0;
+        return true;
+    }
+
+    size_t len = end - begin;
+    const char *text = src + begin;
+    if ((len == 8 && memcmp(text, "Infinity", 8) == 0) ||
+        (len == 9 && memcmp(text, "+Infinity", 9) == 0)) {
+        *out = INFINITY;
+        return true;
+    }
+    if (len == 9 && memcmp(text, "-Infinity", 9) == 0) {
+        *out = -INFINITY;
+        return true;
+    }
+
+    if (len > 2 && text[0] == '0' &&
+        (text[1] == 'x' || text[1] == 'X' ||
+         text[1] == 'o' || text[1] == 'O' ||
+         text[1] == 'b' || text[1] == 'B')) {
+        unsigned int base = (text[1] == 'x' || text[1] == 'X') ? 16U
+            : (text[1] == 'o' || text[1] == 'O') ? 8U : 2U;
+        double number = 0.0;
+        for (size_t i = 2; i < len; i++) {
+            unsigned char c = (unsigned char)text[i];
+            unsigned int digit;
+            if (c >= '0' && c <= '9') digit = (unsigned int)(c - '0');
+            else if (c >= 'a' && c <= 'f') digit = 10U + (unsigned int)(c - 'a');
+            else if (c >= 'A' && c <= 'F') digit = 10U + (unsigned int)(c - 'A');
+            else return false;
+            if (digit >= base) return false;
+            number = number * (double)base + (double)digit;
+        }
+        *out = number;
+        return true;
+    }
+
+    size_t pos = 0;
+    if (text[pos] == '+' || text[pos] == '-') pos++;
+    size_t integer_digits = 0;
+    while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
+        pos++;
+        integer_digits++;
+    }
+    size_t fraction_digits = 0;
+    if (pos < len && text[pos] == '.') {
+        pos++;
+        while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
+            pos++;
+            fraction_digits++;
+        }
+    }
+    if (integer_digits == 0 && fraction_digits == 0) return false;
+    if (pos < len && (text[pos] == 'e' || text[pos] == 'E')) {
+        pos++;
+        if (pos < len && (text[pos] == '+' || text[pos] == '-')) pos++;
+        size_t exponent_digits = 0;
+        while (pos < len && text[pos] >= '0' && text[pos] <= '9') {
+            pos++;
+            exponent_digits++;
+        }
+        if (exponent_digits == 0) return false;
+    }
+    if (pos != len) return false;
+
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) return false;
+    char *copy = (char *)arena_alloc(arena, bytes);
+    if (copy == NULL) return false;
+    memcpy(copy, text, len);
+    copy[len] = '\0';
+    char *parsed_end = NULL;
+    *out = strtod(copy, &parsed_end);
+    return parsed_end == copy + len;
+}
+
+int rv_compare(const reflow_value *a, const reflow_value *b, arena_t *arena)
 {
     if (a->tag == RV_NUMBER && b->tag == RV_NUMBER) {
         if (isnan(a->number) || isnan(b->number)) {
@@ -246,7 +342,18 @@ int rv_compare(const reflow_value *a, const reflow_value *b)
         }
         return 0;
     }
-    return 2; /* mixed types: not comparable (JS NaN semantics) */
+    if ((a->tag == RV_NUMBER && b->tag == RV_STRING) ||
+        (a->tag == RV_STRING && b->tag == RV_NUMBER)) {
+        double left = a->number;
+        double right = b->number;
+        if (a->tag == RV_STRING && !string_to_number(a, arena, &left)) return 2;
+        if (b->tag == RV_STRING && !string_to_number(b, arena, &right)) return 2;
+        if (isnan(left) || isnan(right)) return 2;
+        if (left < right) return -1;
+        if (left > right) return 1;
+        return 0;
+    }
+    return 2;
 }
 
 int rv_is_array(const reflow_value *v)

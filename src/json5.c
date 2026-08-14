@@ -1,11 +1,11 @@
 /* MIT license — Copyright (C) 2026 Masatoshi Fukunaga */
 // project
 #include "json5.h"
+#include "checked.h"
 // depend
 #include "yyjson.h"
 // system
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 /* --- yyjson_val → reflow_value (recursive, arena-owned) --- */
@@ -39,7 +39,9 @@ static reflow_value *convert_val(yyjson_val *v, arena_t *arena)
         /* yyjson strings are NUL-terminated; len via get_len */
         slen           = yyjson_get_len(v);
         rv->tag         = RV_STRING;
-        char *dst       = (char *)arena_alloc(arena, slen + 1);
+        size_t bytes = 0;
+        if (!reflow_size_add(slen, 1, &bytes)) return NULL;
+        char *dst       = (char *)arena_alloc(arena, bytes);
         if (dst == NULL) return NULL;
         memcpy(dst, sv, slen);
         dst[slen]       = '\0';
@@ -51,8 +53,9 @@ static reflow_value *convert_val(yyjson_val *v, arena_t *arena)
     case YYJSON_TYPE_ARR: {
         rv->tag = RV_ARRAY;
         size_t idx = 0, max = yyjson_arr_size(v);
-        rv->array.items = (reflow_value *)arena_alloc(
-            arena, max * sizeof(reflow_value));
+        size_t bytes;
+        if (!reflow_size_mul(max, sizeof(reflow_value), &bytes)) return NULL;
+        rv->array.items = (reflow_value *)arena_alloc(arena, bytes);
         if (rv->array.items == NULL && max > 0) return NULL;
         rv->array.cap = max;
         rv->array.len = 0;
@@ -71,8 +74,9 @@ static reflow_value *convert_val(yyjson_val *v, arena_t *arena)
     case YYJSON_TYPE_OBJ: {
         rv->tag = RV_OBJECT;
         size_t max = yyjson_obj_size(v);
-        rv->object.props = (rv_prop *)arena_alloc(
-            arena, max * sizeof(rv_prop));
+        size_t bytes;
+        if (!reflow_size_mul(max, sizeof(rv_prop), &bytes)) return NULL;
+        rv->object.props = (rv_prop *)arena_alloc(arena, bytes);
         if (rv->object.props == NULL && max > 0) return NULL;
         rv->object.cap = max;
         rv->object.len = 0;
@@ -85,7 +89,9 @@ static reflow_value *convert_val(yyjson_val *v, arena_t *arena)
             const char *key = yyjson_get_str(key_val);
             yyjson_val *val = yyjson_obj_iter_get_val(key_val);
 
-            char *kdst = (char *)arena_alloc(arena, klen + 1);
+            size_t key_bytes = 0;
+            if (!reflow_size_add(klen, 1, &key_bytes)) return NULL;
+            char *kdst = (char *)arena_alloc(arena, key_bytes);
             if (kdst == NULL) return NULL;
             memcpy(kdst, key, klen);
             kdst[klen] = '\0';
@@ -109,23 +115,61 @@ static reflow_value *convert_val(yyjson_val *v, arena_t *arena)
 
 /* --- public API --- */
 
-/* Static buffer for yyjson error messages (single-threaded Lua, no leak). */
-static char g_json5_err[256];
+static void set_json_error(arena_t *arena, reflow_error *err,
+                           const yyjson_read_err *rerr)
+{
+    if (err == NULL) return;
+    char tmp[256];
+    int n = snprintf(tmp, sizeof(tmp),
+                     "failed to parse JSON5: %s (at position %zu)",
+                     rerr->msg ? rerr->msg : "unknown error", rerr->pos);
+    err->type = "ReflowRuntimeError";
+    if (n < 0) {
+        err->message = "failed to parse JSON5";
+        return;
+    }
+    size_t len = (size_t)n;
+    if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+    size_t alloc_size;
+    if (!reflow_size_add(len, 1, &alloc_size)) {
+        err->message = "failed to parse JSON5";
+        return;
+    }
+    char *message = (char *)arena_alloc(arena, alloc_size);
+    if (message == NULL) {
+        err->message = "failed to parse JSON5";
+        return;
+    }
+    memcpy(message, tmp, len);
+    message[len] = '\0';
+    err->message = message;
+}
 
 reflow_value *json5_parse(const char *src, size_t len,
                           arena_t *arena, reflow_error *err)
 {
+    yyjson_read_flag flags = YYJSON_READ_JSON5;
     yyjson_read_err rerr = {0};
-    yyjson_doc *doc = yyjson_read_opts((char *)src, len, YYJSON_READ_JSON5,
-                                       NULL, &rerr);
-    if (doc == NULL) {
-        if (err) {
+    size_t pool_size = yyjson_read_max_memory_usage(len, flags);
+    if (pool_size == 0) {
+        if (err != NULL) {
             err->type = "ReflowRuntimeError";
-            snprintf(g_json5_err, sizeof(g_json5_err),
-                     "failed to parse JSON5: %s (at position %zu)",
-                     rerr.msg ? rerr.msg : "unknown error", rerr.pos);
-            err->message = g_json5_err;
+            err->message = "JSON5 input is too large";
         }
+        return NULL;
+    }
+    void *pool = arena_alloc(arena, pool_size);
+    yyjson_alc alc;
+    if (pool == NULL || !yyjson_alc_pool_init(&alc, pool, pool_size)) {
+        if (err != NULL) {
+            err->type = "ReflowRuntimeError";
+            err->message = "out of memory during JSON5 parsing";
+        }
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read_opts((char *)src, len, flags, &alc, &rerr);
+    if (doc == NULL) {
+        set_json_error(arena, err, &rerr);
         return NULL;
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
@@ -142,8 +186,17 @@ reflow_value *json5_parse_data(const char *value, size_t len,
                                arena_t *arena, reflow_error *err)
 {
     /* Wrap value in "{ ... }" for object-style parsing */
-    size_t wrapped_len = len + 4; /* "{ " + value + " }" + NUL handled by buf */
-    char *buf = (char *)arena_alloc(arena, wrapped_len + 1);
+    size_t wrapped_len;
+    size_t alloc_size;
+    if (!reflow_size_add(len, 4, &wrapped_len) ||
+        !reflow_size_add(wrapped_len, 1, &alloc_size)) {
+        if (err) {
+            err->type = "ReflowRuntimeError";
+            err->message = "JSON5 input is too large";
+        }
+        return NULL;
+    }
+    char *buf = (char *)arena_alloc(arena, alloc_size);
     if (buf == NULL) {
         if (err) {
             err->type    = "ReflowRuntimeError";

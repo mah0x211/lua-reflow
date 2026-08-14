@@ -34,7 +34,6 @@
 #include "parser.h"
 #include "renderer.h"
 #include "scope.h"
-#include "selector/cache.h"
 #include "selector/index.h"
 #include "selector/match.h"
 #include "selector/parse.h"
@@ -92,13 +91,17 @@ static int esct_lua(lua_State *L)
 {
     size_t slen    = 0;
     const char *s  = luaL_checklstring(L, 1, &slen);
+    arena_t arena;
+    arena_init(&arena, L, NULL, 0);
     buf_t out;
-    if (buf_init(&out) != 0) {
+    if (buf_init(&out, &arena) != 0) {
+        arena_destroy(&arena);
         return luaL_error(L, "out of memory");
     }
     escape_text(s, slen, &out);
     lua_pushlstring(L, out.data, out.len);
     buf_free(&out);
+    arena_destroy(&arena);
     return 1;
 }
 
@@ -107,13 +110,17 @@ static int esca_lua(lua_State *L)
 {
     size_t slen    = 0;
     const char *s  = luaL_checklstring(L, 1, &slen);
+    arena_t arena;
+    arena_init(&arena, L, NULL, 0);
     buf_t out;
-    if (buf_init(&out) != 0) {
+    if (buf_init(&out, &arena) != 0) {
+        arena_destroy(&arena);
         return luaL_error(L, "out of memory");
     }
     escape_attr(s, slen, &out);
     lua_pushlstring(L, out.data, out.len);
     buf_free(&out);
+    arena_destroy(&arena);
     return 1;
 }
 
@@ -154,54 +161,53 @@ static int eval_expr_lua(lua_State *L)
 
     /* 1. Parse expression (compile_arena; may throw OOM) */
     compile_arena *carena = compile_arena_new(L, 4096);
+    int carena_stack_pos = lua_gettop(L);
     reflow_error  err = {0};
     expr_node    *node = expr_parse(carena, L, expr_str, expr_len, &err);
-    lua_pop(L, 1);  /* remove carena */
 
     if (!node) {
         lua_pushnil(L);
         lua_pushstring(L, err.message ? err.message : "parse error");
+        lua_remove(L, carena_stack_pos);
         return 2;
     }
 
     /* 2. Parse JSON data (render-scope arena) */
     char     arena_buf[65536];
     arena_t  rarena;
-    arena_init(&rarena, arena_buf, sizeof(arena_buf));
+    arena_init(&rarena, L, arena_buf, sizeof(arena_buf));
 
     reflow_value *globals = json5_parse(data_str, data_len, &rarena, &err);
     if (!globals) {
         lua_pushnil(L);
         lua_pushstring(L, err.message ? err.message : "json error");
+        arena_destroy(&rarena);
+        lua_remove(L, carena_stack_pos);
         return 2;
     }
 
-    /* 3. Set up helpers (after OOM-prone code) */
-    int helpers_ref = LUA_NOREF;
-    if (lua_istable(L, 3)) {
-        lua_pushvalue(L, 3);
-        helpers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-    }
+    /* 3. The argument table remains reachable for the whole C call. */
+    int helpers_idx = lua_istable(L, 3) ? 3 : 0;
 
     /* 4. Evaluate */
     scope_env env;
-    scope_env_init(&env, globals);
+    scope_env_init(&env, &rarena, globals);
     scope_push_frame(&env, SCOPE_FRAME_DATA, globals);
-    reflow_value result = expr_eval(node, &env, L, helpers_ref,
+    reflow_value result = expr_eval(node, &env, L, helpers_idx,
                                     &rarena, &err);
-
-    /* 5. Clean up helpers ref */
-    if (helpers_ref != LUA_NOREF)
-        luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
 
     if (err.message) {
         lua_pushnil(L);
         lua_pushstring(L, err.message);
+        arena_destroy(&rarena);
+        lua_remove(L, carena_stack_pos);
         return 2;
     }
 
-    /* 6. Return result as Lua value */
+    /* 5. Return result as Lua value */
     rv_to_lua(L, &result);
+    arena_destroy(&rarena);
+    lua_remove(L, carena_stack_pos);
     return 1;
 }
 
@@ -213,20 +219,24 @@ static int dir_parse_data_lua(lua_State *L)
     const char *value = luaL_checklstring(L, 1, &vlen);
 
     compile_arena *carena = compile_arena_new(L, 4096);
+    int carena_stack_pos = lua_gettop(L);
     char     abuf[65536];
     arena_t  rarena;
-    arena_init(&rarena, abuf, sizeof(abuf));
+    arena_bind(&rarena, L, carena, abuf, sizeof(abuf));
     reflow_error err = {0};
 
     reflow_value *rv = directives_parse_data(carena, L, &rarena,
                                              value, vlen, &err);
-    lua_pop(L, 1); /* remove carena */
     if (!rv) {
         lua_pushnil(L);
         lua_pushstring(L, err.message ? err.message : "parse error");
+        arena_destroy(&rarena);
+        lua_remove(L, carena_stack_pos);
         return 2;
     }
     rv_to_lua(L, rv);
+    arena_destroy(&rarena);
+    lua_remove(L, carena_stack_pos);
     return 1;
 }
 
@@ -348,13 +358,17 @@ static int dir_assert_empty_lua(lua_State *L)
     }
     const char *name = luaL_checkstring(L, 2);
 
+    compile_arena *arena = compile_arena_new(L, 256);
+    int arena_pos = lua_gettop(L);
     reflow_error err = {0};
-    if (directives_assert_empty(value, vlen, name, &err) != 0) {
+    if (directives_assert_empty(arena, L, value, vlen, name, &err) != 0) {
         lua_pushnil(L);
         lua_pushstring(L, err.message ? err.message : "value not empty");
+        lua_remove(L, arena_pos);
         return 2;
     }
     lua_pushliteral(L, "ok");
+    lua_remove(L, arena_pos);
     return 1;
 }
 
@@ -500,6 +514,8 @@ static int parse_html_lua(lua_State *L)
     size_t hlen = 0;
     const char *html = luaL_checklstring(L, 1, &hlen);
 
+    compile_arena *error_arena = compile_arena_new(L, 256);
+    int error_arena_pos = lua_gettop(L);
     lua_newtable(L);
     parse_ctx ctx = {
         .L = L,
@@ -514,13 +530,15 @@ static int parse_html_lua(lua_State *L)
         .on_comment = ev_comment,
     };
     reflow_error err = {0};
-    int rc = html_parse(html, hlen, &handler, &err);
+    int rc = html_parse(L, error_arena, html, hlen, &handler, &err);
     if (rc != 0 || err.message != NULL) {
         lua_pop(L, 1);
         lua_pushnil(L);
         lua_pushstring(L, err.message ? err.message : "parse error");
+        lua_remove(L, error_arena_pos);
         return 2;
     }
+    lua_remove(L, error_arena_pos);
     return 1;
 }
 
@@ -1085,123 +1103,6 @@ push_err_table:
     return 1;
 }
 
-/* selector_cache_new: test hook — create a bounded LRU cache and expose
- * it via a small closure API.  The closure is a table of methods that
- * captures the cache userdata in an upvalue so tests can drive the LRU
- * behaviour without exposing the raw C struct. */
-static int sel_cache_resolve_lua(lua_State *L)
-{
-    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
-    size_t     slen = 0;
-    const char *src = luaL_checklstring(L, 1, &slen);
-    reflow_error err = {0};
-    const sel_compiled *sel = sel_cache_resolve(c, L, src, slen, &err);
-    if (sel == NULL) {
-        lua_pushnil(L);
-        lua_newtable(L);
-        lua_pushstring(L, err.type ? err.type : "ReflowSelectorError");
-        lua_setfield(L, -2, "type");
-        lua_pushstring(L, err.message ? err.message : "parse error");
-        lua_setfield(L, -2, "message");
-        if (err.reason) {
-            lua_pushstring(L, err.reason);
-            lua_setfield(L, -2, "reason");
-        }
-        return 2;
-    }
-    /* Return the source string as an identity token; tests compare
-     * identity by peek-ing before / after promotion.  We do not expose
-     * the C pointer directly. */
-    lua_pushlstring(L, sel->source, sel->source_len);
-    return 1;
-}
-
-static int sel_cache_peek_lua(lua_State *L)
-{
-    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
-    size_t      slen = 0;
-    const char *src  = luaL_checklstring(L, 1, &slen);
-    const sel_compiled *sel = sel_cache_peek(c, src, slen);
-    if (sel == NULL) {
-        lua_pushnil(L);
-        return 1;
-    }
-    lua_pushlstring(L, sel->source, sel->source_len);
-    return 1;
-}
-
-static int sel_cache_size_lua(lua_State *L)
-{
-    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
-    lua_pushinteger(L, (lua_Integer)sel_cache_size(c));
-    return 1;
-}
-
-static int sel_cache_max_size_lua(lua_State *L)
-{
-    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
-    lua_pushinteger(L, (lua_Integer)sel_cache_max_size(c));
-    return 1;
-}
-
-static int sel_cache_clear_lua(lua_State *L)
-{
-    sel_cache *c = *(sel_cache **)lua_touserdata(L, lua_upvalueindex(1));
-    sel_cache_clear(c);
-    return 0;
-}
-
-static int selector_cache_new_lua(lua_State *L)
-{
-    lua_Integer max_size = luaL_optinteger(L, 1, 128);
-    if (max_size < 0) {
-        return luaL_error(L,
-                          "selectorCacheSize must be a non-negative integer");
-    }
-    sel_cache *c = sel_cache_new(L, (size_t)max_size);
-    /* Wrap the raw cache userdata in a boxed pointer so the closure
-     * upvalue holds a stable reference while the wrapping userdata (on
-     * the stack) is kept alive via an uservalue link. */
-    sel_cache **box = (sel_cache **)lua_newuserdata(L, sizeof(*box));
-    *box = c;
-#if defined(LUA_VERSION_NUM) && LUA_VERSION_NUM >= 502
-    lua_pushvalue(L, -2);          /* the sel_cache userdata */
-    lua_setuservalue(L, -2);       /* box.uservalue = cache */
-#else
-    /* Lua 5.1: keep the anchor via an environment table. */
-    lua_newtable(L);
-    lua_pushvalue(L, -3);
-    lua_rawseti(L, -2, 1);
-    lua_setfenv(L, -2);
-#endif
-    lua_remove(L, -2);             /* drop the raw cache userdata */
-
-    /* Build the method table with box as an upvalue for each function. */
-    lua_newtable(L);
-    struct {
-        const char   *name;
-        lua_CFunction fn;
-    } methods[] = {
-        {"resolve",   sel_cache_resolve_lua},
-        {"peek",      sel_cache_peek_lua},
-        {"size",      sel_cache_size_lua},
-        {"max_size",  sel_cache_max_size_lua},
-        {"clear",     sel_cache_clear_lua},
-        {NULL, NULL},
-    };
-    for (int i = 0; methods[i].name != NULL; i++) {
-        lua_pushvalue(L, -2);       /* box */
-        lua_pushcclosure(L, methods[i].fn, 1);
-        lua_setfield(L, -2, methods[i].name);
-    }
-    /* Anchor the box on the returned table so the table's lifetime
-     * keeps the cache alive. */
-    lua_pushvalue(L, -2);
-    lua_setfield(L, -2, "_box");
-    lua_remove(L, -2);              /* drop the box off the stack */
-    return 1;
-}
-
 /* ============================================================ */
 /* compile_template test hook — dumps the IR tree as a table    */
 /* ============================================================ */
@@ -1317,7 +1218,7 @@ static int render_lua(lua_State *L)
     size_t prefix_len = 2;
     const char **helper_names = NULL;
     size_t n_helpers = 0;
-    int helpers_ref = LUA_NOREF;
+    int helpers_idx = 0;
 
     compile_arena *carena = compile_arena_new(L, 4096);
     int carena_stack_pos = lua_gettop(L);
@@ -1356,12 +1257,12 @@ static int render_lua(lua_State *L)
                 }
                 n_helpers = idx;
             }
-            /* Store the helpers table itself in the registry for
-             * name→function lookup at eval time. */
-            lua_pushvalue(L, -1);
-            helpers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+            /* Keep this table on the active C-call stack.  Its absolute
+             * index stays valid until rendering returns. */
+            helpers_idx = lua_gettop(L);
+        } else {
+            lua_pop(L, 1);
         }
-        lua_pop(L, 1);
     }
 
     /* 1. Compile. */
@@ -1372,8 +1273,6 @@ static int render_lua(lua_State *L)
                                      prefix, prefix_len,
                                      helper_names, n_helpers, &err);
     if (root == NULL) {
-        if (helpers_ref != LUA_NOREF)
-            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
         lua_settop(L, carena_stack_pos);
         lua_pop(L, 1);
         lua_pushnil(L);
@@ -1383,52 +1282,42 @@ static int render_lua(lua_State *L)
 
     /* 2. Set up render arena and parse render data (JSON5). */
     arena_t rarena;
-    arena_init(&rarena, NULL, 0);
+    arena_init(&rarena, L, NULL, 0);
 
     reflow_value *globals = NULL;
     if (data != NULL) {
         reflow_error derr = {0};
         globals = json5_parse(data, data_len, &rarena, &derr);
         if (globals == NULL) {
-            arena_destroy(&rarena);
-            if (helpers_ref != LUA_NOREF)
-                luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-            lua_settop(L, carena_stack_pos);
-            lua_pop(L, 1);
             lua_pushnil(L);
             lua_pushstring(L, derr.message ? derr.message : "data error");
+            arena_destroy(&rarena);
+            lua_remove(L, carena_stack_pos);
             return 2;
         }
     }
 
     /* 3. Render into a buf_t. */
     buf_t out;
-    if (buf_init(&out) != 0) {
+    if (buf_init(&out, &rarena) != 0) {
         arena_destroy(&rarena);
-        if (helpers_ref != LUA_NOREF)
-            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
         return luaL_error(L, "out of memory");
     }
     reflow_error rerr = {0};
-    int rc = interpret_render(&rarena, root, globals, L, helpers_ref,
+    int rc = interpret_render(&rarena, root, globals, L, helpers_idx,
                               NULL, html, hlen,
                               NULL, &out, &rerr);
     if (rc != 0) {
         buf_free(&out);
-        arena_destroy(&rarena);
-        if (helpers_ref != LUA_NOREF)
-            luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
-        lua_settop(L, carena_stack_pos);
-        lua_pop(L, 1);
         lua_pushnil(L);
         lua_pushstring(L, rerr.message ? rerr.message : "render error");
+        arena_destroy(&rarena);
+        lua_remove(L, carena_stack_pos);
         return 2;
     }
     lua_pushlstring(L, out.data, out.len);
     buf_free(&out);
     arena_destroy(&rarena);
-    if (helpers_ref != LUA_NOREF)
-        luaL_unref(L, LUA_REGISTRYINDEX, helpers_ref);
     lua_remove(L, carena_stack_pos);
     return 1;
 }
@@ -1455,16 +1344,8 @@ LUALIB_API int luaopen_reflow_compiler(lua_State *L)
         {"parse_selector",   parse_selector_lua  },
         {"build_selector_index", build_selector_index_lua},
         {"resolve_selector",     resolve_selector_lua},
-        {"selector_cache_new",   selector_cache_new_lua},
         {"compile_template", compile_template_lua},
         {"render",           render_lua          },
-        /* State-based public API (used by lua/reflow.lua). */
-        {"state_new",        rf_state_new        },
-        {"state_add_helper", rf_state_add_helper },
-        {"state_compile",    rf_state_compile    },
-        {"state_render",     rf_state_render     },
-        {"state_clear",      rf_state_clear      },
-        {"state_templates",  rf_state_templates  },
         {NULL,         NULL           },
     };
 

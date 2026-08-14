@@ -1,0 +1,1 @@
+{ "payload": "<script>alert('xss')</script>", "url": "javascript:alert(1)\"onclick=\"x" }

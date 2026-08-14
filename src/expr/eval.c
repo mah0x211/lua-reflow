@@ -23,11 +23,13 @@
 
 // project
 #include "eval.h"
+#include "../checked.h"
 // lua
 #include <lauxlib.h>
 #include <lua.h>
 // system
 #include <stdarg.h>
+#include <limits.h>
 #include <string.h>
 
 /* ============================================================ */
@@ -93,9 +95,50 @@ void rv_to_lua(lua_State *L, const reflow_value *v)
 /* Lua → reflow_value conversion (arena-allocated)             */
 /* ============================================================ */
 
-static reflow_value lua_to_rv(lua_State *L, int idx, arena_t *arena)
+static void eval_error(reflow_error *err, const char *msg);
+
+static void *eval_alloc_array(arena_t *arena, size_t count, size_t item_size,
+                              reflow_error *err)
+{
+    size_t bytes = 0;
+    if (!reflow_size_mul(count, item_size, &bytes)) {
+        eval_error(err, "helper return value is too large");
+        return NULL;
+    }
+    return arena_alloc(arena, bytes);
+}
+
+static char *eval_owned_string(arena_t *arena, const char *src, size_t len,
+                               reflow_error *err)
+{
+    size_t bytes = 0;
+    if (!reflow_size_add(len, 1, &bytes)) {
+        eval_error(err, "helper return value is too large");
+        return NULL;
+    }
+    char *dst = (char *)arena_alloc(arena, bytes);
+    if (dst == NULL) {
+        eval_error(err, "helper return value is too large");
+        return NULL;
+    }
+    memcpy(dst, src, len);
+    dst[len] = '\0';
+    return dst;
+}
+
+static void unmark_table(lua_State *L, int seen_idx, int table_idx)
+{
+    lua_pushvalue(L, table_idx);
+    lua_pushnil(L);
+    lua_rawset(L, seen_idx);
+}
+
+static reflow_value lua_to_rv_inner(lua_State *L, int idx, arena_t *arena,
+                                    reflow_error *err, int seen_idx,
+                                    size_t depth)
 {
     idx = lua_absindex(L, idx);
+    seen_idx = lua_absindex(L, seen_idx);
     int t = lua_type(L, idx);
 
     switch (t) {
@@ -108,57 +151,113 @@ static reflow_value lua_to_rv(lua_State *L, int idx, arena_t *arena)
     case LUA_TSTRING: {
         size_t slen  = 0;
         const char *s = lua_tolstring(L, idx, &slen);
-        char *dst = (char *)arena_alloc(arena, slen + 1);
-        memcpy(dst, s, slen);
-        dst[slen] = '\0';
+        char *dst = eval_owned_string(arena, s, slen, err);
+        if (dst == NULL) return rv_undef();
         return rv_string(dst, slen);
     }
     case LUA_TTABLE: {
+        if (depth >= 256) {
+            eval_error(err, "helper return table nesting is too deep");
+            return rv_undef();
+        }
+        lua_pushvalue(L, idx);
+        lua_rawget(L, seen_idx);
+        bool seen = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        if (seen) {
+            eval_error(err, "helper return table contains a cycle");
+            return rv_undef();
+        }
+        lua_pushvalue(L, idx);
+        lua_pushboolean(L, 1);
+        lua_rawset(L, seen_idx);
+
         size_t alen = table_len(L, idx);
         if (alen > 0) {
             /* treat as array */
             reflow_value *items = (reflow_value *)
-                arena_alloc(arena, alen * sizeof(reflow_value));
+                eval_alloc_array(arena, alen, sizeof(reflow_value), err);
+            if (items == NULL) {
+                unmark_table(L, seen_idx, idx);
+                return rv_undef();
+            }
             for (size_t i = 0; i < alen; i++) {
+                if (i >= (size_t)INT_MAX) {
+                    eval_error(err, "helper return array is too large");
+                    unmark_table(L, seen_idx, idx);
+                    return rv_undef();
+                }
                 lua_rawgeti(L, idx, (int)(i + 1));
-                items[i] = lua_to_rv(L, -1, arena);
+                items[i] = lua_to_rv_inner(L, -1, arena, err, seen_idx,
+                                           depth + 1);
                 lua_pop(L, 1);
+                if (err != NULL && err->message != NULL) {
+                    unmark_table(L, seen_idx, idx);
+                    return rv_undef();
+                }
             }
             reflow_value v;
             v.tag          = RV_ARRAY;
             v.array.items  = items;
             v.array.len    = alen;
             v.array.cap    = alen;
+            unmark_table(L, seen_idx, idx);
             return v;
         }
         /* treat as object */
         lua_pushnil(L);
         size_t n = 0;
         while (lua_next(L, idx)) {
+            if (n == SIZE_MAX) {
+                lua_pop(L, 2);
+                eval_error(err, "helper return object is too large");
+                unmark_table(L, seen_idx, idx);
+                return rv_undef();
+            }
             n++;
             lua_pop(L, 1);
         }
         rv_prop *props = (rv_prop *)
-            arena_alloc(arena, n * sizeof(rv_prop));
+            eval_alloc_array(arena, n, sizeof(rv_prop), err);
+        if (props == NULL && n != 0) {
+            unmark_table(L, seen_idx, idx);
+            return rv_undef();
+        }
         n = 0;
         lua_pushnil(L);
         while (lua_next(L, idx)) {
             size_t klen = 0;
             const char *k = lua_tolstring(L, -2, &klen);
-            char *kdst = (char *)arena_alloc(arena, klen + 1);
-            memcpy(kdst, k, klen);
-            kdst[klen] = '\0';
+            if (k == NULL) {
+                lua_pop(L, 2);
+                eval_error(err, "helper return object keys must be strings");
+                unmark_table(L, seen_idx, idx);
+                return rv_undef();
+            }
+            char *kdst = eval_owned_string(arena, k, klen, err);
+            if (kdst == NULL) {
+                lua_pop(L, 2);
+                unmark_table(L, seen_idx, idx);
+                return rv_undef();
+            }
             props[n].key     = kdst;
             props[n].key_len = klen;
-            props[n].value   = lua_to_rv(L, -1, arena);
+            props[n].value = lua_to_rv_inner(L, -1, arena, err, seen_idx,
+                                              depth + 1);
             n++;
             lua_pop(L, 1);
+            if (err != NULL && err->message != NULL) {
+                lua_pop(L, 1); /* pending lua_next key */
+                unmark_table(L, seen_idx, idx);
+                return rv_undef();
+            }
         }
         reflow_value v;
         v.tag          = RV_OBJECT;
         v.object.props = props;
         v.object.len   = n;
         v.object.cap   = n;
+        unmark_table(L, seen_idx, idx);
         return v;
     }
     default:
@@ -167,11 +266,21 @@ static reflow_value lua_to_rv(lua_State *L, int idx, arena_t *arena)
     }
 }
 
+static reflow_value lua_to_rv(lua_State *L, int idx, arena_t *arena,
+                              reflow_error *err)
+{
+    idx = lua_absindex(L, idx);
+    lua_newtable(L);
+    int seen_idx = lua_gettop(L);
+    reflow_value result =
+        lua_to_rv_inner(L, idx, arena, err, seen_idx, 0);
+    lua_remove(L, seen_idx);
+    return result;
+}
+
 /* ============================================================ */
 /* Error helper                                                 */
 /* ============================================================ */
-
-static char g_eval_err[256];
 
 static void eval_error(reflow_error *err, const char *msg)
 {
@@ -181,15 +290,29 @@ static void eval_error(reflow_error *err, const char *msg)
     }
 }
 
-static void eval_errorf(reflow_error *err, const char *fmt, ...)
+static void eval_errorf(arena_t *arena, reflow_error *err,
+                        const char *fmt, ...)
 {
     if (err) {
+        char message[256];
         va_list ap;
         va_start(ap, fmt);
-        vsnprintf(g_eval_err, sizeof(g_eval_err), fmt, ap);
+        vsnprintf(message, sizeof(message), fmt, ap);
         va_end(ap);
+        size_t len = strlen(message);
+        size_t bytes = 0;
+        if (!reflow_size_add(len, 1, &bytes)) {
+            eval_error(err, "runtime error message is too large");
+            return;
+        }
+        char *owned = (char *)arena_alloc(arena, bytes);
+        if (owned == NULL) {
+            eval_error(err, "runtime error message is too large");
+            return;
+        }
+        memcpy(owned, message, bytes);
         err->type    = "ReflowRuntimeError";
-        err->message = g_eval_err;
+        err->message = owned;
     }
 }
 
@@ -198,7 +321,7 @@ static void eval_errorf(reflow_error *err, const char *fmt, ...)
 /* ============================================================ */
 
 reflow_value expr_eval(const expr_node *node, scope_env *env,
-                       lua_State *L, int helpers_ref,
+                       lua_State *L, int helpers_idx,
                        arena_t *arena, reflow_error *err)
 {
     switch (node->type) {
@@ -224,13 +347,13 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
 
     case EX_MEMBER: {
         reflow_value obj = expr_eval(node->member.object, env, L,
-                                     helpers_ref, arena, err);
+                                     helpers_idx, arena, err);
         if (err->message) return rv_undef();
 
         if (rv_is_nullish(&obj)) {
             if (node->member.optional)
                 return rv_undef();
-            eval_errorf(err, "cannot read property \"%s\" of %s",
+            eval_errorf(arena, err, "cannot read property \"%s\" of %s",
                         node->member.pname,
                         obj.tag == RV_NULL ? "null" : "undefined");
             return rv_undef();
@@ -242,7 +365,7 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
 
     case EX_UNARY: {
         reflow_value arg = expr_eval(node->unary.arg, env, L,
-                                     helpers_ref, arena, err);
+                                     helpers_idx, arena, err);
         if (err->message) return rv_undef();
         return rv_bool(!rv_is_truthy(&arg));
     }
@@ -251,54 +374,54 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
         /* && and || need short-circuit (don't eval right early) */
         if (node->binary.op == OP_AND) {
             reflow_value l = expr_eval(node->binary.left, env, L,
-                                       helpers_ref, arena, err);
+                                       helpers_idx, arena, err);
             if (err->message) return rv_undef();
             if (rv_is_falsy(&l)) return l;
             return expr_eval(node->binary.right, env, L,
-                             helpers_ref, arena, err);
+                             helpers_idx, arena, err);
         }
         if (node->binary.op == OP_OR) {
             reflow_value l = expr_eval(node->binary.left, env, L,
-                                       helpers_ref, arena, err);
+                                       helpers_idx, arena, err);
             if (err->message) return rv_undef();
             if (rv_is_truthy(&l)) return l;
             return expr_eval(node->binary.right, env, L,
-                             helpers_ref, arena, err);
+                             helpers_idx, arena, err);
         }
         if (node->binary.op == OP_COALESCE) {
             reflow_value l = expr_eval(node->binary.left, env, L,
-                                       helpers_ref, arena, err);
+                                       helpers_idx, arena, err);
             if (err->message) return rv_undef();
             if (!rv_is_nullish(&l)) return l;
             return expr_eval(node->binary.right, env, L,
-                             helpers_ref, arena, err);
+                             helpers_idx, arena, err);
         }
 
         /* non-short-circuit: evaluate both sides */
         reflow_value l = expr_eval(node->binary.left, env, L,
-                                   helpers_ref, arena, err);
+                                   helpers_idx, arena, err);
         if (err->message) return rv_undef();
         reflow_value r = expr_eval(node->binary.right, env, L,
-                                   helpers_ref, arena, err);
+                                   helpers_idx, arena, err);
         if (err->message) return rv_undef();
 
         switch (node->binary.op) {
         case OP_EQ: return rv_bool(rv_strict_eq(&l, &r));
         case OP_NE: return rv_bool(rv_strict_neq(&l, &r));
         case OP_LT: {
-            int c = rv_compare(&l, &r);
+            int c = rv_compare(&l, &r, arena);
             return rv_bool(c == 2 ? 0 : c < 0);
         }
         case OP_GT: {
-            int c = rv_compare(&l, &r);
+            int c = rv_compare(&l, &r, arena);
             return rv_bool(c == 2 ? 0 : c > 0);
         }
         case OP_LE: {
-            int c = rv_compare(&l, &r);
+            int c = rv_compare(&l, &r, arena);
             return rv_bool(c == 2 ? 0 : c <= 0);
         }
         case OP_GE: {
-            int c = rv_compare(&l, &r);
+            int c = rv_compare(&l, &r, arena);
             return rv_bool(c == 2 ? 0 : c >= 0);
         }
         default:
@@ -309,30 +432,30 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
 
     case EX_TERNARY: {
         reflow_value test = expr_eval(node->ternary.test, env, L,
-                                      helpers_ref, arena, err);
+                                      helpers_idx, arena, err);
         if (err->message) return rv_undef();
         if (rv_is_truthy(&test))
             return expr_eval(node->ternary.cons, env, L,
-                             helpers_ref, arena, err);
+                             helpers_idx, arena, err);
         return expr_eval(node->ternary.alt, env, L,
-                         helpers_ref, arena, err);
+                         helpers_idx, arena, err);
     }
 
     case EX_CALL: {
-        if (!L || helpers_ref == LUA_NOREF) {
-            eval_errorf(err, "helper \"%s\" is not available "
+        if (!L || helpers_idx == 0) {
+            eval_errorf(arena, err, "helper \"%s\" is not available "
                         "(no helper registry)", node->call.callee);
             return rv_undef();
         }
 
         /* Look up helper function */
-        lua_rawgeti(L, LUA_REGISTRYINDEX, helpers_ref);
+        lua_pushvalue(L, helpers_idx);
         lua_getfield(L, -1, node->call.callee);
         lua_remove(L, -2); /* remove helpers table */
 
         if (!lua_isfunction(L, -1)) {
             lua_pop(L, 1);
-            eval_errorf(err, "helper \"%s\" is not registered",
+            eval_errorf(arena, err, "helper \"%s\" is not registered",
                         node->call.callee);
             return rv_undef();
         }
@@ -340,7 +463,7 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
         /* Evaluate and push arguments */
         for (size_t i = 0; i < node->call.n_args; i++) {
             reflow_value arg = expr_eval(node->call.args[i], env, L,
-                                         helpers_ref, arena, err);
+                                         helpers_idx, arena, err);
             if (err->message) {
                 lua_pop(L, 1 + (int)i); /* function + pushed args */
                 return rv_undef();
@@ -351,25 +474,26 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
         /* Call helper */
         if (lua_pcall(L, (int)node->call.n_args, 1, 0) != 0) {
             const char *m = lua_tostring(L, -1);
-            eval_errorf(err, "helper \"%s\": %s",
+            eval_errorf(arena, err, "helper \"%s\": %s",
                         node->call.callee, m ? m : "error");
             lua_pop(L, 1);
             return rv_undef();
         }
 
-        reflow_value result = lua_to_rv(L, -1, arena);
+        reflow_value result = lua_to_rv(L, -1, arena, err);
         lua_pop(L, 1);
         return result;
     }
 
     case EX_OBJECT: {
         rv_prop *props = (rv_prop *)
-            arena_alloc(arena, node->object.n * sizeof(rv_prop));
+            eval_alloc_array(arena, node->object.n, sizeof(rv_prop), err);
+        if (props == NULL && node->object.n != 0) return rv_undef();
         for (size_t i = 0; i < node->object.n; i++) {
             obj_entry *e = &node->object.entries[i];
             if (e->computed) {
                 reflow_value kv = expr_eval(e->key_expr, env, L,
-                                            helpers_ref, arena, err);
+                                            helpers_idx, arena, err);
                 if (err->message) return rv_undef();
                 /* key must be string or number */
                 if (kv.tag == RV_STRING) {
@@ -378,9 +502,8 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
                 } else if (kv.tag == RV_NUMBER) {
                     char buf[32];
                     size_t len = number_to_string(kv.number, buf);
-                    char *dst = (char *)arena_alloc(arena, len + 1);
-                    memcpy(dst, buf, len);
-                    dst[len] = '\0';
+                    char *dst = eval_owned_string(arena, buf, len, err);
+                    if (dst == NULL) return rv_undef();
                     props[i].key = dst;
                     props[i].key_len = len;
                 } else {
@@ -392,7 +515,7 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
                 props[i].key_len = e->klen;
             }
             props[i].value = expr_eval(e->val, env, L,
-                                       helpers_ref, arena, err);
+                                       helpers_idx, arena, err);
             if (err->message) return rv_undef();
         }
         reflow_value v;
@@ -405,10 +528,12 @@ reflow_value expr_eval(const expr_node *node, scope_env *env,
 
     case EX_ARRAY: {
         reflow_value *items = (reflow_value *)
-            arena_alloc(arena, node->array.n * sizeof(reflow_value));
+            eval_alloc_array(arena, node->array.n,
+                             sizeof(reflow_value), err);
+        if (items == NULL && node->array.n != 0) return rv_undef();
         for (size_t i = 0; i < node->array.n; i++) {
             items[i] = expr_eval(node->array.items[i], env, L,
-                                 helpers_ref, arena, err);
+                                 helpers_idx, arena, err);
             if (err->message) return rv_undef();
         }
         reflow_value v;

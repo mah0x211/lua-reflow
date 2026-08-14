@@ -35,7 +35,9 @@ local new_selector = require('reflow.selector')
 
 --- @class reflow
 --- @field _templates table<string, userdata>
+--- @field _template_order string[]
 --- @field _selectors table<string, userdata>
+--- @field _selector_order string[]
 --- @field _helpers table<string, reflow.helper>
 --- @field _prefix string
 --- @field _max_depth integer
@@ -83,6 +85,21 @@ function Reflow:compile(name, html)
             message = 'template name must be a non-empty string',
         }
     end
+    if type(html) ~= 'string' then
+        return nil, {
+            type = 'ReflowCompileError',
+            message = 'compile: html must be a string',
+            templateName = name,
+        }
+    end
+    if self._templates[name] then
+        return nil, {
+            type = 'ReflowCompileError',
+            message = ('template %q already exists; call clear(%q) before recompiling')
+                :format(name, name),
+            templateName = name,
+        }
+    end
     local helper_names = {}
     for h in pairs(self._helpers) do
         helper_names[#helper_names + 1] = h
@@ -96,6 +113,7 @@ function Reflow:compile(name, html)
         return nil, err
     end
     self._templates[name] = tmpl
+    self._template_order[#self._template_order + 1] = name
     return self
 end
 
@@ -125,10 +143,27 @@ local function resolve_selector(self, src)
         }
     end
     local cached = self._selectors[src]
-    if cached then return cached, nil end
+    if cached then
+        for i, source in ipairs(self._selector_order) do
+            if source == src then
+                table.remove(self._selector_order, i)
+                break
+            end
+        end
+        self._selector_order[#self._selector_order + 1] = src
+        return cached, nil
+    end
     local sel, err = new_selector(src)
     if not sel then return nil, err end
+    if self._selector_cache_max == 0 then
+        return sel, nil
+    end
     self._selectors[src] = sel
+    self._selector_order[#self._selector_order + 1] = src
+    if #self._selector_order > self._selector_cache_max then
+        local evicted = table.remove(self._selector_order, 1)
+        self._selectors[evicted] = nil
+    end
     return sel, nil
 end
 
@@ -154,7 +189,7 @@ function Reflow:render(name, data, selector)
         return nil, serr
     end
     local html, err = tmpl:render(data, self._helpers, self._templates,
-                                  self._max_depth, sel)
+                                  self._max_depth, sel, name)
     if err ~= nil then
         -- The template userdata is intentionally anonymous, so it has
         -- no notion of its registered name.  Inject the coordinator's
@@ -173,15 +208,22 @@ function Reflow:clear(name)
     if name ~= nil then
         if self._templates[name] then
             self._templates[name] = nil
+            for i, registered in ipairs(self._template_order) do
+                if registered == name then
+                    table.remove(self._template_order, i)
+                    break
+                end
+            end
             return {name}
         end
         return {}
     end
     local removed = {}
-    for n in pairs(self._templates) do
-        removed[#removed + 1] = n
+    for i, registered in ipairs(self._template_order) do
+        removed[i] = registered
     end
     self._templates = {}
+    self._template_order = {}
     return removed
 end
 
@@ -189,8 +231,8 @@ end
 --- @return string[]
 function Reflow:templates()
     local names = {}
-    for n in pairs(self._templates) do
-        names[#names + 1] = n
+    for i, registered in ipairs(self._template_order) do
+        names[i] = registered
     end
     return names
 end
@@ -212,12 +254,23 @@ local function new(opts)
     opts = opts or {}
     local prefix = opts.prefix or 'x-'
     local max_include_depth = opts.max_include_depth or 50
-    local selector_cache_size = opts.selector_cache_size or 128
+    local selector_cache_size = opts.selector_cache_size
+    if selector_cache_size == nil then
+        selector_cache_size = 128
+    end
+    assert(type(selector_cache_size) == 'number' and
+           selector_cache_size >= 0 and selector_cache_size % 1 == 0,
+           'selector_cache_size must be a non-negative integer')
+    assert(type(max_include_depth) == 'number' and
+           max_include_depth >= 0 and max_include_depth % 1 == 0,
+           'max_include_depth must be a non-negative integer')
     local loader = opts.loader or default_loader
     assert(type(loader) == 'function', 'loader must be a function')
     local self = setmetatable({
         _templates = {},
+        _template_order = {},
         _selectors = {},
+        _selector_order = {},
         _helpers = {},
         _prefix = prefix,
         _max_depth = max_include_depth,

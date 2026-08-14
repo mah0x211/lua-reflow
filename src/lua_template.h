@@ -34,16 +34,15 @@
  * A `reflow.template` userdata bundles everything needed to render a
  * template into a stand-alone value: the IR tree, the selector index,
  * the source HTML (for runtime error snippets), the directive prefix,
- * and a registry ref that keeps the compile_arena alive.  The userdata
+ * and a private ownership edge that keeps the compile_arena alive. The userdata
  * is intended to be passed around like any other Lua object — stored
  * in tables, keyed on names, or handed to `template:render(...)`
  * directly.  All lifetime is bound to the userdata: when it becomes
- * unreachable, __gc releases the arena ref and the tree is collected
- * with the rest of the arena's chunks.
+ * unreachable, its private uservalue/environment and arena chunks become
+ * collectible in the same GC cycle.
  */
 
 typedef struct reflow_template {
-    int              arena_ref;   /* LUA_NOREF after __gc */
     const ir_node   *root;
     const sel_index *sindex;
     const char      *html;

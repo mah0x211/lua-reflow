@@ -62,7 +62,8 @@ expr_node *directives_parse_expr(compile_arena *arena, lua_State *L,
                                  reflow_error *err);
 
 /* x-else / x-nocase / x-break: assert value is empty. */
-int directives_assert_empty(const char *value, size_t len,
+int directives_assert_empty(compile_arena *arena, lua_State *L,
+                            const char *value, size_t len,
                             const char *directive_name,
                             reflow_error *err);
 

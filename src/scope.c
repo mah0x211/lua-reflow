@@ -23,21 +23,48 @@
 
 // project
 #include "scope.h"
+#include "checked.h"
 
-void scope_env_init(scope_env *env, reflow_value *globals)
+#include <string.h>
+
+void scope_env_init(scope_env *env, arena_t *arena, reflow_value *globals)
 {
+    env->frames = NULL;
     env->n_frames = 0;
+    env->frame_capacity = 0;
+    env->arena = arena;
     env->globals  = globals;
 }
 
 void scope_push_frame(scope_env *env, scope_frame_kind kind,
                       reflow_value *vars)
 {
-    if (env->n_frames < SCOPE_MAX_FRAMES) {
-        env->frames[env->n_frames].kind = kind;
-        env->frames[env->n_frames].vars = vars;
-        env->n_frames++;
+    if (env->n_frames >= env->frame_capacity) {
+        size_t required = 0;
+        size_t capacity = 0;
+        size_t bytes = 0;
+        size_t copy_bytes = 0;
+        if (!reflow_size_add(env->n_frames, 1, &required) ||
+            !reflow_size_grow(env->frame_capacity, required, &capacity) ||
+            !reflow_size_mul(capacity, sizeof(scope_frame), &bytes) ||
+            !reflow_size_mul(env->n_frames, sizeof(scope_frame),
+                             &copy_bytes)) {
+            lua_pushliteral(env->arena->L, "scope nesting is too deep");
+            lua_error(env->arena->L);
+        }
+        scope_frame *frames =
+            (scope_frame *)arena_alloc(env->arena, bytes);
+        if (frames == NULL) {
+            lua_pushliteral(env->arena->L, "scope nesting is too deep");
+            lua_error(env->arena->L);
+        }
+        if (copy_bytes != 0) memcpy(frames, env->frames, copy_bytes);
+        env->frames = frames;
+        env->frame_capacity = capacity;
     }
+    env->frames[env->n_frames].kind = kind;
+    env->frames[env->n_frames].vars = vars;
+    env->n_frames++;
 }
 
 void scope_pop_frame(scope_env *env)

@@ -26,6 +26,8 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <lua.h>
+#include "compile_arena.h"
 #include "error.h"
 
 /*
@@ -82,7 +84,8 @@ typedef struct sax_handler {
  * or non-zero on error (with `err` set). Callbacks may set `err->message`
  * on their side; when set, the parser stops emitting further events.
  */
-int html_parse(const char *src, size_t len,
+int html_parse(lua_State *L, compile_arena *error_arena,
+               const char *src, size_t len,
                const sax_handler *handler,
                reflow_error *err);
 
