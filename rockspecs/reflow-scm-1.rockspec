@@ -32,6 +32,7 @@ build = {
     },
     modules = {
         reflow = "lua/reflow.lua",
+        ["reflow.error"] = "lua/error.lua",
     },
 }
 test = {
