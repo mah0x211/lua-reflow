@@ -1,7 +1,7 @@
 std = 'max'
 include_files = {
-    'lib/*.lua',
-    'lib/*/*.lua',
+    'lua/*.lua',
+    'lua/*/*.lua',
     'test/*_test.lua',
     'test/*/*_test.lua',
 }
@@ -16,4 +16,3 @@ ignore = {
     -- Line is too long
     '631',
 }
-

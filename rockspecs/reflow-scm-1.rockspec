@@ -23,11 +23,14 @@ external_dependencies = {}
 build_dependencies = {
     "luarocks-build-hooks >= 0.8.0",
 }
+test_dependencies = {
+    "testcase >= 0.16.0",
+    "luacov >= 0.15.0",
+}
 build = {
     type = "hooks",
     before_build = {
         "$(extra-vars)",
-        "build_lexbor.lua",
     },
     extra_variables = {
         CFLAGS = "-Wall -Wno-trigraphs -Wmissing-field-initializers -Wreturn-type -Wmissing-braces -Wparentheses -Wno-switch -Wunused-function -Wunused-label -Wunused-parameter -Wunused-variable -Wunused-value -Wuninitialized -Wunknown-pragmas -Wshadow -Wsign-compare",
@@ -40,18 +43,9 @@ build = {
     },
     modules = {
         reflow = "lua/reflow.lua",
-        ["reflow.compiler"] = {
-            sources = {
-                "src/compiler.c",
-                "deps/yyjson/src/yyjson.c",
-            },
-            incdirs = {
-                "deps/yyjson/src",
-                "$(DEP_LAUXHLIB_INCDIR)",
-                "$(DEP_ERRNO_INCDIR)",
-                "$(DEP_ERROR_INCDIR)",
-            },
-            -- build_lexbor.lua produces liblexbor_static.a before the build.
-        },
     },
+}
+test = {
+    type = "command",
+    command = "testcase test/",
 }

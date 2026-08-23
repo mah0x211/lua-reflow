@@ -22,9 +22,8 @@
 -- build_lexbor.lua builds the lexbor submodule as a static library via CMake.
 -- It runs as a luarocks-build-hooks `before_build` script, so it takes no
 -- command-line arguments (same convention as lua-llsocket's codegen.lua).
--- The resulting liblexbor_static.a is linked into reflow.compiler by the
--- rockspec.
-
+-- The resulting liblexbor_static.a is linked into the future reflow.compile
+-- artifact when that artifact is registered by the rockspec.
 local SRC_DIR = 'deps/lexbor'
 local BUILD_DIR = 'deps/lexbor/build'
 
@@ -44,17 +43,18 @@ local CONFIGURE_FLAGS = {
 local function run(cmd)
     local res = os.execute(cmd)
     -- Lua 5.1: os.execute returns an implementation-dependent value; on POSIX
-    -- it is the exit status (0 == success). Lua 5.2+: true/nil, code.
+    -- it is the exit status (0 == success). Lua 5.2+: true/nil, "exit",
+    -- code.
     if type(res) == 'number' then
         return res == 0
-    elseif res == true or res == nil then
+    elseif res == true then
         return true
     end
     return false
 end
 
-local configure = 'cmake -S ' .. SRC_DIR .. ' -B ' .. BUILD_DIR .. ' '
-    .. table.concat(CONFIGURE_FLAGS, ' ')
+local configure = 'cmake -S ' .. SRC_DIR .. ' -B ' .. BUILD_DIR .. ' ' ..
+                      table.concat(CONFIGURE_FLAGS, ' ')
 if not run(configure) then
     error('reflow: lexbor cmake configure failed:\n  ' .. configure)
 end
