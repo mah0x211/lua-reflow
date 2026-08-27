@@ -22,6 +22,8 @@ build_dependencies = {
 test_dependencies = {
     "testcase >= 0.16.0",
     "luacov >= 0.15.0",
+    "memlimit >= 0.1.1",
+    "newstate >= 0.3.1",
 }
 build = {
     type = "hooks",
