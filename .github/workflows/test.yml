@@ -52,10 +52,9 @@ jobs:
       with:
         submodules: 'true'
     -
-      name: Install Tools
+      name: Install Test Dependencies
       run: |
-        luarocks install testcase
-        luarocks install luacov
+        luarocks test --prepare rockspecs/reflow-scm-1.rockspec
     -
       name: Install
       run: |

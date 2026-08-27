@@ -13,6 +13,7 @@ description = {
 }
 dependencies = {
     "lua >= 5.1",
+    "errno >= 0.6.0",
 }
 external_dependencies = {}
 build_dependencies = {
@@ -21,6 +22,8 @@ build_dependencies = {
 test_dependencies = {
     "testcase >= 0.16.0",
     "luacov >= 0.15.0",
+    "memlimit >= 0.1.1",
+    "newstate >= 0.3.1",
 }
 build = {
     type = "hooks",
@@ -32,6 +35,16 @@ build = {
     },
     modules = {
         reflow = "lua/reflow.lua",
+        ["reflow.error"] = "lua/error.lua",
+        ["reflow.pool"] = {
+            sources = {
+                "src/pool.c",
+                "src/pool_lua.c",
+            },
+            incdirs = {
+                "src",
+            },
+        },
     },
 }
 test = {
