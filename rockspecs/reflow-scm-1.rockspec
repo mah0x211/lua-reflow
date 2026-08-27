@@ -13,6 +13,7 @@ description = {
 }
 dependencies = {
     "lua >= 5.1",
+    "errno >= 0.6.0",
 }
 external_dependencies = {}
 build_dependencies = {
@@ -33,6 +34,15 @@ build = {
     modules = {
         reflow = "lua/reflow.lua",
         ["reflow.error"] = "lua/error.lua",
+        ["reflow.pool"] = {
+            sources = {
+                "src/pool.c",
+                "src/pool_lua.c",
+            },
+            incdirs = {
+                "src",
+            },
+        },
     },
 }
 test = {
