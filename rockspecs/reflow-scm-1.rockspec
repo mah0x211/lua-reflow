@@ -14,6 +14,7 @@ description = {
 dependencies = {
     "lua >= 5.1",
     "errno >= 0.6.0",
+    "error >= 0.15.1",
 }
 external_dependencies = {}
 build_dependencies = {
@@ -29,6 +30,7 @@ build = {
     type = "hooks",
     before_build = {
         "$(extra-vars)",
+        "build_lexbor.lua",
     },
     extra_variables = {
         CFLAGS = "-Wall -Wno-trigraphs -Wmissing-field-initializers -Wreturn-type -Wmissing-braces -Wparentheses -Wno-switch -Wunused-function -Wunused-label -Wunused-parameter -Wunused-variable -Wunused-value -Wuninitialized -Wunknown-pragmas -Wshadow -Wsign-compare",
@@ -43,6 +45,28 @@ build = {
             },
             incdirs = {
                 "src",
+            },
+        },
+        ["reflow.compile"] = {
+            sources = {
+                "src/compile.c",
+                "src/html_lexbor.c",
+                "src/ir.c",
+                "src/pool.c",
+                "src/reflow_util.c",
+            },
+            incdirs = {
+                "src",
+                "$(LEXBOR_INCDIR)",
+            },
+            libdirs = {
+                "$(LEXBOR_LIBDIR)",
+            },
+            libraries = {
+                "$(LEXBOR_LIB)",
+            },
+            defines = {
+                "LEXBOR_STATIC",
             },
         },
     },
