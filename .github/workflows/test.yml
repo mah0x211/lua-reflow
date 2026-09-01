@@ -62,7 +62,7 @@ jobs:
     -
       name: Run Test
       run: |
-        testcase ./test/
+        luarocks test rockspecs/reflow-scm-1.rockspec
     -
       name: Upload coverage to Codecov
       if: ${{ hashFiles('luacov.report.out') != '' }}
