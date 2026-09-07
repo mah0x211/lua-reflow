@@ -33,7 +33,7 @@
 #include "ir.h"
 #include "ir_internal.h"
 
-#define COMPILE_OPERATION "reflow.compile.compile"
+#define COMPILE_OPERATION "reflow.compile"
 
 typedef struct compile_ctx_t {
     lua_State *L;
@@ -331,14 +331,9 @@ static int compile_lua(lua_State *L)
 
 int luaopen_reflow_compile(lua_State *L)
 {
-    static const luaL_Reg functions[] = {
-        {"compile", compile_lua},
-        {NULL,      NULL       },
-    };
-
     reflow_error_require(L, "reflow.error");
     lua_pop(L, 1);
     ir_init_metatable(L);
-    luaL_newlib(L, functions);
+    lua_pushcfunction(L, compile_lua);
     return 1;
 }

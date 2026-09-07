@@ -9,7 +9,7 @@ local newstate = require('newstate')
 local function assert_compile_error(err, template_name)
     assert.equal(type(err), 'table')
     assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
-    assert.equal(err.op, 'reflow.compile.compile')
+    assert.equal(err.op, 'reflow.compile')
     if template_name ~= nil then
         assert.equal(type(err.meta), 'table')
         assert.equal(err.meta.template_name, template_name)
@@ -17,8 +17,7 @@ local function assert_compile_error(err, template_name)
 end
 
 local function compile_ok(name, html, prefix, helper_names)
-    local result, err = compile.compile(name, html, prefix or 'x-',
-                                        helper_names or {})
+    local result, err = compile(name, html, prefix or 'x-', helper_names or {})
     assert.not_nil(result, err)
     assert.equal(type(result), 'userdata')
     assert.equal(getmetatable(result), 'reflow.ir')
@@ -30,19 +29,13 @@ local function run(source)
     return state:dostring(source)
 end
 
-function testcase.module_exposes_only_the_named_compile_operation()
-    assert.equal(type(compile), 'table')
-    assert.equal(type(compile.compile), 'function')
-    local count = 0
-    for _ in pairs(compile) do
-        count = count + 1
-    end
-    assert.equal(count, 1)
+function testcase.module_returns_the_compile_function()
+    assert.equal(type(compile), 'function')
 end
 
 function testcase.success_returns_one_new_ir_userdata_each_time()
     local values = {
-        compile.compile('page', '<main>hello</main>', 'x-', {}),
+        compile('page', '<main>hello</main>', 'x-', {}),
     }
     assert.equal(#values, 1)
     assert.equal(type(values[1]), 'userdata')
@@ -126,22 +119,22 @@ end
 function testcase.rejects_invalid_input_contract_with_compile_errors()
     local invalid = {
         function()
-            return compile.compile(nil, '', 'x-', {})
+            return compile(nil, '', 'x-', {})
         end,
         function()
-            return compile.compile('', '', 'x-', {})
+            return compile('', '', 'x-', {})
         end,
         function()
-            return compile.compile('page', 1, 'x-', {})
+            return compile('page', 1, 'x-', {})
         end,
         function()
-            return compile.compile('page', '', false, {})
+            return compile('page', '', false, {})
         end,
         function()
-            return compile.compile('page', '', 'x-', nil)
+            return compile('page', '', 'x-', nil)
         end,
         function()
-            return compile.compile('page', '', 'x-', {
+            return compile('page', '', 'x-', {
                 [1] = true,
             })
         end,
@@ -155,15 +148,13 @@ function testcase.rejects_invalid_input_contract_with_compile_errors()
 end
 
 function testcase.rejects_configured_prefix_attributes_without_downgrading()
-    local result, err = compile.compile('page',
-                                        '<div X-UNKNOWN="value"></div>',
-                                        'x-', {})
+    local result, err = compile('page', '<div X-UNKNOWN="value"></div>',
+                                'x-', {})
     assert.is_nil(result)
     assert_compile_error(err, 'page')
     assert.equal(err.meta.attribute, 'x-unknown')
 
-    result, err = compile.compile('empty-prefix', '<div id="value"></div>',
-                                  '', {})
+    result, err = compile('empty-prefix', '<div id="value"></div>', '', {})
     assert.is_nil(result)
     assert_compile_error(err, 'empty-prefix')
     assert.equal(err.meta.attribute, 'id')
@@ -172,8 +163,7 @@ function testcase.rejects_configured_prefix_attributes_without_downgrading()
 end
 
 function testcase.callback_failure_cleans_the_lexbor_session_for_the_next_call()
-    local result, err = compile.compile('rejected', '<div x-unknown></div>',
-                                        'x-', {})
+    local result, err = compile('rejected', '<div x-unknown></div>', 'x-', {})
     assert.is_nil(result)
     assert_compile_error(err, 'rejected')
 
@@ -191,12 +181,12 @@ function testcase.result_pool_oom_returns_no_ir_and_allows_a_later_compile()
         collectgarbage('collect')
         local used = memlimit.used()
         memlimit.maxsize(math.max(used, memlimit.minsize()) + 65536)
-        local result, err = compile.compile('oom', html, 'x-', {})
+        local result, err = compile('oom', html, 'x-', {})
         memlimit.maxsize(0)
         collectgarbage('collect')
         collectgarbage('collect')
 
-        local retry = compile.compile('retry', '<p>ok</p>', 'x-', {})
+        local retry = compile('retry', '<p>ok</p>', 'x-', {})
         return result == nil, errorlib.typeof(err) == errors.ECOMPILE,
                type(retry) == 'userdata' and
                    getmetatable(retry) == 'reflow.ir'
