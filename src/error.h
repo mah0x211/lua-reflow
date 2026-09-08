@@ -42,22 +42,16 @@ static inline void reflow_error_require(lua_State *L, const char *module_name)
     lua_call(L, 1, 1);
 }
 
-/**
- * Push reflow.error.new_compile(op, message, cause, meta).
- *
- * cause_idx and meta_idx are existing stack indices, or 0 to pass nil.  The
- * named Lua operation owns all error types and representation details; this
- * helper only preserves its stack contract.
- */
-static inline void reflow_error_push_compile(lua_State *L, const char *op,
-                                             const char *message, int cause_idx,
-                                             int meta_idx)
+static inline void reflow_error_push_named(lua_State *L,
+                                           const char *constructor,
+                                           const char *op, const char *message,
+                                           int cause_idx, int meta_idx)
 {
     int cause = cause_idx == 0 ? 0 : reflow_error_absolute_index(L, cause_idx);
     int meta  = meta_idx == 0 ? 0 : reflow_error_absolute_index(L, meta_idx);
 
     reflow_error_require(L, "reflow.error");
-    lua_getfield(L, -1, "new_compile");
+    lua_getfield(L, -1, constructor);
     lua_remove(L, -2);
     lua_pushstring(L, op);
     lua_pushstring(L, message);
@@ -72,6 +66,28 @@ static inline void reflow_error_push_compile(lua_State *L, const char *op,
         lua_pushvalue(L, meta);
     }
     lua_call(L, 4, 1);
+}
+
+/** Push reflow.error.new(op, message, cause, meta). */
+static inline void reflow_error_push(lua_State *L, const char *op,
+                                     const char *message, int cause_idx,
+                                     int meta_idx)
+{
+    reflow_error_push_named(L, "new", op, message, cause_idx, meta_idx);
+}
+
+/**
+ * Push reflow.error.new_compile(op, message, cause, meta).
+ *
+ * cause_idx and meta_idx are existing stack indices, or 0 to pass nil.  The
+ * named Lua operation owns all error types and representation details; this
+ * helper only preserves its stack contract.
+ */
+static inline void reflow_error_push_compile(lua_State *L, const char *op,
+                                             const char *message, int cause_idx,
+                                             int meta_idx)
+{
+    reflow_error_push_named(L, "new_compile", op, message, cause_idx, meta_idx);
 }
 
 #endif /* REFLOW_ERROR_H */

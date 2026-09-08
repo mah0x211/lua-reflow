@@ -33,6 +33,8 @@ typedef struct ir_t ir_t;
 typedef struct ir_node_t ir_node_t;
 typedef struct ir_attr_t ir_attr_t;
 typedef struct ir_branch_t ir_branch_t;
+typedef struct ir_directives_t ir_directives_t;
+struct reflow_value_t;
 
 typedef enum ir_node_type_t {
     IR_ROOT = 1,
@@ -79,6 +81,7 @@ typedef struct ir_element_t {
     ir_node_t node;
     ir_string_t tag_name;
     ir_attr_list_t attrs;
+    ir_directives_t *directives;
     ir_node_list_t children;
     size_t source_start;
     size_t source_end;
@@ -100,6 +103,10 @@ typedef struct ir_comment_t {
     ir_node_t node;
     ir_string_t text;
 } ir_comment_t;
+
+struct ir_directives_t {
+    const struct reflow_value_t *data_scopes;
+};
 
 struct ir_attr_t {
     ir_attr_t *next;

@@ -28,12 +28,14 @@
 #include <lua.h>
 
 #include "compat.h"
+#include "directive_parse.h"
 #include "error.h"
 #include "html.h"
 #include "ir.h"
 #include "ir_internal.h"
+#include "snippet.h"
 
-#define COMPILE_OPERATION "reflow.compile.compile"
+#define COMPILE_OPERATION "reflow.compile"
 
 typedef struct compile_ctx_t {
     lua_State *L;
@@ -103,10 +105,74 @@ static int return_existing_error(lua_State *L, int owner_idx)
 static void compile_raise(compile_ctx_t *ctx, const char *message,
                           const char *attribute, size_t attribute_len)
 {
-    ctx->structured_failure = 1;
     push_compile_error(ctx->L, message, ctx->ir->name.data, ctx->ir->name.len,
                        attribute, attribute_len);
+    ctx->structured_failure = 1;
     (void)lua_error(ctx->L);
+}
+
+static void push_element_name(lua_State *L, const ir_element_t *element)
+{
+    lua_pushliteral(L, "<");
+    lua_pushlstring(L, element->tag_name.data, element->tag_name.len);
+    lua_pushliteral(L, ">");
+    lua_concat(L, 3);
+}
+
+static void push_directive_error_meta(compile_ctx_t *ctx, const char *attribute,
+                                      size_t attribute_len)
+{
+    lua_State *L                      = ctx->L;
+    const ir_element_t *element       = ctx->pending_element;
+    reflow_source_location_t location = reflow_source_location(
+        ctx->ir->html.data, ctx->ir->html.len, element->source_start);
+
+    lua_createtable(L, 0, 6);
+    lua_pushlstring(L, ctx->ir->name.data, ctx->ir->name.len);
+    lua_setfield(L, -2, "template_name");
+    lua_pushlstring(L, attribute, attribute_len);
+    lua_setfield(L, -2, "attribute");
+    lua_pushinteger(L, (lua_Integer)location.line);
+    lua_setfield(L, -2, "line");
+    lua_pushinteger(L, (lua_Integer)location.column);
+    lua_setfield(L, -2, "column");
+    reflow_snippet_push(L, ctx->ir->html.data, ctx->ir->html.len,
+                        element->source_start, element->source_end, 2);
+    lua_setfield(L, -2, "snippet");
+    push_element_name(L, element);
+    lua_setfield(L, -2, "element");
+}
+
+static void compile_raise_directive_error(compile_ctx_t *ctx,
+                                          const char *attribute,
+                                          size_t attribute_len,
+                                          const directive_parse_error_t *error)
+{
+    lua_State *L       = ctx->L;
+    int cause_meta_idx = 0;
+    int cause_idx      = 0;
+    int meta_idx       = 0;
+
+    if (error->cause != NULL) {
+        lua_createtable(L, 0, 1);
+        lua_pushinteger(L, (lua_Integer)error->position);
+        lua_setfield(L, -2, "position");
+        cause_meta_idx = lua_gettop(L);
+        reflow_error_push(L, COMPILE_OPERATION, error->cause, 0,
+                          cause_meta_idx);
+        lua_remove(L, cause_meta_idx);
+        cause_idx = lua_gettop(L);
+    }
+    push_directive_error_meta(ctx, attribute, attribute_len);
+    meta_idx = lua_gettop(L);
+    reflow_error_push_compile(L, COMPILE_OPERATION, error->message, cause_idx,
+                              meta_idx);
+    lua_remove(L, meta_idx);
+    if (cause_idx != 0) {
+        lua_remove(L, cause_idx);
+    }
+    ctx->structured_failure = 1;
+    (void)lua_error(L);
 }
 
 static void compile_raise_ir_error(compile_ctx_t *ctx)
@@ -147,6 +213,28 @@ static void on_attribute(void *data, const char *name, size_t name_len,
     }
     if (name_len >= ctx->prefix_len &&
         memcmp(name, ctx->prefix, ctx->prefix_len) == 0) {
+        directive_parse_error_t error   = {0};
+        const char *suffix              = name + ctx->prefix_len;
+        size_t suffix_len               = name_len - ctx->prefix_len;
+        directive_parse_ctx_t parse_ctx = {
+            .L       = ctx->L,
+            .ir      = ctx->ir,
+            .element = ctx->pending_element,
+        };
+        int status = directive_parse_attribute(&parse_ctx, suffix, suffix_len,
+                                               value, value_len, &error);
+
+        if (status == 0) {
+            return;
+        } else if (status < 0) {
+            if (error.message == NULL) {
+                error.message = "failed to parse directive attribute";
+            }
+            if (errno == ENOMEM) {
+                compile_raise(ctx, error.message, name, name_len);
+            }
+            compile_raise_directive_error(ctx, name, name_len, &error);
+        }
         compile_raise(
             ctx, "directive attributes are not supported by this compile stage",
             name, name_len);
@@ -331,14 +419,9 @@ static int compile_lua(lua_State *L)
 
 int luaopen_reflow_compile(lua_State *L)
 {
-    static const luaL_Reg functions[] = {
-        {"compile", compile_lua},
-        {NULL,      NULL       },
-    };
-
     reflow_error_require(L, "reflow.error");
     lua_pop(L, 1);
     ir_init_metatable(L);
-    luaL_newlib(L, functions);
+    lua_pushcfunction(L, compile_lua);
     return 1;
 }

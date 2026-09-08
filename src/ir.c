@@ -29,6 +29,7 @@
 #include "ir.h"
 #include "ir_internal.h"
 #include "pool.h"
+#include "value.h"
 
 typedef struct ir_new_ctx_t {
     ir_t *ir;
@@ -142,7 +143,7 @@ ir_t *ir_new(lua_State *L)
     }
 }
 
-static pool_t *ir_pool(ir_t *ir)
+pool_t *ir_pool(ir_t *ir)
 {
     ir_owner_internal_t *owner = (ir_owner_internal_t *)ir;
 
@@ -430,5 +431,42 @@ int ir_append_attr(ir_element_t *element, const char *name, size_t name_len,
     }
     list->tail = attr;
     list->count++;
+    return 0;
+}
+
+int ir_element_has_data(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->data_scopes != NULL;
+}
+
+int ir_set_data(ir_element_t *element, reflow_value_t *scopes)
+{
+    ir_node_private_t *node_state = NULL;
+    pool_t *pool                  = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT || scopes == NULL ||
+        scopes->type != REFLOW_VALUE_OBJECT) {
+        errno = EINVAL;
+        return -1;
+    }
+    node_state = node_private(&element->node);
+    if (node_state == NULL || node_state->owner == NULL ||
+        ir_element_has_data(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    pool = ir_pool(node_state->owner);
+    if (pool == NULL) {
+        return -1;
+    }
+    if (element->directives == NULL) {
+        element->directives = (ir_directives_t *)pool_calloc(
+            pool, 1, sizeof(*element->directives));
+        if (element->directives == NULL) {
+            return -1;
+        }
+    }
+    element->directives->data_scopes = scopes;
     return 0;
 }
