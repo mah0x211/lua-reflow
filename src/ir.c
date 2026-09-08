@@ -142,7 +142,7 @@ ir_t *ir_new(lua_State *L)
     }
 }
 
-static pool_t *ir_pool(ir_t *ir)
+pool_t *ir_pool(ir_t *ir)
 {
     ir_owner_internal_t *owner = (ir_owner_internal_t *)ir;
 

@@ -62,6 +62,7 @@ typedef struct ir_comment_internal_t {
 
 void ir_init_metatable(lua_State *L);
 ir_t *ir_new(lua_State *L);
+pool_t *ir_pool(ir_t *ir);
 int ir_set_source(ir_t *ir, const char *name, size_t name_len, const char *html,
                   size_t html_len);
 ir_node_t *ir_node_parent(const ir_node_t *node);
