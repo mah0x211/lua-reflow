@@ -28,6 +28,7 @@
 
 #include "ir.h"
 #include "pool.h"
+#include "value.h"
 
 typedef struct ir_node_private_t {
     ir_t *owner;
@@ -77,5 +78,7 @@ ir_comment_t *ir_new_comment(ir_t *ir, const char *text, size_t text_len);
 int ir_append_child(ir_node_t *parent, ir_node_t *child);
 int ir_append_attr(ir_element_t *element, const char *name, size_t name_len,
                    const char *value, size_t value_len);
+int ir_element_has_data(const ir_element_t *element);
+int ir_set_data(ir_element_t *element, reflow_value_t *scopes);
 
 #endif /* REFLOW_IR_INTERNAL_H */
