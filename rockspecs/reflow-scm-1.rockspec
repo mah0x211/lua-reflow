@@ -54,9 +54,15 @@ build = {
                 "src/ir.c",
                 "src/pool.c",
                 "src/reflow_util.c",
+                "src/directive_parse.c",
+                "src/json5.c",
+                "src/snippet.c",
+                "src/value.c",
+                "deps/yyjson/src/yyjson.c",
             },
             incdirs = {
                 "src",
+                "deps/yyjson/src",
                 "$(LEXBOR_INCDIR)",
             },
             libdirs = {

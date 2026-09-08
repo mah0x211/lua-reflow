@@ -96,6 +96,77 @@ function testcase.accepts_deep_html_without_a_fixed_limit()
     compile_ok('deep', html)
 end
 
+function testcase.compile_accepts_x_data_json5_values()
+    local cases = {
+        '<div x-data></div>',
+        [[<div x-data="scope: 'value'"></div>]],
+        [[<div x-data="scope: { key: 'value' }"></div>]],
+        [[<div x-data="scope: { key: 'value', }"></div>]],
+        '<div x-data="scope: 0x2a"></div>',
+        [[<div x-data="scope: /* comment */ 'value'"></div>]],
+        '<div x-data="scope: [1, 2,]"></div>',
+        '<div x-data="scope: null"></div>',
+        '<div x-data="scope: +.5"></div>',
+        '<div x-data="scope: -0"></div>',
+        '<div x-data="scope: NaN"></div>',
+        '<div x-data="scope: Infinity"></div>',
+    }
+
+    for i, html in ipairs(cases) do
+        compile_ok('x-data-json5-' .. i, html)
+    end
+end
+
+function testcase.compile_accepts_deep_x_data_without_c_recursion()
+    local depth = 2000
+    local html = '<div x-data="scope: ' .. string.rep('[', depth) .. '0' ..
+                     string.rep(']', depth) .. '"></div>'
+    compile_ok('deep-x-data', html)
+end
+
+function testcase.compile_rejects_duplicate_x_data()
+    local result, err = compile('duplicate-x-data',
+                                '<div x-data="scope: 1" x-data="scope: 2">' ..
+                                    '</div>',
+                                'x-', {})
+    assert.is_nil(result)
+    assert_compile_error(err, 'duplicate-x-data')
+    assert.equal(err.message.message, 'duplicate x-data on element')
+    assert.equal(err.meta.attribute, 'x-data')
+    assert.equal(err.meta.line, 1)
+    assert.equal(err.meta.column, 1)
+    assert.match(err.meta.snippet,
+                 '<div x-data="scope: 1" x-data="scope: 2">')
+    assert.equal(err.meta.element, '<div>')
+end
+
+function testcase.compile_rejects_invalid_x_data_with_source_context()
+    local html = table.concat({
+        '<main>',
+        '  <div x-data="scope: {"></div>',
+        '</main>',
+    }, '\n')
+    local result, err = compile('invalid-x-data', html, 'x-', {})
+    assert.is_nil(result)
+    assert_compile_error(err, 'invalid-x-data')
+    assert.equal(err.message.message, 'x-data: invalid JSON5')
+    assert.equal(err.meta.attribute, 'x-data')
+    assert.equal(err.meta.line, 2)
+    assert.equal(err.meta.column, 3)
+    assert.match(err.meta.snippet, '<div x-data="scope: {">')
+    assert.equal(err.meta.element, '<div>')
+    assert.rawequal(errorlib.typeof(errorlib.unwrap(err)),
+                    reflow_error.EREFLOW)
+end
+
+function testcase.compile_keeps_unimplemented_directives_rejected()
+    local result, err = compile('unimplemented', '<div x-with="scope"></div>',
+                                'x-', {})
+    assert.is_nil(result)
+    assert_compile_error(err, 'unimplemented')
+    assert.equal(err.meta.attribute, 'x-with')
+end
+
 function testcase.result_remains_owned_after_input_values_are_collected()
     local result
     do
@@ -194,5 +265,35 @@ function testcase.result_pool_oom_returns_no_ir_and_allows_a_later_compile()
     assert.is_true(ok)
     assert.is_true(failed)
     assert.is_true(typed)
+    assert.is_true(recovered)
+end
+
+function testcase.x_data_pool_oom_returns_no_ir_and_allows_a_later_compile()
+    local ok, failed, typed, attributed, recovered = run([[
+        local memlimit = require('memlimit')
+        local errorlib = require('error')
+        local errors = require('reflow.error')
+        local compile = require('reflow.compile')
+        local html = '<div x-data="scope: [' .. string.rep('null,', 8192) ..
+                         'null]"></div>'
+
+        collectgarbage('collect')
+        local used = memlimit.used()
+        memlimit.maxsize(math.max(used, memlimit.minsize()) + 1024 * 1024)
+        local result, err = compile('x-data-oom', html, 'x-', {})
+        memlimit.maxsize(0)
+        collectgarbage('collect')
+        collectgarbage('collect')
+
+        local retry = compile('x-data-retry', '<p>ok</p>', 'x-', {})
+        return result == nil, errorlib.typeof(err) == errors.ECOMPILE,
+               err.meta.attribute == 'x-data',
+               type(retry) == 'userdata' and
+                   getmetatable(retry) == 'reflow.ir'
+    ]])
+    assert.is_true(ok)
+    assert.is_true(failed)
+    assert.is_true(typed)
+    assert.is_true(attributed)
     assert.is_true(recovered)
 end
