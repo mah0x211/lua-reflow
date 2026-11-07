@@ -25,6 +25,44 @@ jobs:
       run: |
         luacheck .
 
+  static-checks:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/mah0x211/lua-ci:latest
+    steps:
+    -
+      name: Checkout
+      uses: actions/checkout@v2
+      with:
+        submodules: 'true'
+    -
+      name: Set Up LLVM
+      uses: ./.github/actions/setup-llvm
+    -
+      name: Install Dependencies
+      run: |
+        luarocks make --only-deps rockspecs/reflow-scm-1.rockspec
+    -
+      name: Check C Formatting
+      run: |
+        clang-format --version
+        clang-format --dry-run --Werror src/*.c src/*.h
+    -
+      name: Check Compiler Warnings and Static Analysis
+      run: |
+        INC=$(luarocks config variables.LUA_INCDIR)
+        ERRNO_INC="$(luarocks show --rock-dir errno)/conf"
+        ISYSTEM="-isystem $INC -isystem $ERRNO_INC -isystem deps/yyjson/src -isystem deps/lexbor/source"
+        clang --version
+        gcc --version
+        status=0
+        for src in src/*.c; do
+          gcc -std=c99 -fsyntax-only @config/gcc/warnings.rsp $ISYSTEM -Isrc "$src" || status=1
+          clang -std=c99 -fsyntax-only --config=config/clang/warnings.cfg $ISYSTEM -Isrc "$src" || status=1
+          clang --analyze -Xanalyzer -analyzer-werror -std=c99 $ISYSTEM -Isrc "$src" -o /dev/null || status=1
+        done
+        exit $status
+
   test:
     needs: luacheck
     permissions:
