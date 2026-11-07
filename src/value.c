@@ -114,7 +114,8 @@ reflow_value_t *reflow_value_new_string(ir_t *ir, const char *value,
     }
     result = new_value(ir, REFLOW_VALUE_STRING);
     if (result == NULL) {
-        (void)pool_free(pool, (void *)string.data);
+        /* The read contract exposes pool-owned mutable copies as const. */
+        (void)pool_free(pool, (void *)(uintptr_t)string.data);
         return NULL;
     }
     result->as.string = string;
@@ -186,7 +187,8 @@ int reflow_value_object_append(ir_t *ir, reflow_value_t *object,
     }
     member = (reflow_value_member_t *)pool_calloc(pool, 1, sizeof(*member));
     if (member == NULL) {
-        (void)pool_free(pool, (void *)key_copy.data);
+        /* The read contract exposes pool-owned mutable copies as const. */
+        (void)pool_free(pool, (void *)(uintptr_t)key_copy.data);
         return -1;
     }
     member->key   = key_copy;
