@@ -292,3 +292,291 @@ function testcase.x_data_pool_oom_returns_no_ir_and_allows_a_later_compile()
     assert.is_true(attributed)
     assert.is_true(recovered)
 end
+local function element(node, tag_name)
+    assert.equal(node.type, 'element')
+    assert.equal(node.tag_name, tag_name)
+    return node
+end
+
+-- Lua 5.3 and later keep the IR double as a float subtype, so numbers are
+-- compared by value instead of through a table comparison.
+local function assert_number_value(node, expected)
+    assert.equal(node.type, 'number')
+    assert.is_true(node.value == expected)
+end
+
+local function start_tag_range(html, start_tag, init)
+    local first, last = string.find(html, start_tag, init or 1, true)
+    assert.not_nil(first, start_tag)
+    return first - 1, last
+end
+
+function testcase.ir_to_table_maps_name_source_and_root()
+    local html = '<main>hello</main>'
+    local ir = compile_ok('page', html)
+    local tree = ir:to_table()
+
+    assert.equal(tree.name, 'page')
+    assert.equal(tree.html, html)
+    assert.equal(tree.root.type, 'root')
+    assert.equal(#tree.root.children, 1)
+    local main = element(tree.root.children[1], 'main')
+    assert.equal(main.source_start, 0)
+    assert.equal(main.source_end, 6)
+    assert.equal(#main.attrs, 0)
+    assert.is_nil(main.directives)
+    assert.equal(#main.children, 1)
+    assert.equal(main.children[1].type, 'text')
+    assert.equal(main.children[1].text, 'hello')
+end
+
+function testcase.ir_to_table_returns_a_new_table_without_changing_the_ir()
+    local ir = compile_ok('page', '<main id="a">hello</main>')
+    local first = ir:to_table()
+    local second = ir:to_table()
+
+    assert.not_rawequal(first, second)
+    assert.not_rawequal(first.root, second.root)
+    assert.equal(first, second)
+
+    first.root.children[1].tag_name = 'changed'
+    assert.equal(ir:to_table(), second)
+end
+
+function testcase.ir_to_table_rejects_values_other_than_reflow_ir()
+    local ir = compile_ok('page', '<p>ok</p>')
+    local to_table = ir.to_table
+
+    assert.equal(type(to_table), 'function')
+    for _, value in ipairs({
+        false,
+        1,
+        'reflow.ir',
+        {},
+        newproxy and newproxy() or io.stdout,
+    }) do
+        local ok = pcall(to_table, value)
+        assert.is_false(ok)
+    end
+    assert.equal(getmetatable(ir), 'reflow.ir')
+end
+
+function testcase.ir_keeps_attribute_order_duplicates_and_empty_values()
+    local html = '<DIV ID="first" id=second disabled data-x="">body</DIV>'
+    local tree = compile_ok('attrs', html):to_table()
+    local div = element(tree.root.children[1], 'div')
+    local start, stop = start_tag_range(html,
+                                        '<DIV ID="first" id=second disabled data-x="">')
+
+    assert.equal(div.source_start, start)
+    assert.equal(div.source_end, stop)
+    assert.equal(div.attrs, {
+        {
+            name = 'id',
+            value = 'first',
+        },
+        {
+            name = 'id',
+            value = 'second',
+        },
+        {
+            name = 'disabled',
+            value = '',
+        },
+        {
+            name = 'data-x',
+            value = '',
+        },
+    })
+end
+
+function testcase.ir_keeps_node_order_text_comments_and_byte_ranges()
+    local html =
+        '<main><!-- note --><p>日本語🙂</p>a &amp; b<br>tail</main>'
+    local tree = compile_ok('nodes', html):to_table()
+    local main = element(tree.root.children[1], 'main')
+    local p_start, p_stop = start_tag_range(html, '<p>')
+    local br_start, br_stop = start_tag_range(html, '<br>')
+
+    assert.equal(main.source_start, 0)
+    assert.equal(main.source_end, 6)
+    assert.equal(#main.children, 5)
+    assert.equal(main.children[1], {
+        type = 'comment',
+        text = ' note ',
+    })
+    local p = element(main.children[2], 'p')
+    assert.equal(p.source_start, p_start)
+    assert.equal(p.source_end, p_stop)
+    assert.equal(p.children, {
+        {
+            type = 'text',
+            text = '日本語🙂',
+        },
+    })
+    assert.equal(main.children[3], {
+        type = 'text',
+        text = 'a &amp; b',
+    })
+    local br = element(main.children[4], 'br')
+    assert.equal(br.source_start, br_start)
+    assert.equal(br.source_end, br_stop)
+    assert.equal(#br.children, 0)
+    assert.equal(main.children[5], {
+        type = 'text',
+        text = 'tail',
+    })
+end
+
+function testcase.ir_keeps_lenient_closing_and_raw_text_structure()
+    local tree = compile_ok('lenient',
+                            '<main><p>implicitly closed</main></orphan>' ..
+                                '<section>kept'):to_table()
+    assert.equal(#tree.root.children, 2)
+    local main = element(tree.root.children[1], 'main')
+    local p = element(main.children[1], 'p')
+    assert.equal(p.children[1].text, 'implicitly closed')
+    local section = element(tree.root.children[2], 'section')
+    assert.equal(section.children[1].text, 'kept')
+
+    local script = '<script>const html = "<div x-unknown>";</script>'
+    tree = compile_ok('raw-text', script):to_table()
+    local node = element(tree.root.children[1], 'script')
+    assert.equal(node.children, {
+        {
+            type = 'text',
+            text = 'const html = "<div x-unknown>";',
+        },
+    })
+
+    tree = compile_ok('nul', '<p>a\0b</p>'):to_table()
+    assert.equal(tree.root.children[1].children, {
+        {
+            type = 'text',
+            text = 'a\0b',
+        },
+    })
+
+    tree = compile_ok('empty', ''):to_table()
+    assert.equal(tree.root.children, {})
+end
+
+function testcase.ir_maps_x_data_values_with_types_order_and_duplicates()
+    local html =
+        '<div x-data="a: \'v\', b: { k: [1, true, null] }, a: -1.5, ' ..
+            'n: NaN, e: {}, l: []" id="d"></div>'
+    local tree = compile_ok('x-data', html):to_table()
+    local div = element(tree.root.children[1], 'div')
+    local data = div.directives.data
+
+    assert.equal(div.attrs, {
+        {
+            name = 'id',
+            value = 'd',
+        },
+    })
+    assert.equal(data.type, 'object')
+    assert.equal(#data.members, 6)
+    assert.equal(data.members[1], {
+        key = 'a',
+        value = {
+            type = 'string',
+            value = 'v',
+        },
+    })
+    assert.equal(data.members[2].key, 'b')
+    local object = data.members[2].value
+    assert.equal(object.type, 'object')
+    assert.equal(#object.members, 1)
+    assert.equal(object.members[1].key, 'k')
+    local array = object.members[1].value
+    assert.equal(array.type, 'array')
+    assert.equal(#array.items, 3)
+    assert_number_value(array.items[1], 1)
+    assert.equal(array.items[2], {
+        type = 'boolean',
+        value = true,
+    })
+    assert.equal(array.items[3], {
+        type = 'null',
+    })
+    assert.equal(data.members[3], {
+        key = 'a',
+        value = {
+            type = 'number',
+            value = -1.5,
+        },
+    })
+    local nan = data.members[4].value.value
+    assert.equal(data.members[4].key, 'n')
+    assert.is_true(nan ~= nan)
+    assert.equal(data.members[5], {
+        key = 'e',
+        value = {
+            type = 'object',
+            members = {},
+        },
+    })
+    assert.equal(data.members[6], {
+        key = 'l',
+        value = {
+            type = 'array',
+            items = {},
+        },
+    })
+
+    tree = compile_ok('empty-x-data', '<div x-data></div>'):to_table()
+    assert.equal(tree.root.children[1].directives.data, {
+        type = 'object',
+        members = {},
+    })
+end
+
+function testcase.ir_to_table_converts_deep_and_wide_trees_without_c_recursion()
+    local depth = 2000
+    local tree = compile_ok('deep', string.rep('<i>', depth) .. 'leaf' ..
+                                string.rep('</i>', depth)):to_table()
+    local node = tree.root
+    for _ = 1, depth do
+        assert.equal(#node.children, 1)
+        node = element(node.children[1], 'i')
+    end
+    assert.equal(node.children[1].text, 'leaf')
+
+    tree = compile_ok('deep-x-data',
+                      '<div x-data="v: ' .. string.rep('[', depth) .. '0' ..
+                          string.rep(']', depth) .. '"></div>'):to_table()
+    local value = tree.root.children[1].directives.data.members[1].value
+    for _ = 1, depth do
+        assert.equal(value.type, 'array')
+        assert.equal(#value.items, 1)
+        value = value.items[1]
+    end
+    assert_number_value(value, 0)
+
+    local count = 5000
+    tree = compile_ok('wide', string.rep('<b></b>', count)):to_table()
+    assert.equal(#tree.root.children, count)
+    assert.equal(tree.root.children[count].source_start, (count - 1) * 7)
+end
+
+function testcase.ir_to_table_reads_owned_source_after_inputs_are_collected()
+    local ir
+    do
+        ir = compile_ok(table.concat({
+            'owned',
+            '-name',
+        }), table.concat({
+            '<article>',
+            'owned html',
+            '</article>',
+        }))
+    end
+    collectgarbage('collect')
+    collectgarbage('collect')
+    local tree = ir:to_table()
+    assert.equal(tree.name, 'owned-name')
+    assert.equal(tree.html, '<article>owned html</article>')
+    assert.equal(element(tree.root.children[1], 'article').children[1].text,
+                 'owned html')
+end
