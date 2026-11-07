@@ -33,6 +33,7 @@
 #include "html.h"
 #include "ir.h"
 #include "ir_internal.h"
+#include "ir_lua.h"
 #include "snippet.h"
 
 #define COMPILE_OPERATION "reflow.compile"
@@ -426,6 +427,7 @@ LUALIB_API int luaopen_reflow_compile(lua_State *L)
     reflow_error_require(L, "reflow.error");
     lua_pop(L, 1);
     ir_init_metatable(L);
+    ir_lua_init(L);
     lua_pushcfunction(L, compile_lua);
     return 1;
 }

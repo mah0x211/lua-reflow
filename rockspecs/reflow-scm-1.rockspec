@@ -52,6 +52,7 @@ build = {
                 "src/compile.c",
                 "src/html_lexbor.c",
                 "src/ir.c",
+                "src/ir_lua.c",
                 "src/pool.c",
                 "src/reflow_util.c",
                 "src/directive_parse.c",
