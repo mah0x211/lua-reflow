@@ -420,10 +420,10 @@ static lxb_html_token_t *html_open_element(lxb_html_tokenizer_t *tokenizer,
                                            reflow_html_parse_ctx_t *ctx,
                                            const char *name, size_t name_len)
 {
-    const lxb_html_token_attr_t *attr = NULL;
-    size_t source_start               = 0;
-    size_t source_end                 = 0;
-    int is_void_element               = lxb_html_tag_is_void(token->tag_id);
+    lxb_html_token_attr_t *attr = NULL;
+    size_t source_start         = 0;
+    size_t source_end           = 0;
+    int is_void_element         = lxb_html_tag_is_void(token->tag_id);
 
     if (!html_start_tag_range(ctx, token, &source_start, &source_end)) {
         return html_abort(tokenizer, LXB_STATUS_ERROR);
@@ -437,8 +437,7 @@ static lxb_html_token_t *html_open_element(lxb_html_tokenizer_t *tokenizer,
         size_t attr_name_len        = 0;
         size_t value_len            = 0;
 
-        attr_name = lxb_html_token_attr_name((lxb_html_token_attr_t *)attr,
-                                             &attr_name_len);
+        attr_name = lxb_html_token_attr_name(attr, &attr_name_len);
         if (attr_name == NULL) {
             return html_abort(tokenizer, LXB_STATUS_ERROR);
         }

@@ -188,7 +188,8 @@ static void release_string(ir_t *ir, ir_string_t *value)
     int errnum = errno;
 
     if (ir_pool(ir) != NULL && value != NULL && value->data != NULL) {
-        pool_free(ir_pool(ir), (void *)value->data);
+        /* The read contract exposes pool-owned mutable copies as const. */
+        pool_free(ir_pool(ir), (void *)(uintptr_t)value->data);
         *value = (ir_string_t){0};
     }
     errno = errnum;
@@ -219,14 +220,15 @@ static ir_node_private_t *node_private(ir_node_t *node)
         return &((ir_text_internal_t *)node)->private;
     case IR_COMMENT:
         return &((ir_comment_internal_t *)node)->private;
+    case IR_CHAIN:
     default:
         return NULL;
     }
 }
 
-ir_node_t *ir_node_parent(const ir_node_t *node)
+ir_node_t *ir_node_parent(ir_node_t *node)
 {
-    ir_node_private_t *private = node_private((ir_node_t *)node);
+    ir_node_private_t *private = node_private(node);
 
     if (private == NULL) {
         errno = EINVAL;

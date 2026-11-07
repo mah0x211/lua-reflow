@@ -1,0 +1,39 @@
+name: Set up LLVM 23
+description: Install matching Clang and clang-format from apt.llvm.org on Debian or Ubuntu.
+runs:
+  using: composite
+  steps:
+    - name: Install LLVM
+      shell: sh
+      run: |
+        set -eu
+        if [ "$(id -u)" -eq 0 ]; then
+          as_root=''
+        else
+          as_root='sudo'
+        fi
+        . /etc/os-release
+        codename="${VERSION_CODENAME:?missing VERSION_CODENAME in /etc/os-release}"
+        export DEBIAN_FRONTEND=noninteractive
+        $as_root apt-get update -qq
+        $as_root apt-get install -y -qq ca-certificates curl gnupg
+        curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$RUNNER_TEMP/llvm.asc"
+        $as_root install -m 644 "$RUNNER_TEMP/llvm.asc" /usr/share/keyrings/apt.llvm.org.asc
+        echo "deb [signed-by=/usr/share/keyrings/apt.llvm.org.asc] https://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-23 main" |
+          $as_root tee /etc/apt/sources.list.d/llvm-23.list >/dev/null
+        $as_root apt-get update -qq
+        $as_root apt-get install -y -qq clang-23 clang-format-23
+        echo /usr/lib/llvm-23/bin >> "$GITHUB_PATH"
+
+    - name: Check LLVM tools
+      shell: sh
+      run: |
+        set -eu
+        for tool in clang clang-format; do
+          version=$("$tool" --version)
+          printf '%s\n' "$version"
+          case "$version" in
+            *"version 23."*) ;;
+            *) echo "Expected LLVM 23: $tool" >&2; exit 1 ;;
+          esac
+        done

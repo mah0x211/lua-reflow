@@ -210,6 +210,7 @@ static void on_attribute(void *data, const char *name, size_t name_len,
     if (ctx->pending_element == NULL) {
         compile_raise(ctx, "received an HTML attribute without a start tag",
                       NULL, 0);
+        return;
     }
     if (name_len >= ctx->prefix_len &&
         memcmp(name, ctx->prefix, ctx->prefix_len) == 0) {
@@ -252,6 +253,7 @@ static void on_start_tag_end(void *data, int is_void_element)
 
     if (element == NULL) {
         compile_raise(ctx, "received an incomplete HTML start tag", NULL, 0);
+        return;
     }
     if (ir_append_child(ctx->current_parent, &element->node) != 0) {
         compile_raise_ir_error(ctx);
@@ -270,10 +272,12 @@ static void on_element_end(void *data)
     if (ctx->current_parent == NULL ||
         ctx->current_parent->type != IR_ELEMENT) {
         compile_raise(ctx, "received an unmatched HTML element end", NULL, 0);
+        return;
     }
     parent = ir_node_parent(ctx->current_parent);
     if (parent == NULL) {
         compile_raise(ctx, "lost the parent of an HTML element", NULL, 0);
+        return;
     }
     ctx->current_parent = parent;
 }
@@ -417,7 +421,7 @@ static int compile_lua(lua_State *L)
     return 1;
 }
 
-int luaopen_reflow_compile(lua_State *L)
+LUALIB_API int luaopen_reflow_compile(lua_State *L)
 {
     reflow_error_require(L, "reflow.error");
     lua_pop(L, 1);
