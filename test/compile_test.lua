@@ -85,14 +85,12 @@ function testcase.accepts_many_attributes_without_a_fixed_limit()
     for i = 1, 160 do
         attrs[i] = ' DATA-VALUE="' .. i .. '"'
     end
-    compile_ok('attributes', '<div' .. table.concat(attrs) .. '>ok</div>',
-               'x-')
+    compile_ok('attributes', '<div' .. table.concat(attrs) .. '>ok</div>', 'x-')
 end
 
 function testcase.accepts_deep_html_without_a_fixed_limit()
     local depth = 2000
-    local html = string.rep('<i>', depth) .. 'leaf' ..
-                     string.rep('</i>', depth)
+    local html = string.rep('<i>', depth) .. 'leaf' .. string.rep('</i>', depth)
     compile_ok('deep', html)
 end
 
@@ -127,16 +125,14 @@ end
 function testcase.compile_rejects_duplicate_x_data()
     local result, err = compile('duplicate-x-data',
                                 '<div x-data="scope: 1" x-data="scope: 2">' ..
-                                    '</div>',
-                                'x-', {})
+                                    '</div>', 'x-', {})
     assert.is_nil(result)
     assert_compile_error(err, 'duplicate-x-data')
     assert.equal(err.message.message, 'duplicate x-data on element')
     assert.equal(err.meta.attribute, 'x-data')
     assert.equal(err.meta.line, 1)
     assert.equal(err.meta.column, 1)
-    assert.match(err.meta.snippet,
-                 '<div x-data="scope: 1" x-data="scope: 2">')
+    assert.match(err.meta.snippet, '<div x-data="scope: 1" x-data="scope: 2">')
     assert.equal(err.meta.element, '<div>')
 end
 
@@ -155,8 +151,7 @@ function testcase.compile_rejects_invalid_x_data_with_source_context()
     assert.equal(err.meta.column, 3)
     assert.match(err.meta.snippet, '<div x-data="scope: {">')
     assert.equal(err.meta.element, '<div>')
-    assert.rawequal(errorlib.typeof(errorlib.unwrap(err)),
-                    reflow_error.EREFLOW)
+    assert.rawequal(errorlib.typeof(errorlib.unwrap(err)), reflow_error.EREFLOW)
 end
 
 function testcase.compile_keeps_unimplemented_directives_rejected()
@@ -219,8 +214,8 @@ function testcase.rejects_invalid_input_contract_with_compile_errors()
 end
 
 function testcase.rejects_configured_prefix_attributes_without_downgrading()
-    local result, err = compile('page', '<div X-UNKNOWN="value"></div>',
-                                'x-', {})
+    local result, err = compile('page', '<div X-UNKNOWN="value"></div>', 'x-',
+                                {})
     assert.is_nil(result)
     assert_compile_error(err, 'page')
     assert.equal(err.meta.attribute, 'x-unknown')
