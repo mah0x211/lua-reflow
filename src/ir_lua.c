@@ -27,6 +27,7 @@
 #include <lauxlib.h>
 #include <lua.h>
 
+#include "expr.h"
 #include "ir.h"
 #include "ir_lua.h"
 #include "value.h"
@@ -236,6 +237,278 @@ static void push_value(lua_State *L, const reflow_value_t *root)
     lua_settop(L, frames_idx);
 }
 
+typedef struct ir_lua_expr_task_t {
+    const reflow_expr_t *node;
+    size_t parent;
+    const char *field;
+    size_t index;
+} ir_lua_expr_task_t;
+
+static const char *expr_type_name(reflow_expr_type_t type)
+{
+    switch (type) {
+    case REFLOW_EXPR_LITERAL:
+        return "literal";
+    case REFLOW_EXPR_DOLLAR:
+        return "dollar";
+    case REFLOW_EXPR_AT:
+        return "at";
+    case REFLOW_EXPR_DOT:
+        return "dot";
+    case REFLOW_EXPR_MEMBER:
+        return "member";
+    case REFLOW_EXPR_UNARY:
+        return "unary";
+    case REFLOW_EXPR_BINARY:
+        return "binary";
+    case REFLOW_EXPR_TERNARY:
+        return "ternary";
+    case REFLOW_EXPR_CALL:
+        return "call";
+    case REFLOW_EXPR_OBJECT:
+        return "object";
+    case REFLOW_EXPR_ARRAY:
+        return "array";
+    }
+    return "unknown";
+}
+
+static const char *expr_operator_name(reflow_expr_operator_t op)
+{
+    switch (op) {
+    case REFLOW_EXPR_NOT:
+        return "!";
+    case REFLOW_EXPR_EQ:
+        return "==";
+    case REFLOW_EXPR_NE:
+        return "!=";
+    case REFLOW_EXPR_LE:
+        return "<=";
+    case REFLOW_EXPR_GE:
+        return ">=";
+    case REFLOW_EXPR_LT:
+        return "<";
+    case REFLOW_EXPR_GT:
+        return ">";
+    case REFLOW_EXPR_AND:
+        return "&&";
+    case REFLOW_EXPR_OR:
+        return "||";
+    case REFLOW_EXPR_COALESCE:
+        return "??";
+    }
+    return "unknown";
+}
+
+static void set_literal_fields(lua_State *L, const reflow_value_t *value)
+{
+    switch (value->type) {
+    case REFLOW_VALUE_NULL:
+    case REFLOW_VALUE_UNDEFINED:
+        lua_pushstring(L,
+                       value->type == REFLOW_VALUE_NULL ? "null" : "undefined");
+        lua_setfield(L, -2, "literal_type");
+        return;
+    case REFLOW_VALUE_BOOL:
+        lua_pushliteral(L, "boolean");
+        lua_setfield(L, -2, "literal_type");
+        lua_pushboolean(L, value->as.boolean);
+        lua_setfield(L, -2, "value");
+        return;
+    case REFLOW_VALUE_NUMBER:
+        lua_pushliteral(L, "number");
+        lua_setfield(L, -2, "literal_type");
+        lua_pushnumber(L, (lua_Number)value->as.number);
+        lua_setfield(L, -2, "value");
+        return;
+    case REFLOW_VALUE_STRING:
+        lua_pushliteral(L, "string");
+        lua_setfield(L, -2, "literal_type");
+        set_string_field(L, "value", value->as.string.data,
+                         value->as.string.len);
+        return;
+    case REFLOW_VALUE_ARRAY:
+    case REFLOW_VALUE_OBJECT:
+        break;
+    }
+    (void)luaL_error(L, "unsupported expression literal type");
+}
+
+/* Store the value at the stack top into the table that the work table keeps
+ * under parent, either as a named field or at an array index. */
+static void store_child(lua_State *L, int work_idx,
+                        const ir_lua_expr_task_t *task)
+{
+    lua_rawgeti(L, work_idx, checked_index(L, task->parent));
+    lua_insert(L, -2);
+    if (task->field != NULL) {
+        lua_setfield(L, -2, task->field);
+    } else {
+        lua_rawseti(L, -2, checked_index(L, task->index));
+    }
+    lua_pop(L, 1);
+}
+
+typedef struct ir_lua_expr_walk_t {
+    lua_State *L;
+    int tasks_idx;
+    int work_idx;
+    ir_lua_expr_task_t *tasks;
+    size_t depth;
+    size_t capacity;
+    size_t tables;
+} ir_lua_expr_walk_t;
+
+static void push_task(ir_lua_expr_walk_t *walk, const reflow_expr_t *node,
+                      size_t parent, const char *field, size_t index)
+{
+    if (walk->depth == walk->capacity) {
+        walk->tasks = (ir_lua_expr_task_t *)grow_frames(
+            walk->L, walk->tasks_idx, walk->tasks, &walk->capacity,
+            sizeof(*walk->tasks));
+    }
+    walk->tasks[walk->depth++] = (ir_lua_expr_task_t){
+        .node   = node,
+        .parent = parent,
+        .field  = field,
+        .index  = index,
+    };
+}
+
+/* Keep the table at the stack top in the work table and return its key. */
+static size_t keep_table(ir_lua_expr_walk_t *walk)
+{
+    lua_pushvalue(walk->L, -1);
+    lua_rawseti(walk->L, walk->work_idx,
+                checked_index(walk->L, ++walk->tables));
+    return walk->tables;
+}
+
+/* Create a list table under field of the table at the stack top, schedule
+ * the listed nodes into it, and leave the stack unchanged. */
+static void push_list_tasks(ir_lua_expr_walk_t *walk, const char *field,
+                            const reflow_expr_list_t *list)
+{
+    lua_State *L              = walk->L;
+    const reflow_expr_t *item = NULL;
+    size_t id                 = 0;
+    size_t index              = 0;
+
+    lua_createtable(L, table_size_hint(list->count), 0);
+    id = keep_table(walk);
+    lua_setfield(L, -2, field);
+    for (item = list->head; item != NULL; item = item->next) {
+        push_task(walk, item, id, NULL, ++index);
+    }
+}
+
+/* Push the table for an expression: { source = ..., root = <node> }. Nodes
+ * are created from an explicit task stack, so deep expressions do not grow
+ * the C stack. */
+static void push_expression(lua_State *L, const reflow_expression_t *expression)
+{
+    ir_lua_expr_walk_t walk = {
+        .L        = L,
+        .capacity = IR_LUA_INITIAL_FRAMES,
+    };
+    int result_idx = 0;
+
+    luaL_checkstack(L, 12, "converting an expression");
+    lua_createtable(L, 0, 2);
+    result_idx = lua_gettop(L);
+    set_string_field(L, "source", expression->source.data,
+                     expression->source.len);
+    walk.tasks = (ir_lua_expr_task_t *)lua_newuserdata(
+        L, walk.capacity * sizeof(*walk.tasks));
+    walk.tasks_idx = lua_gettop(L);
+    lua_newtable(L);
+    walk.work_idx = lua_gettop(L);
+    lua_pushvalue(L, result_idx);
+    (void)keep_table(&walk);
+    lua_pop(L, 1);
+    push_task(&walk, expression->root, 1, "root", 0);
+
+    while (walk.depth > 0) {
+        ir_lua_expr_task_t task                 = walk.tasks[--walk.depth];
+        const reflow_expr_t *node               = task.node;
+        const reflow_expr_object_entry_t *entry = NULL;
+        size_t id                               = 0;
+        size_t index                            = 0;
+
+        lua_createtable(L, 0, 8);
+        lua_pushstring(L, expr_type_name(node->type));
+        lua_setfield(L, -2, "type");
+        set_size_field(L, "offset", node->offset);
+        set_size_field(L, "length", node->length);
+        set_string_field(L, "source", expression->source.data + node->offset,
+                         node->length);
+        switch (node->type) {
+        case REFLOW_EXPR_LITERAL:
+            set_literal_fields(L, node->as.literal);
+            break;
+        case REFLOW_EXPR_DOLLAR:
+            break;
+        case REFLOW_EXPR_AT:
+        case REFLOW_EXPR_DOT:
+            set_string_field(L, "name", node->as.scope.name.data,
+                             node->as.scope.name.len);
+            break;
+        case REFLOW_EXPR_MEMBER:
+            set_string_field(L, "property", node->as.member.property.data,
+                             node->as.member.property.len);
+            lua_pushboolean(L, node->as.member.optional);
+            lua_setfield(L, -2, "optional");
+            id = keep_table(&walk);
+            push_task(&walk, node->as.member.object, id, "object", 0);
+            break;
+        case REFLOW_EXPR_UNARY:
+            lua_pushstring(L, expr_operator_name(node->as.unary.op));
+            lua_setfield(L, -2, "op");
+            id = keep_table(&walk);
+            push_task(&walk, node->as.unary.argument, id, "argument", 0);
+            break;
+        case REFLOW_EXPR_BINARY:
+            lua_pushstring(L, expr_operator_name(node->as.binary.op));
+            lua_setfield(L, -2, "op");
+            id = keep_table(&walk);
+            push_task(&walk, node->as.binary.left, id, "left", 0);
+            push_task(&walk, node->as.binary.right, id, "right", 0);
+            break;
+        case REFLOW_EXPR_TERNARY:
+            id = keep_table(&walk);
+            push_task(&walk, node->as.ternary.test, id, "test", 0);
+            push_task(&walk, node->as.ternary.consequent, id, "consequent", 0);
+            push_task(&walk, node->as.ternary.alternate, id, "alternate", 0);
+            break;
+        case REFLOW_EXPR_CALL:
+            set_string_field(L, "callee", node->as.call.callee.data,
+                             node->as.call.callee.len);
+            push_list_tasks(&walk, "arguments", &node->as.call.arguments);
+            break;
+        case REFLOW_EXPR_OBJECT:
+            lua_createtable(L, table_size_hint(node->as.object.count), 0);
+            for (entry = node->as.object.head; entry != NULL;
+                 entry = entry->next) {
+                lua_createtable(L, 0, 3);
+                lua_pushboolean(L, entry->computed);
+                lua_setfield(L, -2, "computed");
+                id = keep_table(&walk);
+                lua_rawseti(L, -2, checked_index(L, ++index));
+                push_task(&walk, entry->key, id, "key", 0);
+                push_task(&walk, entry->value, id, "value", 0);
+            }
+            lua_setfield(L, -2, "entries");
+            break;
+        case REFLOW_EXPR_ARRAY:
+            push_list_tasks(&walk, "items", &node->as.array);
+            break;
+        }
+        store_child(L, walk.work_idx, &task);
+    }
+
+    lua_settop(L, result_idx);
+}
+
 static void push_attrs(lua_State *L, const ir_attr_list_t *attrs)
 {
     const ir_attr_t *attr = NULL;
@@ -272,6 +545,10 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
             if (element->directives->data_scopes != NULL) {
                 push_value(L, element->directives->data_scopes);
                 lua_setfield(L, -2, "data");
+            }
+            if (element->directives->text != NULL) {
+                push_expression(L, element->directives->text);
+                lua_setfield(L, -2, "text");
             }
             lua_setfield(L, -2, "directives");
         }

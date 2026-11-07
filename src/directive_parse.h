@@ -28,16 +28,30 @@
 
 #include "ir.h"
 
+/* When message_pushed is non-zero, message points to a Lua string that the
+ * parser left at the top of the stack; the caller owns that stack slot. */
 typedef struct directive_parse_error_t {
     const char *message;
     const char *cause;
     size_t position;
+    int message_pushed;
 } directive_parse_error_t;
+
+/* Helper names registered for the compilation. The strings are borrowed from
+ * the caller and must outlive the compilation. */
+typedef struct directive_helper_name_t {
+    const char *name;
+    size_t len;
+} directive_helper_name_t;
 
 typedef struct directive_parse_ctx_t {
     lua_State *L;
     ir_t *ir;
     ir_element_t *element;
+    const char *attribute;
+    size_t attribute_len;
+    const directive_helper_name_t *helpers;
+    size_t helper_count;
 } directive_parse_ctx_t;
 
 /**

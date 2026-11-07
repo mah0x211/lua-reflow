@@ -442,33 +442,65 @@ int ir_element_has_data(const ir_element_t *element)
            element->directives->data_scopes != NULL;
 }
 
-int ir_set_data(ir_element_t *element, reflow_value_t *scopes)
+/* Return the directive slots of an element owned by an IR, allocating them
+ * from the result pool on first use. */
+static ir_directives_t *element_directives(ir_element_t *element)
 {
-    ir_node_private_t *node_state = NULL;
+    ir_node_private_t *node_state = node_private(&element->node);
     pool_t *pool                  = NULL;
 
-    if (element == NULL || element->node.type != IR_ELEMENT || scopes == NULL ||
-        scopes->type != REFLOW_VALUE_OBJECT) {
+    if (node_state == NULL || node_state->owner == NULL) {
         errno = EINVAL;
-        return -1;
-    }
-    node_state = node_private(&element->node);
-    if (node_state == NULL || node_state->owner == NULL ||
-        ir_element_has_data(element)) {
-        errno = EINVAL;
-        return -1;
+        return NULL;
     }
     pool = ir_pool(node_state->owner);
     if (pool == NULL) {
-        return -1;
+        return NULL;
     }
     if (element->directives == NULL) {
         element->directives = (ir_directives_t *)pool_calloc(
             pool, 1, sizeof(*element->directives));
-        if (element->directives == NULL) {
-            return -1;
-        }
     }
-    element->directives->data_scopes = scopes;
+    return element->directives;
+}
+
+int ir_set_data(ir_element_t *element, reflow_value_t *scopes)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT || scopes == NULL ||
+        scopes->type != REFLOW_VALUE_OBJECT || ir_element_has_data(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->data_scopes = scopes;
+    return 0;
+}
+
+int ir_element_has_text(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->text != NULL;
+}
+
+int ir_set_text(ir_element_t *element,
+                const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || ir_element_has_text(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->text = expression;
     return 0;
 }

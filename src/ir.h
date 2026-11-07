@@ -35,6 +35,7 @@ typedef struct ir_attr_t ir_attr_t;
 typedef struct ir_branch_t ir_branch_t;
 typedef struct ir_directives_t ir_directives_t;
 struct reflow_value_t;
+struct reflow_expression_t;
 
 typedef enum ir_node_type_t {
     IR_ROOT = 1,
@@ -106,6 +107,7 @@ typedef struct ir_comment_t {
 
 struct ir_directives_t {
     const struct reflow_value_t *data_scopes;
+    const struct reflow_expression_t *text;
 };
 
 struct ir_attr_t {
