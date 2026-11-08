@@ -34,6 +34,7 @@ typedef struct ir_node_t ir_node_t;
 typedef struct ir_attr_t ir_attr_t;
 typedef struct ir_branch_t ir_branch_t;
 typedef struct ir_directives_t ir_directives_t;
+typedef struct ir_bind_t ir_bind_t;
 struct reflow_value_t;
 struct reflow_expression_t;
 
@@ -61,6 +62,12 @@ typedef struct ir_attr_list_t {
     ir_attr_t *tail;
     size_t count;
 } ir_attr_list_t;
+
+typedef struct ir_bind_list_t {
+    ir_bind_t *head;
+    ir_bind_t *tail;
+    size_t count;
+} ir_bind_list_t;
 
 typedef struct ir_branch_list_t {
     ir_branch_t *head;
@@ -110,6 +117,14 @@ struct ir_directives_t {
     const struct reflow_expression_t *text;
     const struct reflow_expression_t *html;
     const struct reflow_expression_t *include;
+    ir_bind_list_t bind;
+};
+
+/* One x-bind:<name> directive, kept in source order. */
+struct ir_bind_t {
+    ir_bind_t *next;
+    ir_string_t name;
+    const struct reflow_expression_t *expression;
 };
 
 struct ir_attr_t {

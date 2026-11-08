@@ -552,3 +552,66 @@ int ir_set_include(ir_element_t *element,
     directives->include = expression;
     return 0;
 }
+
+int ir_element_has_bind(const ir_element_t *element, const char *name,
+                        size_t name_len)
+{
+    const ir_bind_t *bind = NULL;
+
+    if (element == NULL || element->directives == NULL) {
+        return 0;
+    }
+    for (bind = element->directives->bind.head; bind != NULL;
+         bind = bind->next) {
+        if (bind->name.len == name_len &&
+            (name_len == 0 || memcmp(bind->name.data, name, name_len) == 0)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int ir_append_bind(ir_element_t *element, const char *name, size_t name_len,
+                   const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+    ir_t *ir                    = NULL;
+    ir_string_t name_copy       = {0};
+    ir_bind_t *bind             = NULL;
+    ir_bind_list_t *list        = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || name_len == 0 ||
+        ir_element_has_bind(element, name, name_len)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    list = &directives->bind;
+    if (list->count == SIZE_MAX) {
+        errno = ENOMEM;
+        return -1;
+    }
+    ir = node_private(&element->node)->owner;
+    if (copy_string(ir, name, name_len, &name_copy) != 0) {
+        return -1;
+    }
+    bind = (ir_bind_t *)pool_calloc(ir_pool(ir), 1, sizeof(*bind));
+    if (bind == NULL) {
+        release_string(ir, &name_copy);
+        return -1;
+    }
+    bind->name       = name_copy;
+    bind->expression = expression;
+    if (list->tail == NULL) {
+        list->head = bind;
+    } else {
+        list->tail->next = bind;
+    }
+    list->tail = bind;
+    list->count++;
+    return 0;
+}
