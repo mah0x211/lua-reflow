@@ -412,6 +412,13 @@ static const expression_directive_t HTML_DIRECTIVE = {
     .set               = ir_set_html,
 };
 
+static const expression_directive_t INCLUDE_DIRECTIVE = {
+    .duplicate_message = "duplicate x-include on element",
+    .oom_message       = "out of memory while parsing x-include",
+    .has               = ir_element_has_include,
+    .set               = ir_set_include,
+};
+
 static int parse_expression_directive(const directive_parse_ctx_t *ctx,
                                       const expression_directive_t *directive,
                                       const char *source, size_t source_len,
@@ -497,6 +504,16 @@ static int parse_html(const directive_parse_ctx_t *ctx, const char *suffix,
                                       error);
 }
 
+static int parse_include(const directive_parse_ctx_t *ctx, const char *suffix,
+                         size_t suffix_len, const char *source,
+                         size_t source_len, directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_expression_directive(ctx, &INCLUDE_DIRECTIVE, source,
+                                      source_len, error);
+}
+
 static const directive_parser_t parsers[] = {
     {
      .name     = "data",
@@ -516,6 +533,12 @@ static const directive_parser_t parsers[] = {
      .match    = match_exact,
      .parse    = parse_html,
      },
+    {
+     .name     = "include",
+     .name_len = sizeof("include") - 1,
+     .match    = match_exact,
+     .parse    = parse_include,
+     },
 };
 
 int directive_validate_element(const directive_parse_ctx_t *ctx,
@@ -525,7 +548,8 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
     int content                 = 0;
 
     *error  = (directive_parse_error_t){0};
-    content = ir_element_has_text(element) + ir_element_has_html(element);
+    content = ir_element_has_text(element) + ir_element_has_html(element) +
+              ir_element_has_include(element);
     if (content > 1) {
         error->message = "conflicting content directives on same element "
                          "(x-text / x-html / x-include are mutually exclusive)";

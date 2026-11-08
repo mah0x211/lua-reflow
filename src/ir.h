@@ -109,6 +109,7 @@ struct ir_directives_t {
     const struct reflow_value_t *data_scopes;
     const struct reflow_expression_t *text;
     const struct reflow_expression_t *html;
+    const struct reflow_expression_t *include;
 };
 
 struct ir_attr_t {

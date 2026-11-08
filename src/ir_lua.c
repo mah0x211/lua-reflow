@@ -554,6 +554,10 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 push_expression(L, element->directives->html);
                 lua_setfield(L, -2, "html");
             }
+            if (element->directives->include != NULL) {
+                push_expression(L, element->directives->include);
+                lua_setfield(L, -2, "include");
+            }
             lua_setfield(L, -2, "directives");
         }
         lua_createtable(L, table_size_hint(element->children.count), 0);
