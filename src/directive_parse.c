@@ -390,9 +390,32 @@ static int find_unknown_helper(const directive_parse_ctx_t *ctx,
     return status;
 }
 
-static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
-                      size_t suffix_len, const char *source, size_t source_len,
-                      directive_parse_error_t *error)
+/* A directive whose value is one expression stored in its own IR slot. */
+typedef struct expression_directive_t {
+    const char *duplicate_message;
+    const char *oom_message;
+    int (*has)(const ir_element_t *element);
+    int (*set)(ir_element_t *element, const reflow_expression_t *expression);
+} expression_directive_t;
+
+static const expression_directive_t TEXT_DIRECTIVE = {
+    .duplicate_message = "duplicate x-text on element",
+    .oom_message       = "out of memory while parsing x-text",
+    .has               = ir_element_has_text,
+    .set               = ir_set_text,
+};
+
+static const expression_directive_t HTML_DIRECTIVE = {
+    .duplicate_message = "duplicate x-html on element",
+    .oom_message       = "out of memory while parsing x-html",
+    .has               = ir_element_has_html,
+    .set               = ir_set_html,
+};
+
+static int parse_expression_directive(const directive_parse_ctx_t *ctx,
+                                      const expression_directive_t *directive,
+                                      const char *source, size_t source_len,
+                                      directive_parse_error_t *error)
 {
     lua_State *L                    = ctx->L;
     int base                        = lua_gettop(L);
@@ -403,10 +426,8 @@ static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
     int status                      = -1;
     int errnum                      = 0;
 
-    (void)suffix;
-    (void)suffix_len;
-    if (ir_element_has_text(ctx->element)) {
-        error->message = "duplicate x-text on element";
+    if (directive->has(ctx->element)) {
+        error->message = directive->duplicate_message;
         errno          = EINVAL;
         return -1;
     }
@@ -420,7 +441,7 @@ static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
 
     scratch = pool_new(L, 0);
     if (scratch == NULL) {
-        error->message = "out of memory while parsing x-text";
+        error->message = directive->oom_message;
         return -1;
     }
     status = reflow_expr_parse(ir_pool(ctx->ir), scratch, source, source_len,
@@ -435,13 +456,13 @@ static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
 
     if (status != 0) {
         if (errnum == ENOMEM) {
-            error->message = "out of memory while parsing x-text";
+            error->message = directive->oom_message;
             return -1;
         }
         push_parse_message(ctx, source, &parse_error);
     } else if (unknown != NULL) {
         push_unknown_helper_message(ctx, unknown);
-    } else if (ir_set_text(ctx->element, expression) != 0) {
+    } else if (directive->set(ctx->element, expression) != 0) {
         error->message = errno == ENOMEM ?
                              "out of memory while building the intermediate "
                              "representation" :
@@ -454,6 +475,26 @@ static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
     error->message_pushed = 1;
     errno                 = EINVAL;
     return -1;
+}
+
+static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_expression_directive(ctx, &TEXT_DIRECTIVE, source, source_len,
+                                      error);
+}
+
+static int parse_html(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_expression_directive(ctx, &HTML_DIRECTIVE, source, source_len,
+                                      error);
 }
 
 static const directive_parser_t parsers[] = {
@@ -469,7 +510,30 @@ static const directive_parser_t parsers[] = {
      .match    = match_exact,
      .parse    = parse_text,
      },
+    {
+     .name     = "html",
+     .name_len = sizeof("html") - 1,
+     .match    = match_exact,
+     .parse    = parse_html,
+     },
 };
+
+int directive_validate_element(const directive_parse_ctx_t *ctx,
+                               directive_parse_error_t *error)
+{
+    const ir_element_t *element = ctx->element;
+    int content                 = 0;
+
+    *error  = (directive_parse_error_t){0};
+    content = ir_element_has_text(element) + ir_element_has_html(element);
+    if (content > 1) {
+        error->message = "conflicting content directives on same element "
+                         "(x-text / x-html / x-include are mutually exclusive)";
+        errno          = EINVAL;
+        return -1;
+    }
+    return 0;
+}
 
 int directive_parse_attribute(const directive_parse_ctx_t *ctx,
                               const char *suffix, size_t suffix_len,

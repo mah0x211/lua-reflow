@@ -65,4 +65,13 @@ int directive_parse_attribute(const directive_parse_ctx_t *ctx,
                               const char *value, size_t value_len,
                               directive_parse_error_t *error);
 
+/**
+ * Validate the directive combination of an element after all of its
+ * attributes have been parsed.
+ *
+ * @return 0 when valid, or -1 with errno and error set.
+ */
+int directive_validate_element(const directive_parse_ctx_t *ctx,
+                               directive_parse_error_t *error);
+
 #endif /* REFLOW_DIRECTIVE_PARSE_H */

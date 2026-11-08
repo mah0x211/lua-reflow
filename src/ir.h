@@ -108,6 +108,7 @@ typedef struct ir_comment_t {
 struct ir_directives_t {
     const struct reflow_value_t *data_scopes;
     const struct reflow_expression_t *text;
+    const struct reflow_expression_t *html;
 };
 
 struct ir_attr_t {
