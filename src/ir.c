@@ -528,3 +528,27 @@ int ir_set_html(ir_element_t *element,
     directives->html = expression;
     return 0;
 }
+
+int ir_element_has_include(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->include != NULL;
+}
+
+int ir_set_include(ir_element_t *element,
+                   const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || ir_element_has_include(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->include = expression;
+    return 0;
+}

@@ -345,10 +345,10 @@ function testcase.x_text_parses_deep_expressions_without_c_recursion()
 end
 
 function testcase.x_text_keeps_other_directives_rejected()
-    local ir, err = compile('page', '<p x-include="ok(1)"></p>', 'x-', HELPERS)
+    local ir, err = compile('page', '<p x-with="v = ok(1)"></p>', 'x-', HELPERS)
     assert.is_nil(ir)
     assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
-    assert.equal(err.meta.attribute, 'x-include')
+    assert.equal(err.meta.attribute, 'x-with')
 end
 
 function testcase.x_text_oom_returns_no_ir_and_allows_a_later_compile()
