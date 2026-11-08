@@ -134,8 +134,10 @@ static void push_directive_error_meta(compile_ctx_t *ctx, const char *attribute,
     lua_createtable(L, 0, 6);
     lua_pushlstring(L, ctx->ir->name.data, ctx->ir->name.len);
     lua_setfield(L, -2, "template_name");
-    lua_pushlstring(L, attribute, attribute_len);
-    lua_setfield(L, -2, "attribute");
+    if (attribute != NULL) {
+        lua_pushlstring(L, attribute, attribute_len);
+        lua_setfield(L, -2, "attribute");
+    }
     lua_pushinteger(L, (lua_Integer)location.line);
     lua_setfield(L, -2, "line");
     lua_pushinteger(L, (lua_Integer)location.column);
@@ -264,6 +266,18 @@ static void on_start_tag_end(void *data, int is_void_element)
     if (element == NULL) {
         compile_raise(ctx, "received an incomplete HTML start tag", NULL, 0);
         return;
+    }
+    {
+        directive_parse_error_t error   = {0};
+        directive_parse_ctx_t parse_ctx = {
+            .L       = ctx->L,
+            .ir      = ctx->ir,
+            .element = element,
+        };
+
+        if (directive_validate_element(&parse_ctx, &error) != 0) {
+            compile_raise_directive_error(ctx, NULL, 0, &error);
+        }
     }
     if (ir_append_child(ctx->current_parent, &element->node) != 0) {
         compile_raise_ir_error(ctx);
