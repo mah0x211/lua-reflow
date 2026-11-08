@@ -34,6 +34,7 @@
 #include "ir.h"
 #include "ir_internal.h"
 #include "ir_lua.h"
+#include "pool.h"
 #include "snippet.h"
 
 #define COMPILE_OPERATION "reflow.compile"
@@ -45,6 +46,8 @@ typedef struct compile_ctx_t {
     ir_element_t *pending_element;
     const char *prefix;
     size_t prefix_len;
+    const directive_helper_name_t *helpers;
+    size_t helper_count;
     int structured_failure;
 } compile_ctx_t;
 
@@ -154,6 +157,8 @@ static void compile_raise_directive_error(compile_ctx_t *ctx,
     int cause_idx      = 0;
     int meta_idx       = 0;
 
+    /* A pushed message stays at its stack slot until lua_error() unwinds,
+     * so error->message remains valid while the error object is built. */
     if (error->cause != NULL) {
         lua_createtable(L, 0, 1);
         lua_pushinteger(L, (lua_Integer)error->position);
@@ -219,9 +224,13 @@ static void on_attribute(void *data, const char *name, size_t name_len,
         const char *suffix              = name + ctx->prefix_len;
         size_t suffix_len               = name_len - ctx->prefix_len;
         directive_parse_ctx_t parse_ctx = {
-            .L       = ctx->L,
-            .ir      = ctx->ir,
-            .element = ctx->pending_element,
+            .L             = ctx->L,
+            .ir            = ctx->ir,
+            .element       = ctx->pending_element,
+            .attribute     = name,
+            .attribute_len = name_len,
+            .helpers       = ctx->helpers,
+            .helper_count  = ctx->helper_count,
         };
         int status = directive_parse_attribute(&parse_ctx, suffix, suffix_len,
                                                value, value_len, &error);
@@ -305,6 +314,51 @@ static void on_comment(void *data, const char *text, size_t text_len)
     }
 }
 
+/* Borrow the helper names from the table at idx into an array owned by the
+ * result pool. The table stays referenced by the caller for the whole
+ * compilation, so the borrowed strings remain valid. */
+static int collect_helper_names(lua_State *L, int idx, ir_t *ir,
+                                directive_helper_name_t **helpers,
+                                size_t *count)
+{
+    size_t n = 0;
+
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        n++;
+        lua_pop(L, 1);
+    }
+    *helpers = NULL;
+    *count   = 0;
+    if (n == 0) {
+        return 0;
+    }
+    *helpers = (directive_helper_name_t *)pool_calloc(ir_pool(ir), n,
+                                                      sizeof(**helpers));
+    if (*helpers == NULL) {
+        return -1;
+    }
+    lua_pushnil(L);
+    while (lua_next(L, idx) != 0) {
+        directive_helper_name_t *helper = &(*helpers)[*count];
+
+        helper->name = lua_tolstring(L, -2, &helper->len);
+        (*count)++;
+        lua_pop(L, 1);
+    }
+    return 0;
+}
+
+static void release_helper_names(ir_t *ir, directive_helper_name_t *helpers)
+{
+    int errnum = errno;
+
+    if (helpers != NULL) {
+        (void)pool_free(ir_pool(ir), helpers);
+    }
+    errno = errnum;
+}
+
 static int helper_names_are_valid(lua_State *L, int idx)
 {
     lua_pushnil(L);
@@ -320,18 +374,20 @@ static int helper_names_are_valid(lua_State *L, int idx)
 
 static int compile_lua(lua_State *L)
 {
-    const char *name              = NULL;
-    const char *html              = NULL;
-    const char *prefix            = NULL;
-    size_t name_len               = 0;
-    size_t html_len               = 0;
-    size_t prefix_len             = 0;
-    ir_t *ir                      = NULL;
-    ir_root_t *root               = NULL;
-    int owner_idx                 = 0;
-    int status                    = LUA_OK;
-    compile_ctx_t ctx             = {0};
-    reflow_html_handler_t handler = {0};
+    const char *name                 = NULL;
+    const char *html                 = NULL;
+    const char *prefix               = NULL;
+    size_t name_len                  = 0;
+    size_t html_len                  = 0;
+    size_t prefix_len                = 0;
+    ir_t *ir                         = NULL;
+    ir_root_t *root                  = NULL;
+    int owner_idx                    = 0;
+    int status                       = LUA_OK;
+    directive_helper_name_t *helpers = NULL;
+    size_t helper_count              = 0;
+    compile_ctx_t ctx                = {0};
+    reflow_html_handler_t handler    = {0};
 
     if (lua_type(L, 1) != LUA_TSTRING) {
         return return_compile_error(L, 0, "name must be a non-empty string",
@@ -387,12 +443,20 @@ static int compile_lua(lua_State *L)
             name, name_len, NULL, 0);
     }
 
+    if (collect_helper_names(L, 4, ir, &helpers, &helper_count) != 0) {
+        return return_compile_error(
+            L, owner_idx, "out of memory while collecting helper names", name,
+            name_len, NULL, 0);
+    }
+
     ctx = (compile_ctx_t){
         .L              = L,
         .ir             = ir,
         .current_parent = &root->node,
         .prefix         = prefix,
         .prefix_len     = prefix_len,
+        .helpers        = helpers,
+        .helper_count   = helper_count,
     };
     handler = (reflow_html_handler_t){
         .ctx              = &ctx,
@@ -404,6 +468,7 @@ static int compile_lua(lua_State *L)
         .on_comment       = on_comment,
     };
     status = reflow_html_parse(L, ir->html.data, ir->html.len, &handler);
+    release_helper_names(ir, helpers);
     if (status != LUA_OK) {
         if (ctx.structured_failure) {
             return return_existing_error(L, owner_idx);

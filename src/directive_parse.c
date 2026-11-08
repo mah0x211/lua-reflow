@@ -22,9 +22,13 @@
 
 #include <errno.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
+#include <lauxlib.h>
+
 #include "directive_parse.h"
+#include "expr.h"
 #include "ir_internal.h"
 #include "json5.h"
 #include "pool.h"
@@ -124,12 +128,346 @@ cleanup:
     return status;
 }
 
+/* Decode one UTF-8 sequence at s[*pos] and advance *pos. Return -1 for an
+ * invalid or truncated sequence. */
+static long decode_utf8(const char *s, size_t len, size_t *pos)
+{
+    unsigned char lead = (unsigned char)s[*pos];
+    size_t count       = 0;
+    long code          = 0;
+    size_t i           = 0;
+
+    if (lead < 0x80) {
+        (*pos)++;
+        return (long)lead;
+    } else if (lead >= 0xf0 && lead <= 0xf4) {
+        count = 3;
+        code  = lead & 0x07;
+    } else if (lead >= 0xe0) {
+        count = 2;
+        code  = lead & 0x0f;
+    } else if (lead >= 0xc2) {
+        count = 1;
+        code  = lead & 0x1f;
+    } else {
+        return -1;
+    }
+    if (count > len - *pos - 1) {
+        return -1;
+    }
+    for (i = 1; i <= count; i++) {
+        unsigned char next = (unsigned char)s[*pos + i];
+
+        if ((next & 0xc0) != 0x80) {
+            return -1;
+        }
+        code = (code << 6) | (long)(next & 0x3f);
+    }
+    *pos += count + 1;
+    return code;
+}
+
+/* Report whether the value is empty after the whitespace removal performed
+ * by JavaScript's String.prototype.trim(). */
+static int is_blank(const char *value, size_t len)
+{
+    size_t pos = 0;
+
+    while (pos < len) {
+        long code = decode_utf8(value, len, &pos);
+
+        if (!((code >= 0x09 && code <= 0x0d) || code == 0x20 || code == 0xa0 ||
+              code == 0x1680 || (code >= 0x2000 && code <= 0x200a) ||
+              code == 0x2028 || code == 0x2029 || code == 0x202f ||
+              code == 0x205f || code == 0x3000 || code == 0xfeff)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Convert a byte offset in UTF-8 source to the UTF-16 code unit offset that
+ * JavaScript reports for the same position. */
+static size_t utf16_offset(const char *source, size_t pos)
+{
+    size_t units = 0;
+    size_t i     = 0;
+
+    for (i = 0; i < pos; i++) {
+        unsigned char ch = (unsigned char)source[i];
+
+        if ((ch & 0xc0) != 0x80) {
+            units += ch >= 0xf0 ? 2 : 1;
+        }
+    }
+    return units;
+}
+
+static void push_required_message(const directive_parse_ctx_t *ctx)
+{
+    luaL_Buffer buffer;
+
+    luaL_buffinit(ctx->L, &buffer);
+    luaL_addlstring(&buffer, ctx->attribute, ctx->attribute_len);
+    luaL_addstring(&buffer, ": value is required");
+    luaL_pushresult(&buffer);
+}
+
+static void push_parse_message(const directive_parse_ctx_t *ctx,
+                               const char *source,
+                               const reflow_expr_error_t *error)
+{
+    luaL_Buffer buffer;
+    char position[32];
+    const char *cursor = error->message;
+
+    (void)snprintf(position, sizeof(position), "%zu",
+                   utf16_offset(source, error->position));
+    luaL_buffinit(ctx->L, &buffer);
+    luaL_addlstring(&buffer, ctx->attribute, ctx->attribute_len);
+    luaL_addstring(&buffer, ": expression parse error at position ");
+    luaL_addstring(&buffer, position);
+    luaL_addstring(&buffer, ": ");
+    while (*cursor != '\0') {
+        const char *mark = strstr(cursor, "%D");
+
+        if (mark == NULL) {
+            luaL_addstring(&buffer, cursor);
+            break;
+        }
+        luaL_addlstring(&buffer, cursor, (size_t)(mark - cursor));
+        luaL_addlstring(&buffer, source + error->detail, error->detail_len);
+        cursor = mark + 2;
+    }
+    luaL_pushresult(&buffer);
+}
+
+static void push_unknown_helper_message(const directive_parse_ctx_t *ctx,
+                                        const reflow_expr_t *call)
+{
+    luaL_Buffer buffer;
+    const reflow_expr_string_t *name = &call->as.call.callee;
+
+    luaL_buffinit(ctx->L, &buffer);
+    luaL_addlstring(&buffer, ctx->attribute, ctx->attribute_len);
+    luaL_addstring(&buffer, ": unknown helper \"");
+    luaL_addlstring(&buffer, name->data, name->len);
+    luaL_addstring(&buffer,
+                   "\" \xe2\x80\x94 register it via reflow.new({ helpers = { ");
+    luaL_addlstring(&buffer, name->data, name->len);
+    luaL_addstring(&buffer, " = fn } })");
+    luaL_pushresult(&buffer);
+}
+
+static int is_registered_helper(const directive_parse_ctx_t *ctx,
+                                const reflow_expr_string_t *name)
+{
+    size_t i = 0;
+
+    for (i = 0; i < ctx->helper_count; i++) {
+        if (ctx->helpers[i].len == name->len &&
+            memcmp(ctx->helpers[i].name, name->data, name->len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int push_node(pool_t *scratch, const reflow_expr_t ***stack,
+                     size_t *depth, size_t *capacity, const reflow_expr_t *node)
+{
+    if (node == NULL) {
+        return 0;
+    }
+    if (*depth == *capacity) {
+        size_t next                = *capacity == 0 ? 16 : *capacity * 2;
+        const reflow_expr_t **grow = NULL;
+
+        if (next < *capacity || next > SIZE_MAX / sizeof(**stack)) {
+            errno = ENOMEM;
+            return -1;
+        }
+        grow = (const reflow_expr_t **)pool_realloc(
+            scratch, (void *)(uintptr_t)*stack, next * sizeof(**stack));
+        if (grow == NULL) {
+            return -1;
+        }
+        *stack    = grow;
+        *capacity = next;
+    }
+    (*stack)[(*depth)++] = node;
+    return 0;
+}
+
+/* Find the call to an unregistered helper that appears first in the source,
+ * which is the first one JavaScript's pre-order helper collection reports.
+ * The tree is walked with an explicit stack. */
+static int find_unknown_helper(const directive_parse_ctx_t *ctx,
+                               pool_t *scratch, const reflow_expr_t *root,
+                               const reflow_expr_t **unknown)
+{
+    const reflow_expr_t **stack = NULL;
+    size_t depth                = 0;
+    size_t capacity             = 0;
+    int status                  = 0;
+
+    *unknown = NULL;
+    status   = push_node(scratch, &stack, &depth, &capacity, root);
+    while (status == 0 && depth > 0) {
+        const reflow_expr_t *node                = stack[--depth];
+        const reflow_expr_t *item                = NULL;
+        const reflow_expr_object_entry_t *member = NULL;
+
+        switch (node->type) {
+        case REFLOW_EXPR_LITERAL:
+        case REFLOW_EXPR_DOLLAR:
+        case REFLOW_EXPR_AT:
+        case REFLOW_EXPR_DOT:
+            break;
+        case REFLOW_EXPR_MEMBER:
+            status = push_node(scratch, &stack, &depth, &capacity,
+                               node->as.member.object);
+            break;
+        case REFLOW_EXPR_UNARY:
+            status = push_node(scratch, &stack, &depth, &capacity,
+                               node->as.unary.argument);
+            break;
+        case REFLOW_EXPR_BINARY:
+            status = push_node(scratch, &stack, &depth, &capacity,
+                               node->as.binary.left);
+            if (status == 0) {
+                status = push_node(scratch, &stack, &depth, &capacity,
+                                   node->as.binary.right);
+            }
+            break;
+        case REFLOW_EXPR_TERNARY:
+            status = push_node(scratch, &stack, &depth, &capacity,
+                               node->as.ternary.test);
+            if (status == 0) {
+                status = push_node(scratch, &stack, &depth, &capacity,
+                                   node->as.ternary.consequent);
+            }
+            if (status == 0) {
+                status = push_node(scratch, &stack, &depth, &capacity,
+                                   node->as.ternary.alternate);
+            }
+            break;
+        case REFLOW_EXPR_CALL:
+            if (!is_registered_helper(ctx, &node->as.call.callee) &&
+                (*unknown == NULL || node->offset < (*unknown)->offset)) {
+                *unknown = node;
+            }
+            for (item = node->as.call.arguments.head;
+                 status == 0 && item != NULL; item = item->next) {
+                status = push_node(scratch, &stack, &depth, &capacity, item);
+            }
+            break;
+        case REFLOW_EXPR_OBJECT:
+            for (member = node->as.object.head; status == 0 && member != NULL;
+                 member = member->next) {
+                status =
+                    push_node(scratch, &stack, &depth, &capacity, member->key);
+                if (status == 0) {
+                    status = push_node(scratch, &stack, &depth, &capacity,
+                                       member->value);
+                }
+            }
+            break;
+        case REFLOW_EXPR_ARRAY:
+            for (item = node->as.array.head; status == 0 && item != NULL;
+                 item = item->next) {
+                status = push_node(scratch, &stack, &depth, &capacity, item);
+            }
+            break;
+        }
+    }
+    if (stack != NULL) {
+        int errnum = errno;
+
+        (void)pool_free(scratch, (void *)(uintptr_t)stack);
+        errno = errnum;
+    }
+    return status;
+}
+
+static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    lua_State *L                    = ctx->L;
+    int base                        = lua_gettop(L);
+    pool_t *scratch                 = NULL;
+    reflow_expression_t *expression = NULL;
+    reflow_expr_error_t parse_error = {0};
+    const reflow_expr_t *unknown    = NULL;
+    int status                      = -1;
+    int errnum                      = 0;
+
+    (void)suffix;
+    (void)suffix_len;
+    if (ir_element_has_text(ctx->element)) {
+        error->message = "duplicate x-text on element";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (is_blank(source, source_len)) {
+        push_required_message(ctx);
+        error->message        = lua_tostring(L, -1);
+        error->message_pushed = 1;
+        errno                 = EINVAL;
+        return -1;
+    }
+
+    scratch = pool_new(L, 0);
+    if (scratch == NULL) {
+        error->message = "out of memory while parsing x-text";
+        return -1;
+    }
+    status = reflow_expr_parse(ir_pool(ctx->ir), scratch, source, source_len,
+                               &expression, &parse_error);
+    if (status == 0) {
+        status = find_unknown_helper(ctx, scratch, expression->root, &unknown);
+    }
+    errnum = errno;
+    pool_delete(L, scratch);
+    lua_settop(L, base);
+    errno = errnum;
+
+    if (status != 0) {
+        if (errnum == ENOMEM) {
+            error->message = "out of memory while parsing x-text";
+            return -1;
+        }
+        push_parse_message(ctx, source, &parse_error);
+    } else if (unknown != NULL) {
+        push_unknown_helper_message(ctx, unknown);
+    } else if (ir_set_text(ctx->element, expression) != 0) {
+        error->message = errno == ENOMEM ?
+                             "out of memory while building the intermediate "
+                             "representation" :
+                             "failed to build the intermediate representation";
+        return -1;
+    } else {
+        return 0;
+    }
+    error->message        = lua_tostring(L, -1);
+    error->message_pushed = 1;
+    errno                 = EINVAL;
+    return -1;
+}
+
 static const directive_parser_t parsers[] = {
     {
      .name     = "data",
      .name_len = sizeof("data") - 1,
      .match    = match_exact,
      .parse    = parse_data,
+     },
+    {
+     .name     = "text",
+     .name_len = sizeof("text") - 1,
+     .match    = match_exact,
+     .parse    = parse_text,
      },
 };
 

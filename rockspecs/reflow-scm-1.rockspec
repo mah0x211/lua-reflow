@@ -56,6 +56,7 @@ build = {
                 "src/pool.c",
                 "src/reflow_util.c",
                 "src/directive_parse.c",
+                "src/expr_parse.c",
                 "src/json5.c",
                 "src/snippet.c",
                 "src/value.c",
