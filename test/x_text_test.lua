@@ -345,10 +345,10 @@ function testcase.x_text_parses_deep_expressions_without_c_recursion()
 end
 
 function testcase.x_text_keeps_other_directives_rejected()
-    local ir, err = compile('page', '<p x-with="v = ok(1)"></p>', 'x-', HELPERS)
+    local ir, err = compile('page', '<p x-if="ok(1)"></p>', 'x-', HELPERS)
     assert.is_nil(ir)
     assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
-    assert.equal(err.meta.attribute, 'x-with')
+    assert.equal(err.meta.attribute, 'x-if')
 end
 
 function testcase.x_text_oom_returns_no_ir_and_allows_a_later_compile()
@@ -377,4 +377,27 @@ function testcase.x_text_oom_returns_no_ir_and_allows_a_later_compile()
     assert.is_true(failed)
     assert.is_true(typed)
     assert.is_true(recovered)
+end
+
+function testcase.x_text_errors_locate_the_position_in_lua_terms()
+    local err = compile_error("'日本' #")
+    assert.equal(err.message.message, 'x-text: expression parse error at ' ..
+                     'position 5: unexpected token')
+    local location = err.meta.expression
+    assert.equal(location, {
+        source = "'日本' #",
+        byte = 10,
+        char = 6,
+    })
+    assert.equal(location.source:sub(location.byte, location.byte), '#')
+
+    err = compile_error('ok(nope())')
+    assert.equal(err.meta.expression, {
+        source = 'ok(nope())',
+        byte = 4,
+        char = 4,
+    })
+
+    err = compile_error('')
+    assert.is_nil(err.meta.expression)
 end

@@ -91,6 +91,10 @@ int ir_element_has_bind(const ir_element_t *element, const char *name,
                         size_t name_len);
 int ir_append_bind(ir_element_t *element, const char *name, size_t name_len,
                    const struct reflow_expression_t *expression);
+int ir_element_has_with(const ir_element_t *element, const char *name,
+                        size_t name_len);
+int ir_append_with(ir_element_t *element, const char *name, size_t name_len,
+                   const struct reflow_expression_t *expression);
 int ir_set_include(ir_element_t *element,
                    const struct reflow_expression_t *expression);
 

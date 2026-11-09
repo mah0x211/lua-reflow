@@ -167,23 +167,50 @@ static long decode_utf8(const char *s, size_t len, size_t *pos)
     return code;
 }
 
-/* Report whether the value is empty after the whitespace removal performed
- * by JavaScript's String.prototype.trim(). */
+/* Report whether a code point is removed by JavaScript's
+ * String.prototype.trim(). */
+static int is_js_space(long code)
+{
+    return (code >= 0x09 && code <= 0x0d) || code == 0x20 || code == 0xa0 ||
+           code == 0x1680 || (code >= 0x2000 && code <= 0x200a) ||
+           code == 0x2028 || code == 0x2029 || code == 0x202f ||
+           code == 0x205f || code == 0x3000 || code == 0xfeff;
+}
+
+/* Narrow [*start, *end) of s the way String.prototype.trim() does. */
+static void trim_js(const char *s, size_t *start, size_t *end)
+{
+    while (*start < *end) {
+        size_t next = *start;
+
+        if (!is_js_space(decode_utf8(s, *end, &next))) {
+            break;
+        }
+        *start = next;
+    }
+    while (*end > *start) {
+        size_t lead = *end - 1;
+        size_t next = 0;
+
+        while (lead > *start && ((unsigned char)s[lead] & 0xc0) == 0x80) {
+            lead--;
+        }
+        next = lead;
+        if (!is_js_space(decode_utf8(s, *end, &next)) || next != *end) {
+            break;
+        }
+        *end = lead;
+    }
+}
+
+/* Report whether the value is empty after String.prototype.trim(). */
 static int is_blank(const char *value, size_t len)
 {
-    size_t pos = 0;
+    size_t start = 0;
+    size_t end   = len;
 
-    while (pos < len) {
-        long code = decode_utf8(value, len, &pos);
-
-        if (!((code >= 0x09 && code <= 0x0d) || code == 0x20 || code == 0xa0 ||
-              code == 0x1680 || (code >= 0x2000 && code <= 0x200a) ||
-              code == 0x2028 || code == 0x2029 || code == 0x202f ||
-              code == 0x205f || code == 0x3000 || code == 0xfeff)) {
-            return 0;
-        }
-    }
-    return 1;
+    trim_js(value, &start, &end);
+    return start == end;
 }
 
 /* Convert a byte offset in UTF-8 source to the UTF-16 code unit offset that
@@ -213,9 +240,21 @@ static void push_required_message(const directive_parse_ctx_t *ctx)
     luaL_pushresult(&buffer);
 }
 
-static void push_parse_message(const directive_parse_ctx_t *ctx,
-                               const char *source,
-                               const reflow_expr_error_t *error)
+static void set_error_location(directive_parse_error_t *error,
+                               const char *source, size_t source_len,
+                               size_t pos)
+{
+    error->expression     = source;
+    error->expression_len = source_len;
+    error->expression_pos = pos;
+}
+
+/* Push "<head>: expression parse error at position N: <reason><tail>",
+ * the form the JavaScript version uses for expression errors. */
+static void push_parse_message_with(lua_State *L, const char *head,
+                                    size_t head_len, const char *source,
+                                    const reflow_expr_error_t *error,
+                                    const char *tail, size_t tail_len)
 {
     luaL_Buffer buffer;
     char position[32];
@@ -223,8 +262,8 @@ static void push_parse_message(const directive_parse_ctx_t *ctx,
 
     (void)snprintf(position, sizeof(position), "%zu",
                    utf16_offset(source, error->position));
-    luaL_buffinit(ctx->L, &buffer);
-    luaL_addlstring(&buffer, ctx->attribute, ctx->attribute_len);
+    luaL_buffinit(L, &buffer);
+    luaL_addlstring(&buffer, head, head_len);
     luaL_addstring(&buffer, ": expression parse error at position ");
     luaL_addstring(&buffer, position);
     luaL_addstring(&buffer, ": ");
@@ -239,7 +278,16 @@ static void push_parse_message(const directive_parse_ctx_t *ctx,
         luaL_addlstring(&buffer, source + error->detail, error->detail_len);
         cursor = mark + 2;
     }
+    luaL_addlstring(&buffer, tail, tail_len);
     luaL_pushresult(&buffer);
+}
+
+static void push_parse_message(const directive_parse_ctx_t *ctx,
+                               const char *source,
+                               const reflow_expr_error_t *error)
+{
+    push_parse_message_with(ctx->L, ctx->attribute, ctx->attribute_len, source,
+                            error, "", 0);
 }
 
 static void push_unknown_helper_message(const directive_parse_ctx_t *ctx,
@@ -477,9 +525,11 @@ static int parse_expression_value(const directive_parse_ctx_t *ctx,
             return -1;
         }
         push_parse_message(ctx, source, &parse_error);
+        set_error_location(error, source, source_len, parse_error.position);
         return fail_with_pushed_message(L, error);
     } else if (unknown != NULL) {
         push_unknown_helper_message(ctx, unknown);
+        set_error_location(error, source, source_len, unknown->offset);
         return fail_with_pushed_message(L, error);
     }
     *result = expression;
@@ -537,6 +587,245 @@ static int parse_include(const directive_parse_ctx_t *ctx, const char *suffix,
     (void)suffix_len;
     return parse_expression_directive(ctx, &INCLUDE_DIRECTIVE, source,
                                       source_len, error);
+}
+
+#define WITH_OOM_MESSAGE "out of memory while parsing x-with"
+
+static int is_with_name_start(unsigned char ch)
+{
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '_' ||
+           ch == '$';
+}
+
+static int is_with_name_char(unsigned char ch)
+{
+    return is_with_name_start(ch) || (ch >= '0' && ch <= '9');
+}
+
+static size_t skip_with_space(const char *s, size_t len, size_t pos)
+{
+    while (pos < len && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' ||
+                         s[pos] == '\r')) {
+        pos++;
+    }
+    return pos;
+}
+
+/* Push "x-with: <before>"<name>"". */
+static void push_with_name_message(lua_State *L, const char *before,
+                                   const char *name, size_t name_len)
+{
+    lua_pushliteral(L, "x-with: ");
+    lua_pushstring(L, before);
+    lua_pushliteral(L, "\"");
+    lua_pushlstring(L, name, name_len);
+    lua_pushliteral(L, "\"");
+    lua_concat(L, 5);
+}
+
+static void release_scratch(lua_State *L, pool_t *scratch, int base)
+{
+    int errnum = errno;
+
+    pool_delete(L, scratch);
+    lua_settop(L, base);
+    errno = errnum;
+}
+
+/* Parse "name = expression, ..." with the scanner of the JavaScript version:
+ * a binding value ends at the first comma outside brackets and string
+ * literals. Every binding is parsed before any helper reference is checked,
+ * as in the JavaScript version. */
+static int parse_with(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    lua_State *L          = ctx->L;
+    int base              = lua_gettop(L);
+    pool_t *scratch       = NULL;
+    size_t pos            = 0;
+    size_t count          = 0;
+    const ir_with_t *with = NULL;
+    char position[32];
+
+    (void)suffix;
+    (void)suffix_len;
+    if (ir_element_has_with(ctx->element, NULL, 0)) {
+        error->message = "duplicate x-with on element";
+        errno          = EINVAL;
+        return -1;
+    }
+    scratch = pool_new(L, 0);
+    if (scratch == NULL) {
+        error->message = WITH_OOM_MESSAGE;
+        return -1;
+    }
+
+    while (1) {
+        size_t name_start               = 0;
+        size_t name_len                 = 0;
+        size_t value_start              = 0;
+        size_t value_end                = 0;
+        size_t depth                    = 0;
+        reflow_expression_t *expression = NULL;
+        reflow_expr_error_t parse_error = {0};
+
+        pos = skip_with_space(source, source_len, pos);
+        if (pos >= source_len) {
+            break;
+        }
+        name_start = pos;
+        if (!is_with_name_start((unsigned char)source[pos])) {
+            release_scratch(L, scratch, base);
+            (void)snprintf(position, sizeof(position), "%zu",
+                           utf16_offset(source, pos));
+            lua_pushliteral(L, "x-with: expected binding name at position ");
+            lua_pushstring(L, position);
+            lua_concat(L, 2);
+            set_error_location(error, source, source_len, pos);
+            return fail_with_pushed_message(L, error);
+        }
+        pos++;
+        while (pos < source_len &&
+               is_with_name_char((unsigned char)source[pos])) {
+            pos++;
+        }
+        name_len = pos - name_start;
+        if (ir_element_has_with(ctx->element, source + name_start, name_len)) {
+            release_scratch(L, scratch, base);
+            push_with_name_message(L, "duplicate binding name ",
+                                   source + name_start, name_len);
+            set_error_location(error, source, source_len, name_start);
+            return fail_with_pushed_message(L, error);
+        }
+        pos = skip_with_space(source, source_len, pos);
+        if (pos >= source_len || source[pos] != '=') {
+            release_scratch(L, scratch, base);
+            push_with_name_message(L, "expected \"=\" after binding name ",
+                                   source + name_start, name_len);
+            set_error_location(error, source, source_len, pos);
+            return fail_with_pushed_message(L, error);
+        }
+        pos++;
+
+        pos         = skip_with_space(source, source_len, pos);
+        value_start = pos;
+        while (pos < source_len) {
+            char ch = source[pos];
+
+            if (ch == '"' || ch == '\'') {
+                size_t quote = pos++;
+
+                while (pos < source_len && source[pos] != ch) {
+                    pos += source[pos] == '\\' && pos + 1 < source_len ? 2 : 1;
+                }
+                if (pos >= source_len) {
+                    release_scratch(L, scratch, base);
+                    push_with_name_message(
+                        L, "unterminated string literal in binding ",
+                        source + name_start, name_len);
+                    set_error_location(error, source, source_len, quote);
+                    return fail_with_pushed_message(L, error);
+                }
+                pos++;
+                continue;
+            }
+            if (ch == '{' || ch == '[' || ch == '(') {
+                depth++;
+            } else if (ch == '}' || ch == ']' || ch == ')') {
+                if (depth == 0) {
+                    release_scratch(L, scratch, base);
+                    lua_pushliteral(L, "x-with: unbalanced \"");
+                    lua_pushlstring(L, &source[pos], 1);
+                    lua_pushliteral(L, "\" in binding \"");
+                    lua_pushlstring(L, source + name_start, name_len);
+                    lua_pushliteral(L, "\"");
+                    lua_concat(L, 5);
+                    set_error_location(error, source, source_len, pos);
+                    return fail_with_pushed_message(L, error);
+                }
+                depth--;
+            } else if (ch == ',' && depth == 0) {
+                break;
+            }
+            pos++;
+        }
+        if (depth != 0) {
+            release_scratch(L, scratch, base);
+            push_with_name_message(L, "unbalanced brackets in binding ",
+                                   source + name_start, name_len);
+            set_error_location(error, source, source_len, pos);
+            return fail_with_pushed_message(L, error);
+        }
+        value_end = pos;
+        trim_js(source, &value_start, &value_end);
+        if (value_start == value_end) {
+            release_scratch(L, scratch, base);
+            push_with_name_message(L,
+                                   "value expression is required for binding ",
+                                   source + name_start, name_len);
+            set_error_location(error, source, source_len, value_start);
+            return fail_with_pushed_message(L, error);
+        }
+        if (reflow_expr_parse(ir_pool(ctx->ir), scratch, source + value_start,
+                              value_end - value_start, &expression,
+                              &parse_error) != 0) {
+            release_scratch(L, scratch, base);
+            if (errno == ENOMEM) {
+                error->message = WITH_OOM_MESSAGE;
+                return -1;
+            }
+            push_parse_message_with(L, "x-with", sizeof("x-with") - 1,
+                                    source + value_start, &parse_error, "", 0);
+            lua_pushliteral(L, " (in binding \"");
+            lua_pushlstring(L, source + name_start, name_len);
+            lua_pushliteral(L, "\")");
+            lua_concat(L, 4);
+            set_error_location(error, source + value_start,
+                               value_end - value_start, parse_error.position);
+            return fail_with_pushed_message(L, error);
+        }
+        if (ir_append_with(ctx->element, source + name_start, name_len,
+                           expression) != 0) {
+            release_scratch(L, scratch, base);
+            error->message = IR_BUILD_FAILURE_MESSAGE(errno);
+            return -1;
+        }
+        count++;
+
+        pos = skip_with_space(source, source_len, pos);
+        if (pos >= source_len) {
+            break;
+        }
+        pos++;
+    }
+
+    if (count == 0) {
+        release_scratch(L, scratch, base);
+        error->message = "x-with: at least one binding is required";
+        errno          = EINVAL;
+        return -1;
+    }
+    for (with = ctx->element->directives->with.head; with != NULL;
+         with = with->next) {
+        const reflow_expr_t *unknown = NULL;
+
+        if (find_unknown_helper(ctx, scratch, with->expression->root,
+                                &unknown) != 0) {
+            release_scratch(L, scratch, base);
+            error->message = WITH_OOM_MESSAGE;
+            return -1;
+        }
+        if (unknown != NULL) {
+            release_scratch(L, scratch, base);
+            push_unknown_helper_message(ctx, unknown);
+            set_error_location(error, with->expression->source.data,
+                               with->expression->source.len, unknown->offset);
+            return fail_with_pushed_message(L, error);
+        }
+    }
+    release_scratch(L, scratch, base);
+    return 0;
 }
 
 #define BIND_PREFIX     "bind:"
@@ -610,6 +899,12 @@ static const directive_parser_t parsers[] = {
      .parse    = parse_include,
      },
     {
+     .name     = "with",
+     .name_len = sizeof("with") - 1,
+     .match    = match_exact,
+     .parse    = parse_with,
+     },
+    {
      .name     = BIND_PREFIX,
      .name_len = BIND_PREFIX_LEN,
      .match    = match_bind,
@@ -631,6 +926,29 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
                          "(x-text / x-html / x-include are mutually exclusive)";
         errno          = EINVAL;
         return -1;
+    }
+    if (element->directives != NULL &&
+        element->directives->data_scopes != NULL) {
+        const ir_with_t *with = NULL;
+
+        for (with = element->directives->with.head; with != NULL;
+             with = with->next) {
+            const reflow_value_member_t *member = NULL;
+
+            for (member = element->directives->data_scopes->as.object.head;
+                 member != NULL; member = member->next) {
+                if (member->key.len == with->name.len &&
+                    memcmp(member->key.data, with->name.data, with->name.len) ==
+                        0) {
+                    lua_pushliteral(ctx->L, "name \"");
+                    lua_pushlstring(ctx->L, with->name.data, with->name.len);
+                    lua_pushliteral(ctx->L, "\" declared by both x-data and "
+                                            "x-with on the same element");
+                    lua_concat(ctx->L, 3);
+                    return fail_with_pushed_message(ctx->L, error);
+                }
+            }
+        }
     }
     return 0;
 }

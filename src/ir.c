@@ -615,3 +615,70 @@ int ir_append_bind(ir_element_t *element, const char *name, size_t name_len,
     list->count++;
     return 0;
 }
+
+/* With name == NULL, report whether the element has any x-with binding. */
+int ir_element_has_with(const ir_element_t *element, const char *name,
+                        size_t name_len)
+{
+    const ir_with_t *with = NULL;
+
+    if (element == NULL || element->directives == NULL) {
+        return 0;
+    }
+    if (name == NULL) {
+        return element->directives->with.head != NULL;
+    }
+    for (with = element->directives->with.head; with != NULL;
+         with = with->next) {
+        if (with->name.len == name_len &&
+            memcmp(with->name.data, name, name_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int ir_append_with(ir_element_t *element, const char *name, size_t name_len,
+                   const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+    ir_t *ir                    = NULL;
+    ir_string_t name_copy       = {0};
+    ir_with_t *with             = NULL;
+    ir_with_list_t *list        = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || name == NULL || name_len == 0 ||
+        ir_element_has_with(element, name, name_len)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    list = &directives->with;
+    if (list->count == SIZE_MAX) {
+        errno = ENOMEM;
+        return -1;
+    }
+    ir = node_private(&element->node)->owner;
+    if (copy_string(ir, name, name_len, &name_copy) != 0) {
+        return -1;
+    }
+    with = (ir_with_t *)pool_calloc(ir_pool(ir), 1, sizeof(*with));
+    if (with == NULL) {
+        release_string(ir, &name_copy);
+        return -1;
+    }
+    with->name       = name_copy;
+    with->expression = expression;
+    if (list->tail == NULL) {
+        list->head = with;
+    } else {
+        list->tail->next = with;
+    }
+    list->tail = with;
+    list->count++;
+    return 0;
+}

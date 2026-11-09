@@ -35,6 +35,11 @@ typedef struct directive_parse_error_t {
     const char *cause;
     size_t position;
     int message_pushed;
+    /* When expression is not NULL, the error points at byte offset
+     * expression_pos in [expression, expression + expression_len). */
+    const char *expression;
+    size_t expression_len;
+    size_t expression_pos;
 } directive_parse_error_t;
 
 /* Helper names registered for the compilation. The strings are borrowed from
