@@ -125,3 +125,10 @@ int reflow_js_is_blank(const char *value, size_t len)
     reflow_js_trim(value, &start, &end);
     return start == end;
 }
+
+size_t reflow_js_space_len(const char *s, size_t len, size_t pos)
+{
+    size_t next = pos;
+
+    return is_js_space(decode_utf8(s, len, &next)) ? next - pos : 0;
+}

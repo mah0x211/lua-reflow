@@ -201,14 +201,6 @@ static void push_parse_message_with(lua_State *L, const char *head,
     luaL_pushresult(&buffer);
 }
 
-static void push_parse_message(const directive_parse_ctx_t *ctx,
-                               const char *source,
-                               const reflow_expr_error_t *error)
-{
-    push_parse_message_with(ctx->L, ctx->attribute, ctx->attribute_len, source,
-                            error, "", 0);
-}
-
 static void push_unknown_helper_message(const directive_parse_ctx_t *ctx,
                                         const reflow_expr_t *call)
 {
@@ -401,13 +393,15 @@ static int fail_with_pushed_message(lua_State *L,
     return -1;
 }
 
-/* Parse one expression value and check its helper references, reporting
- * failures with the messages of the JavaScript version. */
-static int parse_expression_value(const directive_parse_ctx_t *ctx,
-                                  const char *oom_message, const char *source,
-                                  size_t source_len,
-                                  directive_parse_error_t *error,
-                                  reflow_expression_t **result)
+/* Parse one non-blank expression and check its helper references. Parse
+ * errors start with head; helper errors start with the attribute name, as
+ * in the JavaScript version. */
+static int parse_expression_as(const directive_parse_ctx_t *ctx,
+                               const char *head, size_t head_len,
+                               const char *oom_message, const char *source,
+                               size_t source_len,
+                               directive_parse_error_t *error,
+                               reflow_expression_t **result)
 {
     lua_State *L                    = ctx->L;
     int base                        = lua_gettop(L);
@@ -417,11 +411,6 @@ static int parse_expression_value(const directive_parse_ctx_t *ctx,
     const reflow_expr_t *unknown    = NULL;
     int status                      = -1;
     int errnum                      = 0;
-
-    if (reflow_js_is_blank(source, source_len)) {
-        push_required_message(ctx);
-        return fail_with_pushed_message(L, error);
-    }
 
     scratch = pool_new(L, 0);
     if (scratch == NULL) {
@@ -443,7 +432,7 @@ static int parse_expression_value(const directive_parse_ctx_t *ctx,
             error->message = oom_message;
             return -1;
         }
-        push_parse_message(ctx, source, &parse_error);
+        push_parse_message_with(L, head, head_len, source, &parse_error, "", 0);
         set_error_location(error, source, source_len, parse_error.position);
         return fail_with_pushed_message(L, error);
     } else if (unknown != NULL) {
@@ -453,6 +442,22 @@ static int parse_expression_value(const directive_parse_ctx_t *ctx,
     }
     *result = expression;
     return 0;
+}
+
+/* Parse one expression value and check its helper references, reporting
+ * failures with the messages of the JavaScript version. */
+static int parse_expression_value(const directive_parse_ctx_t *ctx,
+                                  const char *oom_message, const char *source,
+                                  size_t source_len,
+                                  directive_parse_error_t *error,
+                                  reflow_expression_t **result)
+{
+    if (reflow_js_is_blank(source, source_len)) {
+        push_required_message(ctx);
+        return fail_with_pushed_message(ctx->L, error);
+    }
+    return parse_expression_as(ctx, ctx->attribute, ctx->attribute_len,
+                               oom_message, source, source_len, error, result);
 }
 
 static const expression_directive_t IF_DIRECTIVE = {
@@ -1159,6 +1164,146 @@ static int parse_bind(const directive_parse_ctx_t *ctx, const char *suffix,
     return 0;
 }
 
+#define EACH_OOM_MESSAGE "out of memory while parsing x-each"
+
+static size_t skip_js_space(const char *s, size_t len, size_t pos)
+{
+    size_t step = 0;
+
+    while (pos < len && (step = reflow_js_space_len(s, len, pos)) > 0) {
+        pos += step;
+    }
+    return pos;
+}
+
+static size_t skip_identifier(const char *s, size_t len, size_t pos)
+{
+    if (pos >= len || !is_identifier_start(s[pos])) {
+        return pos;
+    }
+    for (pos++; pos < len; pos++) {
+        if (!is_identifier_start(s[pos]) && !is_ascii_digit(s[pos])) {
+            break;
+        }
+    }
+    return pos;
+}
+
+typedef enum {
+    EACH_NO_MATCH = 0,
+    EACH_COLLECTION,
+    EACH_BLANK_COLLECTION
+} each_tail_t;
+
+/* Match /\s+in\s+(.+)$/s at pos. The greedy \s+ leaves the collection
+ * starting at its first non-space character; a tail of spaces only still
+ * matches when at least two are left, with one of them as the collection. */
+static each_tail_t match_each_tail(const char *s, size_t len, size_t pos,
+                                   size_t *collection)
+{
+    size_t step   = 0;
+    size_t spaces = 0;
+
+    if (pos >= len || reflow_js_space_len(s, len, pos) == 0) {
+        return EACH_NO_MATCH;
+    }
+    pos = skip_js_space(s, len, pos);
+    if (len - pos < 2 || s[pos] != 'i' || s[pos + 1] != 'n') {
+        return EACH_NO_MATCH;
+    }
+    pos += 2;
+    while (pos < len && (step = reflow_js_space_len(s, len, pos)) > 0) {
+        *collection = pos;
+        pos += step;
+        spaces++;
+    }
+    if (spaces == 0) {
+        return EACH_NO_MATCH;
+    }
+    if (pos < len) {
+        *collection = pos;
+        return EACH_COLLECTION;
+    }
+    return spaces >= 2 ? EACH_BLANK_COLLECTION : EACH_NO_MATCH;
+}
+
+/* Parse `<item>[, <index>] in <collection>` with the grammar and messages of
+ * the JavaScript version, which matches the value against
+ * /^\s*([a-zA-Z_$][\w$]*)(?:\s*,\s*([a-zA-Z_$][\w$]*))?\s+in\s+(.+)$/s. */
+static int parse_each(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    lua_State *L                    = ctx->L;
+    size_t item_start               = 0;
+    size_t item_end                 = 0;
+    size_t index_start              = 0;
+    size_t index_end                = 0;
+    size_t collection               = 0;
+    size_t pos                      = 0;
+    each_tail_t tail                = EACH_NO_MATCH;
+    reflow_expression_t *expression = NULL;
+
+    (void)suffix;
+    (void)suffix_len;
+    if (ir_element_has_each(ctx->element)) {
+        error->message = "duplicate x-each on element";
+        errno          = EINVAL;
+        return -1;
+    }
+
+    item_start = skip_js_space(source, source_len, 0);
+    item_end   = skip_identifier(source, source_len, item_start);
+    if (item_end > item_start) {
+        pos = skip_js_space(source, source_len, item_end);
+        if (pos < source_len && source[pos] == ',') {
+            index_start = skip_js_space(source, source_len, pos + 1);
+            index_end   = skip_identifier(source, source_len, index_start);
+            if (index_end > index_start) {
+                tail =
+                    match_each_tail(source, source_len, index_end, &collection);
+            }
+        }
+        if (tail == EACH_NO_MATCH) {
+            index_start = 0;
+            index_end   = 0;
+            tail = match_each_tail(source, source_len, item_end, &collection);
+        }
+    }
+    if (tail == EACH_NO_MATCH) {
+        lua_pushliteral(L, "x-each: expected \"<item>[, <index>] in "
+                           "<collection>\", got \"");
+        lua_pushlstring(L, source, source_len);
+        lua_pushliteral(L, "\"");
+        lua_concat(L, 3);
+        return fail_with_pushed_message(L, error);
+    }
+    if (tail == EACH_BLANK_COLLECTION) {
+        error->message = "x-each: collection expression is required";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (index_end - index_start == item_end - item_start &&
+        memcmp(source + item_start, source + index_start,
+               item_end - item_start) == 0) {
+        error->message = "x-each: item name and index name must differ";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (parse_expression_as(ctx, "x-each", sizeof("x-each") - 1,
+                            EACH_OOM_MESSAGE, source + collection,
+                            source_len - collection, error, &expression) != 0) {
+        return -1;
+    }
+    if (ir_set_each(ctx->element, source + item_start, item_end - item_start,
+                    index_end > index_start ? source + index_start : NULL,
+                    index_end - index_start, expression) != 0) {
+        error->message = IR_BUILD_FAILURE_MESSAGE(errno);
+        return -1;
+    }
+    return 0;
+}
+
 static const directive_parser_t parsers[] = {
     {
      .name     = "data",
@@ -1227,6 +1372,12 @@ static const directive_parser_t parsers[] = {
      .parse    = parse_for,
      },
     {
+     .name     = "each",
+     .name_len = sizeof("each") - 1,
+     .match    = match_exact,
+     .parse    = parse_each,
+     },
+    {
      .name     = "with",
      .name_len = sizeof("with") - 1,
      .match    = match_exact,
@@ -1245,6 +1396,7 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
 {
     const ir_element_t *element = ctx->element;
     int structural              = 0;
+    int iteration               = 0;
     int content                 = 0;
 
     *error     = (directive_parse_error_t){0};
@@ -1259,6 +1411,13 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
         errno = EINVAL;
         return -1;
     }
+    iteration = ir_element_has_for(element) + ir_element_has_each(element);
+    if (iteration > 1) {
+        error->message = "conflicting iteration directives on same element "
+                         "(x-for / x-each are mutually exclusive)";
+        errno          = EINVAL;
+        return -1;
+    }
     content = ir_element_has_text(element) + ir_element_has_html(element) +
               ir_element_has_include(element);
     if (content > 1) {
@@ -1267,7 +1426,7 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
         errno          = EINVAL;
         return -1;
     }
-    if (structural > 0 && ir_element_has_for(element)) {
+    if (structural > 0 && iteration > 0) {
         error->message = "cannot combine structural directive with iteration "
                          "directive on same element; use nesting";
         errno          = EINVAL;

@@ -37,6 +37,7 @@ typedef struct ir_directives_t ir_directives_t;
 typedef struct ir_bind_t ir_bind_t;
 typedef struct ir_with_t ir_with_t;
 typedef struct ir_for_t ir_for_t;
+typedef struct ir_each_t ir_each_t;
 struct reflow_value_t;
 struct reflow_expression_t;
 
@@ -137,6 +138,14 @@ struct ir_directives_t {
      * closes; they replace its children. condition is NULL for x-nocase. */
     ir_branch_list_t match_branches;
     const ir_for_t *range;
+    const ir_each_t *each;
+};
+
+/* An x-each loop. index.data is NULL when no index name is given. */
+struct ir_each_t {
+    ir_string_t item;
+    ir_string_t index;
+    const struct reflow_expression_t *collection;
 };
 
 /* An x-for range, fixed at compile time. Bounds are inclusive and step is

@@ -960,3 +960,47 @@ int ir_set_for(ir_element_t *element, const char *name, size_t name_len,
     directives->range = range;
     return 0;
 }
+
+int ir_element_has_each(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->each != NULL;
+}
+
+int ir_set_each(ir_element_t *element, const char *item, size_t item_len,
+                const char *index, size_t index_len,
+                const struct reflow_expression_t *collection)
+{
+    ir_directives_t *directives = NULL;
+    ir_t *ir                    = NULL;
+    ir_each_t *each             = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT || item == NULL ||
+        item_len == 0 || (index == NULL && index_len != 0) ||
+        (index != NULL && index_len == 0) || collection == NULL ||
+        ir_element_has_each(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    ir   = node_private(&element->node)->owner;
+    each = (ir_each_t *)pool_calloc(ir_pool(ir), 1, sizeof(*each));
+    if (each == NULL) {
+        return -1;
+    }
+    if (copy_string(ir, item, item_len, &each->item) != 0) {
+        (void)pool_free(ir_pool(ir), each);
+        return -1;
+    }
+    if (index != NULL && copy_string(ir, index, index_len, &each->index) != 0) {
+        release_string(ir, &each->item);
+        (void)pool_free(ir_pool(ir), each);
+        return -1;
+    }
+    each->collection = collection;
+    directives->each = each;
+    return 0;
+}
