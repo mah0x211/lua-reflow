@@ -558,6 +558,21 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 push_expression(L, element->directives->include);
                 lua_setfield(L, -2, "include");
             }
+            if (element->directives->bind.head != NULL) {
+                const ir_bind_t *bind = NULL;
+                size_t index          = 0;
+
+                lua_createtable(
+                    L, table_size_hint(element->directives->bind.count), 0);
+                for (bind = element->directives->bind.head; bind != NULL;
+                     bind = bind->next) {
+                    push_expression(L, bind->expression);
+                    set_string_field(L, "name", bind->name.data,
+                                     bind->name.len);
+                    lua_rawseti(L, -2, checked_index(L, ++index));
+                }
+                lua_setfield(L, -2, "bind");
+            }
             lua_setfield(L, -2, "directives");
         }
         lua_createtable(L, table_size_hint(element->children.count), 0);

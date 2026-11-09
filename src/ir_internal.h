@@ -87,6 +87,10 @@ int ir_element_has_html(const ir_element_t *element);
 int ir_set_html(ir_element_t *element,
                 const struct reflow_expression_t *expression);
 int ir_element_has_include(const ir_element_t *element);
+int ir_element_has_bind(const ir_element_t *element, const char *name,
+                        size_t name_len);
+int ir_append_bind(ir_element_t *element, const char *name, size_t name_len,
+                   const struct reflow_expression_t *expression);
 int ir_set_include(ir_element_t *element,
                    const struct reflow_expression_t *expression);
 

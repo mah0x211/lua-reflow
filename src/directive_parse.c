@@ -419,10 +419,28 @@ static const expression_directive_t INCLUDE_DIRECTIVE = {
     .set               = ir_set_include,
 };
 
-static int parse_expression_directive(const directive_parse_ctx_t *ctx,
-                                      const expression_directive_t *directive,
-                                      const char *source, size_t source_len,
-                                      directive_parse_error_t *error)
+#define IR_BUILD_FAILURE_MESSAGE(errnum)                                       \
+    ((errnum) == ENOMEM ?                                                      \
+         "out of memory while building the intermediate representation" :      \
+         "failed to build the intermediate representation")
+
+/* Mark the Lua string at the stack top as the error message. */
+static int fail_with_pushed_message(lua_State *L,
+                                    directive_parse_error_t *error)
+{
+    error->message        = lua_tostring(L, -1);
+    error->message_pushed = 1;
+    errno                 = EINVAL;
+    return -1;
+}
+
+/* Parse one expression value and check its helper references, reporting
+ * failures with the messages of the JavaScript version. */
+static int parse_expression_value(const directive_parse_ctx_t *ctx,
+                                  const char *oom_message, const char *source,
+                                  size_t source_len,
+                                  directive_parse_error_t *error,
+                                  reflow_expression_t **result)
 {
     lua_State *L                    = ctx->L;
     int base                        = lua_gettop(L);
@@ -433,22 +451,14 @@ static int parse_expression_directive(const directive_parse_ctx_t *ctx,
     int status                      = -1;
     int errnum                      = 0;
 
-    if (directive->has(ctx->element)) {
-        error->message = directive->duplicate_message;
-        errno          = EINVAL;
-        return -1;
-    }
     if (is_blank(source, source_len)) {
         push_required_message(ctx);
-        error->message        = lua_tostring(L, -1);
-        error->message_pushed = 1;
-        errno                 = EINVAL;
-        return -1;
+        return fail_with_pushed_message(L, error);
     }
 
     scratch = pool_new(L, 0);
     if (scratch == NULL) {
-        error->message = directive->oom_message;
+        error->message = oom_message;
         return -1;
     }
     status = reflow_expr_parse(ir_pool(ctx->ir), scratch, source, source_len,
@@ -463,25 +473,40 @@ static int parse_expression_directive(const directive_parse_ctx_t *ctx,
 
     if (status != 0) {
         if (errnum == ENOMEM) {
-            error->message = directive->oom_message;
+            error->message = oom_message;
             return -1;
         }
         push_parse_message(ctx, source, &parse_error);
+        return fail_with_pushed_message(L, error);
     } else if (unknown != NULL) {
         push_unknown_helper_message(ctx, unknown);
-    } else if (directive->set(ctx->element, expression) != 0) {
-        error->message = errno == ENOMEM ?
-                             "out of memory while building the intermediate "
-                             "representation" :
-                             "failed to build the intermediate representation";
-        return -1;
-    } else {
-        return 0;
+        return fail_with_pushed_message(L, error);
     }
-    error->message        = lua_tostring(L, -1);
-    error->message_pushed = 1;
-    errno                 = EINVAL;
-    return -1;
+    *result = expression;
+    return 0;
+}
+
+static int parse_expression_directive(const directive_parse_ctx_t *ctx,
+                                      const expression_directive_t *directive,
+                                      const char *source, size_t source_len,
+                                      directive_parse_error_t *error)
+{
+    reflow_expression_t *expression = NULL;
+
+    if (directive->has(ctx->element)) {
+        error->message = directive->duplicate_message;
+        errno          = EINVAL;
+        return -1;
+    }
+    if (parse_expression_value(ctx, directive->oom_message, source, source_len,
+                               error, &expression) != 0) {
+        return -1;
+    }
+    if (directive->set(ctx->element, expression) != 0) {
+        error->message = IR_BUILD_FAILURE_MESSAGE(errno);
+        return -1;
+    }
+    return 0;
 }
 
 static int parse_text(const directive_parse_ctx_t *ctx, const char *suffix,
@@ -514,6 +539,51 @@ static int parse_include(const directive_parse_ctx_t *ctx, const char *suffix,
                                       source_len, error);
 }
 
+#define BIND_PREFIX     "bind:"
+#define BIND_PREFIX_LEN (sizeof(BIND_PREFIX) - 1)
+
+static int match_bind(const char *suffix, size_t suffix_len, const char *name,
+                      size_t name_len)
+{
+    return suffix_len >= name_len && memcmp(suffix, name, name_len) == 0;
+}
+
+static int parse_bind(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    lua_State *L                    = ctx->L;
+    const char *target              = suffix + BIND_PREFIX_LEN;
+    size_t target_len               = suffix_len - BIND_PREFIX_LEN;
+    reflow_expression_t *expression = NULL;
+    luaL_Buffer buffer;
+
+    if (target_len == 0) {
+        luaL_buffinit(L, &buffer);
+        luaL_addlstring(&buffer, ctx->attribute, ctx->attribute_len);
+        luaL_addstring(&buffer, ": attribute name after \"bind:\" is required");
+        luaL_pushresult(&buffer);
+        return fail_with_pushed_message(L, error);
+    }
+    if (ir_element_has_bind(ctx->element, target, target_len)) {
+        luaL_buffinit(L, &buffer);
+        luaL_addstring(&buffer, "duplicate x-bind:");
+        luaL_addlstring(&buffer, target, target_len);
+        luaL_addstring(&buffer, " on element");
+        luaL_pushresult(&buffer);
+        return fail_with_pushed_message(L, error);
+    }
+    if (parse_expression_value(ctx, "out of memory while parsing x-bind",
+                               source, source_len, error, &expression) != 0) {
+        return -1;
+    }
+    if (ir_append_bind(ctx->element, target, target_len, expression) != 0) {
+        error->message = IR_BUILD_FAILURE_MESSAGE(errno);
+        return -1;
+    }
+    return 0;
+}
+
 static const directive_parser_t parsers[] = {
     {
      .name     = "data",
@@ -538,6 +608,12 @@ static const directive_parser_t parsers[] = {
      .name_len = sizeof("include") - 1,
      .match    = match_exact,
      .parse    = parse_include,
+     },
+    {
+     .name     = BIND_PREFIX,
+     .name_len = BIND_PREFIX_LEN,
+     .match    = match_bind,
+     .parse    = parse_bind,
      },
 };
 
