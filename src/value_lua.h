@@ -70,6 +70,9 @@ int value_lua_is_truthy(lua_State *L, int idx);
  */
 void value_lua_push_number_string(lua_State *L, int idx);
 
+/* The length of the table at idx without calling metamethods. */
+size_t value_lua_raw_length(lua_State *L, int idx);
+
 /**
  * The JavaScript-style type name used in runtime error messages: "undefined"
  * for nil, "null", "boolean", "number", "string", "array" for a table whose

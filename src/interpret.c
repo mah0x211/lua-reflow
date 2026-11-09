@@ -48,12 +48,30 @@
 #define INTERPRET_HELPERS_IDX 3
 #define INTERPRET_FRAMES_IDX  4
 
-/* One open element (NULL for the root), the next child to render, and the
- * scope depth to restore when the element closes. */
+typedef enum {
+    FRAME_CHILDREN, /* the children of an open element, or of the root */
+    FRAME_FOR,      /* the iterations of an x-for element */
+    FRAME_EACH      /* the iterations of an x-each element */
+} frame_kind_t;
+
+/* A children frame holds an open element (NULL for the root) and the next
+ * child to render. A loop frame holds the element it repeats and its
+ * position: the next x-for value, or the next x-each array index or, for a
+ * hash table, the last key, kept on the Lua stack. scope_depth is restored
+ * when the frame is dropped, and a loop frame also restores the Lua stack
+ * to stack_base, dropping the collection, the key, and the table of loop
+ * variables. */
 typedef struct {
+    frame_kind_t kind;
     const ir_element_t *element;
     const ir_node_t *next;
     size_t scope_depth;
+    int stack_base;
+    int vars_idx;
+    int collection_idx;
+    int is_hash;
+    int index;
+    double value;
 } frame_t;
 
 typedef struct {
@@ -71,6 +89,8 @@ typedef struct {
     const reflow_expression_t *error_expression;
     const char *error_directive;
     const ir_bind_t *error_bind;
+    /* Set when x-break or x-break-if fired, until the innermost loop ends. */
+    int breaking;
 } render_ctx_t;
 
 /* HTML void elements never have an end tag. The list is the one used by the
@@ -92,8 +112,7 @@ static int is_void_element(const ir_string_t *tag)
     return 0;
 }
 
-static int push_frame(render_ctx_t *ctx, const ir_element_t *element,
-                      const ir_node_t *next, size_t scope_depth)
+static int push_frame_value(render_ctx_t *ctx, const frame_t *frame)
 {
     if (ctx->depth == ctx->capacity) {
         size_t capacity =
@@ -112,12 +131,21 @@ static int push_frame(render_ctx_t *ctx, const ir_element_t *element,
         ctx->frames   = frames;
         ctx->capacity = capacity;
     }
-    ctx->frames[ctx->depth++] = (frame_t){
+    ctx->frames[ctx->depth++] = *frame;
+    return 0;
+}
+
+static int push_frame(render_ctx_t *ctx, const ir_element_t *element,
+                      const ir_node_t *next, size_t scope_depth)
+{
+    frame_t frame = {
+        .kind        = FRAME_CHILDREN,
         .element     = element,
         .next        = next,
         .scope_depth = scope_depth,
     };
-    return 0;
+
+    return push_frame_value(ctx, &frame);
 }
 
 #define WRITE_LITERAL(out, s) render_output_write((out), (s), sizeof(s) - 1)
@@ -435,12 +463,32 @@ static int select_match_branch(render_ctx_t *ctx, const ir_element_t *element,
     return 0;
 }
 
+/* Called when an element has been written and its own frames dropped:
+ * x-break, or x-break-if with a truthy value, ends the innermost loop. */
+static int finish_element(render_ctx_t *ctx, const ir_element_t *element)
+{
+    const ir_directives_t *directives = element->directives;
+
+    if (directives == NULL) {
+        return 0;
+    } else if (directives->has_break) {
+        ctx->breaking = 1;
+    } else if (directives->break_condition != NULL) {
+        if (eval_expression(ctx, element, directives->break_condition) != 0) {
+            return -1;
+        }
+        ctx->breaking = value_lua_is_truthy(ctx->L, -1);
+        lua_pop(ctx->L, 1);
+    }
+    return 0;
+}
+
 /* Render an element as the JavaScript version does: push its x-data frame,
  * then its x-with frame, select the branch of an x-match, evaluate its
  * x-bind directives, write the start tag and its x-text or x-html content,
  * and open a frame for its children, or for the selected branch alone,
  * unless it has none. */
-static int render_element(render_ctx_t *ctx, const ir_element_t *element)
+static int render_element_once(render_ctx_t *ctx, const ir_element_t *element)
 {
     const ir_directives_t *directives = element->directives;
     size_t scope_depth                = ctx->scope.depth;
@@ -449,7 +497,10 @@ static int render_element(render_ctx_t *ctx, const ir_element_t *element)
     int has_content                   = 0;
     int content_rc                    = 0;
 
-    if (directives != NULL) {
+    if (directives != NULL && directives->invisible_marker) {
+        /* Only x-break or x-break-if: nothing is written. */
+        return finish_element(ctx, element);
+    } else if (directives != NULL) {
         if (directives->data_scopes != NULL &&
             (value_lua_push(ctx->L, ctx->pool, directives->data_scopes) != 0 ||
              scope_push(&ctx->scope, SCOPE_DATA) != 0)) {
@@ -488,7 +539,149 @@ static int render_element(render_ctx_t *ctx, const ir_element_t *element)
         return -1;
     }
     scope_pop_to(&ctx->scope, scope_depth);
-    return 0;
+    return finish_element(ctx, element);
+}
+
+/* Start the loop of an x-for or x-each element: evaluate the collection of
+ * an x-each outside the element's own frames, and push the frame of loop
+ * variables, which is reused for every iteration. The iterations are
+ * rendered by render_tree. */
+static int start_loop(render_ctx_t *ctx, const ir_element_t *element)
+{
+    lua_State *L                      = ctx->L;
+    const ir_directives_t *directives = element->directives;
+    frame_t frame                     = {
+        .element     = element,
+        .scope_depth = ctx->scope.depth,
+        .stack_base  = lua_gettop(L),
+    };
+
+    /* The collection, the key, the loop variables, and a copy of them. */
+    if (!lua_checkstack(L, 4)) {
+        ctx->error_element = element;
+        lua_pushliteral(L, "loops are too deeply nested");
+        return expr_eval_error(&ctx->eval);
+    }
+    if (directives->range != NULL) {
+        frame.kind  = FRAME_FOR;
+        frame.value = directives->range->start;
+    } else {
+        frame.kind = FRAME_EACH;
+        if (eval_expression(ctx, element, directives->each->collection) != 0) {
+            return -1;
+        } else if (lua_type(L, -1) != LUA_TTABLE) {
+            ctx->error_directive = "x-each";
+            lua_pushfstring(L, "x-each: expected array or object, got %s",
+                            value_lua_type_name(L, -1));
+            return raise_type_error(ctx, element, directives->each->collection);
+        }
+        frame.collection_idx = lua_gettop(L);
+        frame.index          = 1;
+        frame.is_hash        = value_lua_raw_length(L, -1) == 0;
+        if (frame.is_hash) {
+            lua_pushnil(L);
+        }
+    }
+    lua_createtable(L, 0, 2);
+    frame.vars_idx = lua_gettop(L);
+    lua_pushvalue(L, -1);
+    if (scope_push(&ctx->scope, SCOPE_LOOP) != 0) {
+        return -1;
+    }
+    return push_frame_value(ctx, &frame);
+}
+
+/* Render an element, or start its loop. */
+static int render_element(render_ctx_t *ctx, const ir_element_t *element)
+{
+    const ir_directives_t *directives = element->directives;
+
+    if (directives != NULL &&
+        (directives->range != NULL || directives->each != NULL)) {
+        return start_loop(ctx, element);
+    }
+    return render_element_once(ctx, element);
+}
+
+static void set_loop_variable(lua_State *L, int vars_idx,
+                              const ir_string_t *name)
+{
+    lua_pushlstring(L, name->data, name->len);
+    lua_insert(L, -2);
+    lua_rawset(L, vars_idx);
+}
+
+/* Push an x-for value as a Lua integer when it is one. */
+static void push_loop_number(lua_State *L, double value)
+{
+    if (value >= -9007199254740992.0 && value <= 9007199254740992.0) {
+        lua_pushinteger(L, (lua_Integer)value);
+    } else {
+        lua_pushnumber(L, (lua_Number)value);
+    }
+}
+
+/* Set the loop variables of the next iteration of the loop frame on top.
+ * Return 1 when there is one, or 0 when the loop has ended. */
+static int next_iteration(render_ctx_t *ctx, frame_t *frame)
+{
+    lua_State *L = ctx->L;
+
+    if (frame->kind == FRAME_FOR) {
+        const ir_for_t *range = frame->element->directives->range;
+
+        if (range->step > 0 ? frame->value > range->stop :
+                              frame->value < range->stop) {
+            return 0;
+        }
+        push_loop_number(L, frame->value);
+        set_loop_variable(L, frame->vars_idx, &range->name);
+        frame->value += range->step;
+        return 1;
+    } else {
+        const ir_each_t *each = frame->element->directives->each;
+
+        if (frame->is_hash) {
+            lua_pushvalue(L, frame->collection_idx + 1);
+            if (!lua_next(L, frame->collection_idx)) {
+                return 0;
+            }
+            set_loop_variable(L, frame->vars_idx, &each->item);
+            if (each->index.data != NULL) {
+                lua_pushvalue(L, -1);
+                set_loop_variable(L, frame->vars_idx, &each->index);
+            }
+            lua_replace(L, frame->collection_idx + 1);
+            return 1;
+        }
+        /* lua_rawgeti takes an int key before Lua 5.3; no array this long
+         * fits in memory. */
+        if (frame->index == INT_MAX) {
+            return 0;
+        }
+        lua_rawgeti(L, frame->collection_idx, frame->index);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return 0;
+        }
+        set_loop_variable(L, frame->vars_idx, &each->item);
+        if (each->index.data != NULL) {
+            lua_pushinteger(L, (lua_Integer)frame->index - 1);
+            set_loop_variable(L, frame->vars_idx, &each->index);
+        }
+        frame->index++;
+        return 1;
+    }
+}
+
+/* Drop the loop frame on top with its scope frame and Lua values. */
+static void end_loop(render_ctx_t *ctx)
+{
+    frame_t *frame = &ctx->frames[ctx->depth - 1];
+
+    scope_pop_to(&ctx->scope, frame->scope_depth);
+    lua_settop(ctx->L, frame->stack_base);
+    ctx->depth--;
 }
 
 /* Render the first branch of an x-if chain whose condition is truthy, or
@@ -556,7 +749,21 @@ static int render_tree(render_ctx_t *ctx)
         frame_t *frame        = &ctx->frames[ctx->depth - 1];
         const ir_node_t *node = frame->next;
 
-        if (node == NULL) {
+        if (frame->kind != FRAME_CHILDREN) {
+            /* A break ends the innermost loop. render_element_once may move
+             * the frame array, so the loop position is advanced first. */
+            if (ctx->breaking) {
+                ctx->breaking = 0;
+                end_loop(ctx);
+            } else if (!next_iteration(ctx, frame)) {
+                end_loop(ctx);
+            } else if (render_element_once(ctx, frame->element) != 0) {
+                return -1;
+            }
+            continue;
+        } else if (node == NULL || ctx->breaking) {
+            /* The element is complete, or a break closes it on its way to
+             * the innermost loop. */
             const ir_element_t *element = frame->element;
             size_t scope_depth          = frame->scope_depth;
 
@@ -565,6 +772,10 @@ static int render_tree(render_ctx_t *ctx)
                 return -1;
             }
             scope_pop_to(&ctx->scope, scope_depth);
+            if (element != NULL && !ctx->breaking &&
+                finish_element(ctx, element) != 0) {
+                return -1;
+            }
             continue;
         }
         /* render_node may move the frame array, so advance first. */

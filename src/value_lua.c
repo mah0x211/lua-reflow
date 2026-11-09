@@ -216,7 +216,7 @@ void value_lua_push_number_string(lua_State *L, int idx)
     lua_pushlstring(L, buf, len);
 }
 
-static size_t raw_length(lua_State *L, int idx)
+size_t value_lua_raw_length(lua_State *L, int idx)
 {
 #if LUA_VERSION_NUM == 501
     return lua_objlen(L, idx);
@@ -233,7 +233,7 @@ const char *value_lua_type_name(lua_State *L, int idx)
     case LUA_TLIGHTUSERDATA:
         return lua_touserdata(L, idx) == NULL ? "null" : "userdata";
     case LUA_TTABLE:
-        return raw_length(L, idx) > 0 ? "array" : "object";
+        return value_lua_raw_length(L, idx) > 0 ? "array" : "object";
     default:
         return lua_typename(L, lua_type(L, idx));
     }
