@@ -497,8 +497,12 @@ static lxb_html_token_t *html_token_done(lxb_html_tokenizer_t *tokenizer,
         ctx->handler->on_comment(ctx->handler->ctx, comment, comment_len);
         return token;
     }
-    case LXB_TAG__EM_DOCTYPE:
     case LXB_TAG__END_OF_FILE:
+        if (ctx->handler->on_document_end != NULL) {
+            ctx->handler->on_document_end(ctx->handler->ctx);
+        }
+        return token;
+    case LXB_TAG__EM_DOCTYPE:
     case LXB_TAG__DOCUMENT:
     case LXB_TAG__UNDEF:
         return token;

@@ -32,6 +32,7 @@
 #include "ir_internal.h"
 #include "json5.h"
 #include "pool.h"
+#include "reflow_util.h"
 
 typedef int (*directive_match_fn)(const char *suffix, size_t suffix_len,
                                   const char *name, size_t name_len);
@@ -126,91 +127,6 @@ cleanup:
     lua_settop(ctx->L, base);
     errno = errnum;
     return status;
-}
-
-/* Decode one UTF-8 sequence at s[*pos] and advance *pos. Return -1 for an
- * invalid or truncated sequence. */
-static long decode_utf8(const char *s, size_t len, size_t *pos)
-{
-    unsigned char lead = (unsigned char)s[*pos];
-    size_t count       = 0;
-    long code          = 0;
-    size_t i           = 0;
-
-    if (lead < 0x80) {
-        (*pos)++;
-        return (long)lead;
-    } else if (lead >= 0xf0 && lead <= 0xf4) {
-        count = 3;
-        code  = lead & 0x07;
-    } else if (lead >= 0xe0) {
-        count = 2;
-        code  = lead & 0x0f;
-    } else if (lead >= 0xc2) {
-        count = 1;
-        code  = lead & 0x1f;
-    } else {
-        return -1;
-    }
-    if (count > len - *pos - 1) {
-        return -1;
-    }
-    for (i = 1; i <= count; i++) {
-        unsigned char next = (unsigned char)s[*pos + i];
-
-        if ((next & 0xc0) != 0x80) {
-            return -1;
-        }
-        code = (code << 6) | (long)(next & 0x3f);
-    }
-    *pos += count + 1;
-    return code;
-}
-
-/* Report whether a code point is removed by JavaScript's
- * String.prototype.trim(). */
-static int is_js_space(long code)
-{
-    return (code >= 0x09 && code <= 0x0d) || code == 0x20 || code == 0xa0 ||
-           code == 0x1680 || (code >= 0x2000 && code <= 0x200a) ||
-           code == 0x2028 || code == 0x2029 || code == 0x202f ||
-           code == 0x205f || code == 0x3000 || code == 0xfeff;
-}
-
-/* Narrow [*start, *end) of s the way String.prototype.trim() does. */
-static void trim_js(const char *s, size_t *start, size_t *end)
-{
-    while (*start < *end) {
-        size_t next = *start;
-
-        if (!is_js_space(decode_utf8(s, *end, &next))) {
-            break;
-        }
-        *start = next;
-    }
-    while (*end > *start) {
-        size_t lead = *end - 1;
-        size_t next = 0;
-
-        while (lead > *start && ((unsigned char)s[lead] & 0xc0) == 0x80) {
-            lead--;
-        }
-        next = lead;
-        if (!is_js_space(decode_utf8(s, *end, &next)) || next != *end) {
-            break;
-        }
-        *end = lead;
-    }
-}
-
-/* Report whether the value is empty after String.prototype.trim(). */
-static int is_blank(const char *value, size_t len)
-{
-    size_t start = 0;
-    size_t end   = len;
-
-    trim_js(value, &start, &end);
-    return start == end;
 }
 
 /* Convert a byte offset in UTF-8 source to the UTF-16 code unit offset that
@@ -499,7 +415,7 @@ static int parse_expression_value(const directive_parse_ctx_t *ctx,
     int status                      = -1;
     int errnum                      = 0;
 
-    if (is_blank(source, source_len)) {
+    if (reflow_js_is_blank(source, source_len)) {
         push_required_message(ctx);
         return fail_with_pushed_message(L, error);
     }
@@ -535,6 +451,20 @@ static int parse_expression_value(const directive_parse_ctx_t *ctx,
     *result = expression;
     return 0;
 }
+
+static const expression_directive_t IF_DIRECTIVE = {
+    .duplicate_message = "duplicate x-if on element",
+    .oom_message       = "out of memory while parsing x-if",
+    .has               = ir_element_has_if,
+    .set               = ir_set_if,
+};
+
+static const expression_directive_t ELSEIF_DIRECTIVE = {
+    .duplicate_message = "duplicate x-elseif on element",
+    .oom_message       = "out of memory while parsing x-elseif",
+    .has               = ir_element_has_elseif,
+    .set               = ir_set_elseif,
+};
 
 static int parse_expression_directive(const directive_parse_ctx_t *ctx,
                                       const expression_directive_t *directive,
@@ -577,6 +507,58 @@ static int parse_html(const directive_parse_ctx_t *ctx, const char *suffix,
     (void)suffix_len;
     return parse_expression_directive(ctx, &HTML_DIRECTIVE, source, source_len,
                                       error);
+}
+
+static int parse_if(const directive_parse_ctx_t *ctx, const char *suffix,
+                    size_t suffix_len, const char *source, size_t source_len,
+                    directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_expression_directive(ctx, &IF_DIRECTIVE, source, source_len,
+                                      error);
+}
+
+static int parse_elseif(const directive_parse_ctx_t *ctx, const char *suffix,
+                        size_t suffix_len, const char *source,
+                        size_t source_len, directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_expression_directive(ctx, &ELSEIF_DIRECTIVE, source,
+                                      source_len, error);
+}
+
+/* A marker directive takes no value; only an empty or blank value is
+ * accepted, as in the JavaScript version. */
+static int parse_else(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    lua_State *L = ctx->L;
+
+    (void)suffix;
+    (void)suffix_len;
+    if (ir_element_has_else(ctx->element)) {
+        error->message = "duplicate x-else on element";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (!reflow_js_is_blank(source, source_len)) {
+        lua_pushlstring(L, ctx->attribute, ctx->attribute_len);
+        lua_pushliteral(L, ": must not have a value; got \"");
+        lua_pushlstring(L, ctx->attribute, ctx->attribute_len);
+        lua_pushliteral(L, "=\"");
+        lua_pushlstring(L, source, source_len);
+        lua_pushliteral(L, "\"\"");
+        lua_concat(L, 6);
+        return fail_with_pushed_message(L, error);
+    }
+    if (ir_set_else(ctx->element) != 0) {
+        error->message = IR_BUILD_FAILURE_MESSAGE(errno);
+        return -1;
+    }
+    return 0;
 }
 
 static int parse_include(const directive_parse_ctx_t *ctx, const char *suffix,
@@ -758,7 +740,7 @@ static int parse_with(const directive_parse_ctx_t *ctx, const char *suffix,
             return fail_with_pushed_message(L, error);
         }
         value_end = pos;
-        trim_js(source, &value_start, &value_end);
+        reflow_js_trim(source, &value_start, &value_end);
         if (value_start == value_end) {
             release_scratch(L, scratch, base);
             push_with_name_message(L,
@@ -899,6 +881,24 @@ static const directive_parser_t parsers[] = {
      .parse    = parse_include,
      },
     {
+     .name     = "if",
+     .name_len = sizeof("if") - 1,
+     .match    = match_exact,
+     .parse    = parse_if,
+     },
+    {
+     .name     = "elseif",
+     .name_len = sizeof("elseif") - 1,
+     .match    = match_exact,
+     .parse    = parse_elseif,
+     },
+    {
+     .name     = "else",
+     .name_len = sizeof("else") - 1,
+     .match    = match_exact,
+     .parse    = parse_else,
+     },
+    {
      .name     = "with",
      .name_len = sizeof("with") - 1,
      .match    = match_exact,
@@ -918,7 +918,17 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
     const ir_element_t *element = ctx->element;
     int content                 = 0;
 
-    *error  = (directive_parse_error_t){0};
+    *error = (directive_parse_error_t){0};
+    if (ir_element_has_if(element) + ir_element_has_elseif(element) +
+            ir_element_has_else(element) >
+        1) {
+        error->message =
+            "conflicting structural directives on same element "
+            "(x-if / x-elseif / x-else / x-match / x-case / x-nocase are "
+            "mutually exclusive)";
+        errno = EINVAL;
+        return -1;
+    }
     content = ir_element_has_text(element) + ir_element_has_html(element) +
               ir_element_has_include(element);
     if (content > 1) {

@@ -91,6 +91,19 @@ int ir_element_has_bind(const ir_element_t *element, const char *name,
                         size_t name_len);
 int ir_append_bind(ir_element_t *element, const char *name, size_t name_len,
                    const struct reflow_expression_t *expression);
+int ir_element_has_if(const ir_element_t *element);
+int ir_set_if(ir_element_t *element,
+              const struct reflow_expression_t *expression);
+int ir_element_has_elseif(const ir_element_t *element);
+int ir_set_elseif(ir_element_t *element,
+                  const struct reflow_expression_t *expression);
+int ir_element_has_else(const ir_element_t *element);
+int ir_set_else(ir_element_t *element);
+ir_chain_t *ir_new_chain(ir_t *ir, size_t source_start, size_t source_end);
+int ir_chain_append_branch(ir_t *ir, ir_chain_t *chain,
+                           const struct reflow_expression_t *condition,
+                           ir_node_t *node);
+ir_node_list_t *ir_node_children(ir_node_t *node);
 int ir_element_has_with(const ir_element_t *element, const char *name,
                         size_t name_len);
 int ir_append_with(ir_element_t *element, const char *name, size_t name_len,

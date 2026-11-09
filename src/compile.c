@@ -36,6 +36,7 @@
 #include "ir_lua.h"
 #include "pool.h"
 #include "snippet.h"
+#include "structure.h"
 
 #define COMPILE_OPERATION "reflow.compile"
 
@@ -123,11 +124,11 @@ static void push_element_name(lua_State *L, const ir_element_t *element)
     lua_concat(L, 3);
 }
 
-static void push_directive_error_meta(compile_ctx_t *ctx, const char *attribute,
-                                      size_t attribute_len)
+static void push_element_error_meta(compile_ctx_t *ctx,
+                                    const ir_element_t *element,
+                                    const char *attribute, size_t attribute_len)
 {
     lua_State *L                      = ctx->L;
-    const ir_element_t *element       = ctx->pending_element;
     reflow_source_location_t location = reflow_source_location(
         ctx->ir->html.data, ctx->ir->html.len, element->source_start);
 
@@ -194,7 +195,8 @@ static void compile_raise_directive_error(compile_ctx_t *ctx,
         lua_remove(L, cause_meta_idx);
         cause_idx = lua_gettop(L);
     }
-    push_directive_error_meta(ctx, attribute, attribute_len);
+    push_element_error_meta(ctx, ctx->pending_element, attribute,
+                            attribute_len);
     meta_idx = lua_gettop(L);
     if (error->expression != NULL) {
         push_expression_location(L, error);
@@ -315,6 +317,35 @@ static void on_start_tag_end(void *data, int is_void_element)
     }
 }
 
+/* Raise a compile error located at an element, for checks that run after
+ * the element and its siblings have been parsed. */
+static void compile_raise_element_error(compile_ctx_t *ctx,
+                                        const ir_element_t *element,
+                                        const char *message)
+{
+    lua_State *L = ctx->L;
+    int meta_idx = 0;
+
+    push_element_error_meta(ctx, element, NULL, 0);
+    meta_idx = lua_gettop(L);
+    reflow_error_push_compile(L, COMPILE_OPERATION, message, 0, meta_idx);
+    lua_remove(L, meta_idx);
+    ctx->structured_failure = 1;
+    (void)lua_error(L);
+}
+
+static void close_children(compile_ctx_t *ctx, ir_node_t *parent)
+{
+    structure_error_t error = {0};
+
+    if (structure_close_children(ctx->ir, parent, &error) != 0) {
+        if (errno == EINVAL && error.message != NULL) {
+            compile_raise_element_error(ctx, error.element, error.message);
+        }
+        compile_raise_ir_error(ctx);
+    }
+}
+
 static void on_element_end(void *data)
 {
     compile_ctx_t *ctx = (compile_ctx_t *)data;
@@ -330,7 +361,31 @@ static void on_element_end(void *data)
         compile_raise(ctx, "lost the parent of an HTML element", NULL, 0);
         return;
     }
+    close_children(ctx, ctx->current_parent);
     ctx->current_parent = parent;
+}
+
+/* Elements still open at the end of the document are treated as closed
+ * there, innermost first, so their children are finalized and checked like
+ * those of closed elements. The root is finalized last. */
+static void on_document_end(void *data)
+{
+    compile_ctx_t *ctx = (compile_ctx_t *)data;
+
+    while (ctx->current_parent != NULL &&
+           ctx->current_parent->type == IR_ELEMENT) {
+        ir_node_t *parent = ir_node_parent(ctx->current_parent);
+
+        if (parent == NULL) {
+            compile_raise(ctx, "lost the parent of an HTML element", NULL, 0);
+            return;
+        }
+        close_children(ctx, ctx->current_parent);
+        ctx->current_parent = parent;
+    }
+    if (ctx->current_parent != NULL) {
+        close_children(ctx, ctx->current_parent);
+    }
 }
 
 static void on_text(void *data, const char *text, size_t text_len)
@@ -507,6 +562,7 @@ static int compile_lua(lua_State *L)
         .on_element_end   = on_element_end,
         .on_text          = on_text,
         .on_comment       = on_comment,
+        .on_document_end  = on_document_end,
     };
     status = reflow_html_parse(L, ir->html.data, ir->html.len, &handler);
     release_helper_names(ir, helpers);

@@ -24,6 +24,7 @@
 #define REFLOW_UTIL_H
 
 #include <lua.h>
+#include <stddef.h>
 
 typedef void (*reflow_cleanup_f)(lua_State *L, void *ctx);
 
@@ -43,5 +44,13 @@ typedef void (*reflow_cleanup_f)(lua_State *L, void *ctx);
  */
 int reflow_pcall_ex(lua_State *L, lua_CFunction operation, void *ctx, int nargs,
                     int nresults, reflow_cleanup_f cleanup);
+
+/* Narrow [*start, *end) of s the way JavaScript's String.prototype.trim()
+ * removes whitespace. s holds UTF-8 text. */
+void reflow_js_trim(const char *s, size_t *start, size_t *end);
+
+/* Report whether s is empty after String.prototype.trim(). This is also the
+ * whitespace class of JavaScript's /^\s*$/. */
+int reflow_js_is_blank(const char *s, size_t len);
 
 #endif /* REFLOW_UTIL_H */
