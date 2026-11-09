@@ -64,4 +64,14 @@ int render_output_write_attr_value(render_output_t *out, const char *s,
  */
 int render_output_write_text(render_output_t *out, const char *s, size_t len);
 
+/**
+ * Append a computed value for a double-quoted attribute, as JavaScript's
+ * escapeAttr does: '&', '<', '>', and '"' become "&amp;", "&lt;", "&gt;", and
+ * "&quot;"; "'" is kept.
+ *
+ * @return 0 on success, or -1 with errno set to ENOMEM.
+ */
+int render_output_write_attr_text(render_output_t *out, const char *s,
+                                  size_t len);
+
 #endif /* REFLOW_RENDER_OUTPUT_H */

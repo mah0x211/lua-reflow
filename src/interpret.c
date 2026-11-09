@@ -21,6 +21,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -69,6 +70,7 @@ typedef struct {
     const ir_element_t *error_element;
     const reflow_expression_t *error_expression;
     const char *error_directive;
+    const ir_bind_t *error_bind;
 } render_ctx_t;
 
 /* HTML void elements never have an end tag. The list is the one used by the
@@ -120,9 +122,75 @@ static int push_frame(render_ctx_t *ctx, const ir_element_t *element,
 
 #define WRITE_LITERAL(out, s) render_output_write((out), (s), sizeof(s) - 1)
 
-static int write_start_tag(render_output_t *out, const ir_element_t *element)
+static int same_name(const ir_string_t *a, const ir_string_t *b)
+{
+    return a->len == b->len && memcmp(a->data, b->data, a->len) == 0;
+}
+
+/* Return the 0-based position of the x-bind targeting name, or -1. */
+static int find_bind(const ir_bind_list_t *binds, const ir_string_t *name)
+{
+    const ir_bind_t *bind = NULL;
+    int i                 = 0;
+
+    for (bind = binds->head; bind != NULL; bind = bind->next, i++) {
+        if (same_name(&bind->name, name)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int has_attr(const ir_attr_list_t *attrs, const ir_string_t *name)
 {
     const ir_attr_t *attr = NULL;
+
+    for (attr = attrs->head; attr != NULL; attr = attr->next) {
+        if (same_name(&attr->name, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Write a computed attribute from the value at idx: false omits it, true
+ * writes the bare name, and a string is written escaped as the value. */
+static int write_bound_attr(lua_State *L, render_output_t *out,
+                            const ir_string_t *name, int idx)
+{
+    const char *s = NULL;
+    size_t len    = 0;
+
+    if (lua_type(L, idx) == LUA_TBOOLEAN && !lua_toboolean(L, idx)) {
+        return 0;
+    } else if (WRITE_LITERAL(out, " ") != 0 ||
+               render_output_write(out, name->data, name->len) != 0) {
+        return -1;
+    } else if (lua_type(L, idx) == LUA_TBOOLEAN) {
+        return 0;
+    }
+    s = lua_tolstring(L, idx, &len);
+    if (WRITE_LITERAL(out, "=\"") != 0 ||
+        render_output_write_attr_text(out, s, len) != 0) {
+        return -1;
+    }
+    return WRITE_LITERAL(out, "\"");
+}
+
+/* Write the start tag. The values of the element's x-bind directives are on
+ * top of the stack in source order, as left by push_bind_values. A bound
+ * attribute replaces every source attribute of the same name in place;
+ * the others follow the source attributes in source order. */
+static int write_start_tag(lua_State *L, render_output_t *out,
+                           const ir_element_t *element)
+{
+    const ir_bind_list_t *binds =
+        element->directives ? &element->directives->bind : NULL;
+    int nbinds            = binds ? (int)binds->count : 0;
+    int base              = lua_gettop(L) - nbinds;
+    const ir_attr_t *attr = NULL;
+    const ir_bind_t *bind = NULL;
+    int i                 = 0;
 
     if (WRITE_LITERAL(out, "<") != 0 ||
         render_output_write(out, element->tag_name.data,
@@ -130,12 +198,26 @@ static int write_start_tag(render_output_t *out, const ir_element_t *element)
         return -1;
     }
     for (attr = element->attrs.head; attr != NULL; attr = attr->next) {
-        if (WRITE_LITERAL(out, " ") != 0 ||
-            render_output_write(out, attr->name.data, attr->name.len) != 0 ||
-            WRITE_LITERAL(out, "=\"") != 0 ||
-            render_output_write_attr_value(out, attr->value.data,
-                                           attr->value.len) != 0 ||
-            WRITE_LITERAL(out, "\"") != 0) {
+        int pos = nbinds ? find_bind(binds, &attr->name) : -1;
+
+        if (pos >= 0) {
+            if (write_bound_attr(L, out, &attr->name, base + 1 + pos) != 0) {
+                return -1;
+            }
+        } else if (WRITE_LITERAL(out, " ") != 0 ||
+                   render_output_write(out, attr->name.data, attr->name.len) !=
+                       0 ||
+                   WRITE_LITERAL(out, "=\"") != 0 ||
+                   render_output_write_attr_value(out, attr->value.data,
+                                                  attr->value.len) != 0 ||
+                   WRITE_LITERAL(out, "\"") != 0) {
+            return -1;
+        }
+    }
+    for (bind = nbinds ? binds->head : NULL; bind != NULL;
+         bind = bind->next, i++) {
+        if (!has_attr(&element->attrs, &bind->name) &&
+            write_bound_attr(L, out, &bind->name, base + 1 + i) != 0) {
             return -1;
         }
     }
@@ -152,6 +234,57 @@ static int write_end_tag(render_output_t *out, const ir_element_t *element)
     return WRITE_LITERAL(out, ">");
 }
 
+/* Evaluate an expression of element, recording both for the meta of an error
+ * raised meanwhile. */
+static int eval_expression(render_ctx_t *ctx, const ir_element_t *element,
+                           const reflow_expression_t *expression)
+{
+    ctx->error_element    = element;
+    ctx->error_expression = expression;
+    if (expr_eval(&ctx->eval, expression) != 0) {
+        return -1;
+    }
+    ctx->error_element    = NULL;
+    ctx->error_expression = NULL;
+    return 0;
+}
+
+/* Raise the type error of a directive whose value is on top of the stack.
+ * The site of the evaluation is restored for the meta. */
+static int raise_type_error(render_ctx_t *ctx, const ir_element_t *element,
+                            const reflow_expression_t *expression)
+{
+    ctx->error_element    = element;
+    ctx->error_expression = expression;
+    return expr_eval_error(&ctx->eval);
+}
+
+/* Write the value of an x-html expression unescaped. nil and null write
+ * nothing; any other value that is not a string is an error. */
+static int write_html_content(render_ctx_t *ctx, const ir_element_t *element,
+                              const reflow_expression_t *expression)
+{
+    lua_State *L  = ctx->L;
+    const char *s = NULL;
+    size_t len    = 0;
+    int rc        = 0;
+
+    if (eval_expression(ctx, element, expression) != 0) {
+        return -1;
+    } else if (lua_type(L, -1) == LUA_TSTRING) {
+        s  = lua_tolstring(L, -1, &len);
+        rc = render_output_write(&ctx->out, s, len);
+    } else if (!value_lua_is_nullish(L, -1)) {
+        ctx->error_directive = "x-html";
+        lua_pushfstring(
+            L, "x-html: value must be string, null, or undefined, got %s",
+            value_lua_type_name(L, -1));
+        return raise_type_error(ctx, element, expression);
+    }
+    lua_pop(L, 1);
+    return rc;
+}
+
 /* Write the value of an x-text expression as escaped text. nil and null
  * write nothing; tables, functions, userdata, and threads are errors. */
 static int write_text_content(render_ctx_t *ctx, const ir_element_t *element,
@@ -162,9 +295,7 @@ static int write_text_content(render_ctx_t *ctx, const ir_element_t *element,
     size_t len    = 0;
     int rc        = 0;
 
-    ctx->error_element    = element;
-    ctx->error_expression = expression;
-    if (expr_eval(&ctx->eval, expression) != 0) {
+    if (eval_expression(ctx, element, expression) != 0) {
         return -1;
     }
     switch (lua_type(L, -1)) {
@@ -191,43 +322,126 @@ static int write_text_content(render_ctx_t *ctx, const ir_element_t *element,
         ctx->error_directive = "x-text";
         lua_pushfstring(L, "x-text: value must be primitive, got %s",
                         value_lua_type_name(L, -1));
-        return expr_eval_error(&ctx->eval);
+        return raise_type_error(ctx, element, expression);
     }
     lua_pop(L, 1);
-    ctx->error_element    = NULL;
-    ctx->error_expression = NULL;
     return rc;
 }
 
-/* Render an element: push its x-data frame, write the start tag and its
- * x-text content, and open a frame for its children unless it has none. */
+/* Evaluate every x-with binding against the current scope, then push them
+ * as one data frame, so that the bindings do not see each other. A binding
+ * to nil is kept so that it still hides outer bindings of the name. */
+static int push_with_frame(render_ctx_t *ctx, const ir_element_t *element)
+{
+    lua_State *L               = ctx->L;
+    const ir_with_list_t *list = &element->directives->with;
+    const ir_with_t *with      = NULL;
+
+    lua_createtable(L, 0, list->count > INT_MAX ? 0 : (int)list->count);
+    for (with = list->head; with != NULL; with = with->next) {
+        if (eval_expression(ctx, element, with->expression) != 0) {
+            return -1;
+        } else if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            scope_push_undefined(L);
+        }
+        lua_pushlstring(L, with->name.data, with->name.len);
+        lua_insert(L, -2);
+        lua_rawset(L, -3);
+    }
+    return scope_push(&ctx->scope, SCOPE_DATA);
+}
+
+/* Evaluate the x-bind directives in source order and leave one value per
+ * directive on the stack: false to omit the attribute, true for a bare
+ * attribute, or the string value. Numbers are converted as String(n) is in
+ * JavaScript; tables, functions, userdata, and threads are errors. */
+static int push_bind_values(render_ctx_t *ctx, const ir_element_t *element)
+{
+    lua_State *L          = ctx->L;
+    const ir_bind_t *bind = NULL;
+
+    for (bind = element->directives->bind.head; bind != NULL;
+         bind = bind->next) {
+        /* The values stay on the stack until the start tag is written.
+         * Reserve the room an evaluation starts with, so that running out
+         * of stack is reported as too many directives. */
+        if (!lua_checkstack(L, LUA_MINSTACK)) {
+            ctx->error_element = element;
+            lua_pushliteral(L, "too many x-bind directives on one element");
+            return expr_eval_error(&ctx->eval);
+        } else if (eval_expression(ctx, element, bind->expression) != 0) {
+            return -1;
+        }
+        switch (lua_type(L, -1)) {
+        case LUA_TBOOLEAN:
+        case LUA_TSTRING:
+            break;
+        case LUA_TNUMBER:
+            value_lua_push_number_string(L, -1);
+            lua_replace(L, -2);
+            break;
+        default:
+            if (value_lua_is_nullish(L, -1)) {
+                lua_pop(L, 1);
+                lua_pushboolean(L, 0);
+                break;
+            }
+            ctx->error_bind = bind;
+            lua_pushliteral(L, "x-bind:");
+            lua_pushlstring(L, bind->name.data, bind->name.len);
+            lua_pushfstring(L, ": value must be primitive, got %s",
+                            value_lua_type_name(L, -3));
+            lua_concat(L, 3);
+            return raise_type_error(ctx, element, bind->expression);
+        }
+    }
+    return 0;
+}
+
+/* Render an element as the JavaScript version does: push its x-data frame,
+ * then its x-with frame, evaluate its x-bind directives, write the start tag
+ * and its x-text or x-html content, and open a frame for its children unless
+ * it has none. */
 static int render_element(render_ctx_t *ctx, const ir_element_t *element)
 {
     const ir_directives_t *directives = element->directives;
     size_t scope_depth                = ctx->scope.depth;
     int is_void                       = is_void_element(&element->tag_name);
+    int content_rc                    = 0;
 
-    if (directives != NULL && directives->data_scopes != NULL &&
-        (value_lua_push(ctx->L, ctx->pool, directives->data_scopes) != 0 ||
-         scope_push(&ctx->scope, SCOPE_DATA) != 0)) {
-        return -1;
-    } else if (write_start_tag(&ctx->out, element) != 0) {
-        return -1;
-    }
-    if (directives != NULL && directives->text != NULL) {
-        /* x-text replaces the children. A void element keeps no end tag, as
-         * in the JavaScript version. */
-        if (write_text_content(ctx, element, directives->text) != 0 ||
-            (!is_void && write_end_tag(&ctx->out, element) != 0)) {
+    if (directives != NULL) {
+        if (directives->data_scopes != NULL &&
+            (value_lua_push(ctx->L, ctx->pool, directives->data_scopes) != 0 ||
+             scope_push(&ctx->scope, SCOPE_DATA) != 0)) {
+            return -1;
+        } else if (directives->with.count > 0 &&
+                   push_with_frame(ctx, element) != 0) {
+            return -1;
+        } else if (push_bind_values(ctx, element) != 0) {
             return -1;
         }
-        scope_pop_to(&ctx->scope, scope_depth);
-        return 0;
-    } else if (is_void) {
-        scope_pop_to(&ctx->scope, scope_depth);
-        return 0;
     }
-    return push_frame(ctx, element, element->children.head, scope_depth);
+    if (write_start_tag(ctx->L, &ctx->out, element) != 0) {
+        return -1;
+    } else if (directives != NULL) {
+        lua_pop(ctx->L, (int)directives->bind.count);
+    }
+    /* x-text and x-html replace the children. A void element keeps no end
+     * tag even with content, as in the JavaScript version. */
+    if (directives != NULL && directives->text != NULL) {
+        content_rc = write_text_content(ctx, element, directives->text);
+    } else if (directives != NULL && directives->html != NULL) {
+        content_rc = write_html_content(ctx, element, directives->html);
+    } else if (!is_void) {
+        return push_frame(ctx, element, element->children.head, scope_depth);
+    }
+    if (content_rc != 0 ||
+        (!is_void && write_end_tag(&ctx->out, element) != 0)) {
+        return -1;
+    }
+    scope_pop_to(&ctx->scope, scope_depth);
+    return 0;
 }
 
 /* Render one node. An element that may have children opens a new frame;
@@ -320,6 +534,7 @@ typedef struct {
     const ir_element_t *element;
     const reflow_expression_t *expression;
     const char *directive;
+    const ir_bind_t *bind;
 } error_site_t;
 
 static void push_error_meta(lua_State *L, const error_site_t *site)
@@ -359,6 +574,14 @@ static void push_error_meta(lua_State *L, const error_site_t *site)
     if (site->directive != NULL) {
         lua_pushstring(L, site->directive);
         lua_setfield(L, -2, "directive");
+    }
+    if (site->bind != NULL) {
+        lua_pushliteral(L, "x-bind:");
+        lua_pushlstring(L, site->bind->name.data, site->bind->name.len);
+        lua_concat(L, 2);
+        lua_setfield(L, -2, "directive");
+        lua_pushlstring(L, site->bind->name.data, site->bind->name.len);
+        lua_setfield(L, -2, "attribute");
     }
 }
 
@@ -467,6 +690,7 @@ static int render_lua(lua_State *L)
         site.element    = ctx.error_element;
         site.expression = ctx.error_expression;
         site.directive  = ctx.error_directive;
+        site.bind       = ctx.error_bind;
         if (ctx.eval.raised) {
             /* The renderer raised its own message. */
             message = lua_tostring(L, base + 1);
