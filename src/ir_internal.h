@@ -110,6 +110,10 @@ int ir_set_nocase(ir_element_t *element);
 int ir_element_has_for(const ir_element_t *element);
 int ir_set_for(ir_element_t *element, const char *name, size_t name_len,
                double start, double stop, double step);
+int ir_element_has_each(const ir_element_t *element);
+int ir_set_each(ir_element_t *element, const char *item, size_t item_len,
+                const char *index, size_t index_len,
+                const struct reflow_expression_t *collection);
 int ir_append_match_branch(ir_t *ir, ir_element_t *element,
                            const struct reflow_expression_t *condition,
                            ir_node_t *node);

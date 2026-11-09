@@ -626,6 +626,19 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 lua_setfield(L, -2, "step");
                 lua_setfield(L, -2, "for");
             }
+            if (element->directives->each != NULL) {
+                const ir_each_t *each = element->directives->each;
+
+                lua_createtable(L, 0, 3);
+                set_string_field(L, "item", each->item.data, each->item.len);
+                if (each->index.data != NULL) {
+                    set_string_field(L, "index", each->index.data,
+                                     each->index.len);
+                }
+                push_expression(L, each->collection);
+                lua_setfield(L, -2, "collection");
+                lua_setfield(L, -2, "each");
+            }
             if (element->directives->with.head != NULL) {
                 const ir_with_t *with = NULL;
                 size_t index          = 0;

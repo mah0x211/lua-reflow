@@ -53,4 +53,8 @@ void reflow_js_trim(const char *s, size_t *start, size_t *end);
  * whitespace class of JavaScript's /^\s*$/. */
 int reflow_js_is_blank(const char *s, size_t len);
 
+/* Return the byte length of the character at s[pos] when it belongs to the
+ * whitespace class of JavaScript's \s, or 0 otherwise. pos must be < len. */
+size_t reflow_js_space_len(const char *s, size_t len, size_t pos);
+
 #endif /* REFLOW_UTIL_H */
