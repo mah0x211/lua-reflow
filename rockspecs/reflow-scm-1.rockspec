@@ -50,6 +50,7 @@ build = {
         ["reflow.compile"] = {
             sources = {
                 "src/compile.c",
+                "src/dom_index.c",
                 "src/html_lexbor.c",
                 "src/ir.c",
                 "src/ir_lua.c",

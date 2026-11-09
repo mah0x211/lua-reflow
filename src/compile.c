@@ -29,6 +29,7 @@
 
 #include "compat.h"
 #include "directive_parse.h"
+#include "dom_index.h"
 #include "error.h"
 #include "html.h"
 #include "ir.h"
@@ -438,6 +439,9 @@ static void on_document_end(void *data)
         compile_raise_element_error(
             ctx, ctx->misplaced_break,
             "x-break / x-break-if outside of x-for or x-each");
+    }
+    if (dom_index_build(ctx->ir) != 0) {
+        compile_raise_ir_error(ctx);
     }
 }
 

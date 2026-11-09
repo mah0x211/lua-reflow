@@ -47,10 +47,11 @@ static int ir_gc_lua(lua_State *L)
 
     if (owner != NULL && owner->pool != NULL) {
         pool_delete(L, owner->pool);
-        owner->pool        = NULL;
-        owner->public.root = NULL;
-        owner->public.name = (ir_string_t){0};
-        owner->public.html = (ir_string_t){0};
+        owner->pool         = NULL;
+        owner->public.root  = NULL;
+        owner->public.name  = (ir_string_t){0};
+        owner->public.html  = (ir_string_t){0};
+        owner->public.index = NULL;
     }
     return 0;
 }

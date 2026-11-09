@@ -534,6 +534,22 @@ static void push_attrs(lua_State *L, const ir_attr_list_t *attrs)
 
 /* Push the table for one node. For an element, also push its empty children
  * table on top and return 1 so the caller can fill it. */
+/* Set the structural annotations of an element; elements are named by
+ * their document order so that the result stays a tree. */
+static void push_structure(lua_State *L, const ir_structure_t *structure)
+{
+    set_size_field(L, "order", structure->order);
+    set_size_field(L, "depth", structure->depth);
+    if (structure->parent != NULL) {
+        set_size_field(L, "parent", structure->parent->structure.order);
+    }
+    if (structure->branch_kind == IR_BRANCH_CHAIN) {
+        set_size_field(L, "chain_branch", structure->branch_index);
+    } else if (structure->branch_kind == IR_BRANCH_MATCH) {
+        set_size_field(L, "match_branch", structure->branch_index);
+    }
+}
+
 static int push_node_shell(lua_State *L, const ir_node_t *node)
 {
     switch (node->type) {
@@ -547,6 +563,7 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                          element->tag_name.len);
         set_size_field(L, "source_start", element->source_start);
         set_size_field(L, "source_end", element->source_end);
+        push_structure(L, &element->structure);
         push_attrs(L, &element->attrs);
         lua_setfield(L, -2, "attrs");
         if (element->directives != NULL) {
@@ -723,6 +740,48 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
     return luaL_error(L, "unsupported intermediate representation node type");
 }
 
+/* Push a list of elements as their document order numbers. */
+static void push_element_list(lua_State *L, const ir_element_list_t *list)
+{
+    size_t i = 0;
+
+    lua_createtable(L, table_size_hint(list->count), 0);
+    for (i = 0; i < list->count; i++) {
+        lua_pushinteger(L, (lua_Integer)list->items[i]->structure.order);
+        lua_rawseti(L, -2, checked_index(L, i + 1));
+    }
+}
+
+/* Push an index axis as { [key] = { order, ... } }. */
+static void push_axis(lua_State *L, const ir_index_axis_t *axis)
+{
+    const ir_index_entry_t *entry = NULL;
+
+    lua_createtable(L, 0, table_size_hint(axis->count));
+    for (entry = axis->head; entry != NULL; entry = entry->next) {
+        lua_pushlstring(L, entry->key.data, entry->key.len);
+        push_element_list(L, &entry->elements);
+        lua_rawset(L, -3);
+    }
+}
+
+static void push_dom_index(lua_State *L, const ir_dom_index_t *index)
+{
+    lua_createtable(L, 0, 6);
+    push_axis(L, &index->by_id);
+    lua_setfield(L, -2, "by_id");
+    push_axis(L, &index->by_class);
+    lua_setfield(L, -2, "by_class");
+    push_axis(L, &index->by_tag);
+    lua_setfield(L, -2, "by_tag");
+    push_axis(L, &index->by_attr_name);
+    lua_setfield(L, -2, "by_attr_name");
+    push_element_list(L, &index->elements);
+    lua_setfield(L, -2, "elements");
+    push_element_list(L, &index->includes);
+    lua_setfield(L, -2, "includes");
+}
+
 /* ir:to_table() returns a new Lua table that mirrors the intermediate
  * representation. The tree is walked with explicit frames so that the C
  * stack does not grow with the HTML depth. */
@@ -832,6 +891,10 @@ static int to_table_lua(lua_State *L)
     }
 
     lua_settop(L, result_idx);
+    if (ir->index != NULL) {
+        push_dom_index(L, ir->index);
+        lua_setfield(L, result_idx, "index");
+    }
     return 1;
 }
 

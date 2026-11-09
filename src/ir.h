@@ -38,6 +38,7 @@ typedef struct ir_bind_t ir_bind_t;
 typedef struct ir_with_t ir_with_t;
 typedef struct ir_for_t ir_for_t;
 typedef struct ir_each_t ir_each_t;
+typedef struct ir_dom_index_t ir_dom_index_t;
 struct reflow_value_t;
 struct reflow_expression_t;
 
@@ -94,6 +95,25 @@ typedef struct ir_root_t {
     ir_node_list_t children;
 } ir_root_t;
 
+typedef enum ir_branch_kind_t {
+    IR_BRANCH_NONE = 0,
+    IR_BRANCH_CHAIN,
+    IR_BRANCH_MATCH
+} ir_branch_kind_t;
+
+/* Structural annotations of an element, filled in once the IR is complete.
+ * Chains are transparent: a chain branch takes the parent and depth of the
+ * chain itself. An x-case / x-nocase branch takes its x-match element as
+ * parent. */
+typedef struct ir_structure_t {
+    const struct ir_element_t *parent; /* NULL at the top level */
+    size_t depth;                      /* 0 at the top level */
+    size_t order;                      /* 0-based document order */
+    ir_branch_kind_t branch_kind;
+    const struct ir_chain_t *chain; /* set for IR_BRANCH_CHAIN */
+    size_t branch_index;            /* 0-based, unless IR_BRANCH_NONE */
+} ir_structure_t;
+
 typedef struct ir_element_t {
     ir_node_t node;
     ir_string_t tag_name;
@@ -102,6 +122,7 @@ typedef struct ir_element_t {
     ir_node_list_t children;
     size_t source_start;
     size_t source_end;
+    ir_structure_t structure;
 } ir_element_t;
 
 typedef struct ir_chain_t {
@@ -189,10 +210,50 @@ struct ir_branch_t {
     ir_node_t *node;
 };
 
+/* Elements in document order. */
+typedef struct ir_element_list_t {
+    const ir_element_t **items;
+    size_t count;
+    size_t capacity;
+} ir_element_list_t;
+
+typedef struct ir_index_entry_t ir_index_entry_t;
+
+struct ir_index_entry_t {
+    ir_index_entry_t *next;      /* next key in first-seen order */
+    ir_index_entry_t *slot_next; /* next key in the same hash slot */
+    size_t hash;
+    ir_string_t key;
+    ir_element_list_t elements;
+};
+
+/* A hash table from byte-string keys to element lists. An element is listed
+ * once per occurrence, so a repeated attribute or class lists it again, as
+ * in the JavaScript version. */
+typedef struct ir_index_axis_t {
+    ir_index_entry_t **slots;
+    size_t slot_count;
+    ir_index_entry_t *head;
+    ir_index_entry_t *tail;
+    size_t count;
+} ir_index_axis_t;
+
+/* The static DOM index of a compiled template. Only regular attributes are
+ * indexed; attributes produced by x-bind at render time are not. */
+struct ir_dom_index_t {
+    ir_index_axis_t by_id;
+    ir_index_axis_t by_class;
+    ir_index_axis_t by_tag;
+    ir_index_axis_t by_attr_name;
+    ir_element_list_t elements;
+    ir_element_list_t includes;
+};
+
 struct ir_t {
     ir_root_t *root;
     ir_string_t name;
     ir_string_t html;
+    const ir_dom_index_t *index;
 };
 
 static inline ir_t *ir_check(lua_State *L, int idx)
