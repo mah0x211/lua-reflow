@@ -90,4 +90,28 @@ static inline void reflow_error_push_compile(lua_State *L, const char *op,
     reflow_error_push_named(L, "new_compile", op, message, cause_idx, meta_idx);
 }
 
+/**
+ * Replace the value at idx with error.toerror(value), so that an arbitrary
+ * Lua error value can be passed as a cause to the constructors below, which
+ * accept only nil or an error object.
+ */
+static inline void reflow_error_to_cause(lua_State *L, int idx)
+{
+    idx = reflow_error_absolute_index(L, idx);
+    reflow_error_require(L, "error");
+    lua_getfield(L, -1, "toerror");
+    lua_remove(L, -2);
+    lua_pushvalue(L, idx);
+    lua_call(L, 1, 1);
+    lua_replace(L, idx);
+}
+
+/** Push reflow.error.new_runtime(op, message, cause, meta). */
+static inline void reflow_error_push_runtime(lua_State *L, const char *op,
+                                             const char *message, int cause_idx,
+                                             int meta_idx)
+{
+    reflow_error_push_named(L, "new_runtime", op, message, cause_idx, meta_idx);
+}
+
 #endif /* REFLOW_ERROR_H */

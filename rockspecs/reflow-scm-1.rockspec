@@ -47,6 +47,16 @@ build = {
                 "src",
             },
         },
+        ["reflow.interpret"] = {
+            sources = {
+                "src/interpret.c",
+                "src/pool.c",
+                "src/render_output.c",
+            },
+            incdirs = {
+                "src",
+            },
+        },
         ["reflow.compile"] = {
             sources = {
                 "src/compile.c",
