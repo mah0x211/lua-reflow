@@ -34,7 +34,8 @@
 
 #define IR_LUA_INITIAL_FRAMES 16
 
-/* A frame walks either a child list (next) or the branches of a chain. */
+/* A frame walks either a child list (next) or the branches of a chain or an
+ * x-match element. */
 typedef struct ir_lua_node_frame_t {
     const ir_node_t *next;
     const ir_branch_t *branch;
@@ -593,6 +594,25 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 lua_pushboolean(L, 1);
                 lua_setfield(L, -2, "else");
             }
+            if (element->directives->match_condition != NULL) {
+                lua_createtable(L, 0, 2);
+                push_expression(L, element->directives->match_condition);
+                lua_setfield(L, -2, "condition");
+                lua_createtable(
+                    L,
+                    table_size_hint(element->directives->match_branches.count),
+                    0);
+                lua_setfield(L, -2, "branches");
+                lua_setfield(L, -2, "match");
+            }
+            if (element->directives->case_condition != NULL) {
+                push_expression(L, element->directives->case_condition);
+                lua_setfield(L, -2, "case");
+            }
+            if (element->directives->has_nocase) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "nocase");
+            }
             if (element->directives->with.head != NULL) {
                 const ir_with_t *with = NULL;
                 size_t index          = 0;
@@ -613,6 +633,18 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
         lua_createtable(L, table_size_hint(element->children.count), 0);
         lua_pushvalue(L, -1);
         lua_setfield(L, -3, "children");
+        if (element->directives != NULL &&
+            element->directives->match_condition != NULL) {
+            /* The branches of an x-match replace its children, so walk them
+             * into directives.match.branches instead. */
+            lua_pop(L, 1);
+            lua_getfield(L, -1, "directives");
+            lua_getfield(L, -1, "match");
+            lua_getfield(L, -1, "branches");
+            lua_replace(L, -3);
+            lua_pop(L, 1);
+            return NODE_BRANCHES;
+        }
         return NODE_CHILDREN;
     }
     case IR_CHAIN: {
@@ -733,8 +765,11 @@ static int to_table_lua(lua_State *L)
 
             if (kind == NODE_CHILDREN) {
                 first_child = ((const ir_element_t *)node)->children.head;
-            } else {
+            } else if (node->type == IR_CHAIN) {
                 first_branch = ((const ir_chain_t *)node)->branches.head;
+            } else {
+                first_branch = ((const ir_element_t *)node)
+                                   ->directives->match_branches.head;
             }
             if (first_child == NULL && first_branch == NULL) {
                 lua_pop(L, 1);

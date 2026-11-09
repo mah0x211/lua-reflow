@@ -340,7 +340,24 @@ static void close_children(compile_ctx_t *ctx, ir_node_t *parent)
 
     if (structure_close_children(ctx->ir, parent, &error) != 0) {
         if (errno == EINVAL && error.message != NULL) {
-            compile_raise_element_error(ctx, error.element, error.message);
+            const char *message = error.message;
+
+            if (error.found != STRUCTURE_FOUND_NONE) {
+                luaL_Buffer buffer;
+
+                luaL_buffinit(ctx->L, &buffer);
+                luaL_addstring(&buffer, error.message);
+                if (error.found == STRUCTURE_FOUND_TEXT) {
+                    luaL_addstring(&buffer, " (found text \"");
+                    luaL_addlstring(&buffer, error.text, error.text_len);
+                    luaL_addstring(&buffer, "\")");
+                } else {
+                    luaL_addstring(&buffer, " (found chain)");
+                }
+                luaL_pushresult(&buffer);
+                message = lua_tostring(ctx->L, -1);
+            }
+            compile_raise_element_error(ctx, error.element, message);
         }
         compile_raise_ir_error(ctx);
     }

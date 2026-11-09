@@ -466,6 +466,20 @@ static const expression_directive_t ELSEIF_DIRECTIVE = {
     .set               = ir_set_elseif,
 };
 
+static const expression_directive_t MATCH_DIRECTIVE = {
+    .duplicate_message = "duplicate x-match on element",
+    .oom_message       = "out of memory while parsing x-match",
+    .has               = ir_element_has_match,
+    .set               = ir_set_match,
+};
+
+static const expression_directive_t CASE_DIRECTIVE = {
+    .duplicate_message = "duplicate x-case on element",
+    .oom_message       = "out of memory while parsing x-case",
+    .has               = ir_element_has_case,
+    .set               = ir_set_case,
+};
+
 static int parse_expression_directive(const directive_parse_ctx_t *ctx,
                                       const expression_directive_t *directive,
                                       const char *source, size_t source_len,
@@ -529,18 +543,55 @@ static int parse_elseif(const directive_parse_ctx_t *ctx, const char *suffix,
                                       source_len, error);
 }
 
-/* A marker directive takes no value; only an empty or blank value is
- * accepted, as in the JavaScript version. */
-static int parse_else(const directive_parse_ctx_t *ctx, const char *suffix,
+static int parse_match(const directive_parse_ctx_t *ctx, const char *suffix,
+                       size_t suffix_len, const char *source, size_t source_len,
+                       directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_expression_directive(ctx, &MATCH_DIRECTIVE, source, source_len,
+                                      error);
+}
+
+static int parse_case(const directive_parse_ctx_t *ctx, const char *suffix,
                       size_t suffix_len, const char *source, size_t source_len,
                       directive_parse_error_t *error)
 {
-    lua_State *L = ctx->L;
-
     (void)suffix;
     (void)suffix_len;
-    if (ir_element_has_else(ctx->element)) {
-        error->message = "duplicate x-else on element";
+    return parse_expression_directive(ctx, &CASE_DIRECTIVE, source, source_len,
+                                      error);
+}
+
+typedef struct {
+    const char *duplicate_message;
+    int (*has)(const ir_element_t *element);
+    int (*set)(ir_element_t *element);
+} marker_directive_t;
+
+static const marker_directive_t ELSE_DIRECTIVE = {
+    .duplicate_message = "duplicate x-else on element",
+    .has               = ir_element_has_else,
+    .set               = ir_set_else,
+};
+
+static const marker_directive_t NOCASE_DIRECTIVE = {
+    .duplicate_message = "duplicate x-nocase on element",
+    .has               = ir_element_has_nocase,
+    .set               = ir_set_nocase,
+};
+
+/* A marker directive takes no value; only an empty or blank value is
+ * accepted, as in the JavaScript version. */
+static int parse_marker_directive(const directive_parse_ctx_t *ctx,
+                                  const marker_directive_t *directive,
+                                  const char *source, size_t source_len,
+                                  directive_parse_error_t *error)
+{
+    lua_State *L = ctx->L;
+
+    if (directive->has(ctx->element)) {
+        error->message = directive->duplicate_message;
         errno          = EINVAL;
         return -1;
     }
@@ -554,11 +605,31 @@ static int parse_else(const directive_parse_ctx_t *ctx, const char *suffix,
         lua_concat(L, 6);
         return fail_with_pushed_message(L, error);
     }
-    if (ir_set_else(ctx->element) != 0) {
+    if (directive->set(ctx->element) != 0) {
         error->message = IR_BUILD_FAILURE_MESSAGE(errno);
         return -1;
     }
     return 0;
+}
+
+static int parse_else(const directive_parse_ctx_t *ctx, const char *suffix,
+                      size_t suffix_len, const char *source, size_t source_len,
+                      directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_marker_directive(ctx, &ELSE_DIRECTIVE, source, source_len,
+                                  error);
+}
+
+static int parse_nocase(const directive_parse_ctx_t *ctx, const char *suffix,
+                        size_t suffix_len, const char *source,
+                        size_t source_len, directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_marker_directive(ctx, &NOCASE_DIRECTIVE, source, source_len,
+                                  error);
 }
 
 static int parse_include(const directive_parse_ctx_t *ctx, const char *suffix,
@@ -899,6 +970,24 @@ static const directive_parser_t parsers[] = {
      .parse    = parse_else,
      },
     {
+     .name     = "match",
+     .name_len = sizeof("match") - 1,
+     .match    = match_exact,
+     .parse    = parse_match,
+     },
+    {
+     .name     = "case",
+     .name_len = sizeof("case") - 1,
+     .match    = match_exact,
+     .parse    = parse_case,
+     },
+    {
+     .name     = "nocase",
+     .name_len = sizeof("nocase") - 1,
+     .match    = match_exact,
+     .parse    = parse_nocase,
+     },
+    {
      .name     = "with",
      .name_len = sizeof("with") - 1,
      .match    = match_exact,
@@ -920,7 +1009,8 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
 
     *error = (directive_parse_error_t){0};
     if (ir_element_has_if(element) + ir_element_has_elseif(element) +
-            ir_element_has_else(element) >
+            ir_element_has_else(element) + ir_element_has_match(element) +
+            ir_element_has_case(element) + ir_element_has_nocase(element) >
         1) {
         error->message =
             "conflicting structural directives on same element "

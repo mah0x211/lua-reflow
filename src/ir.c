@@ -773,20 +773,17 @@ ir_chain_t *ir_new_chain(ir_t *ir, size_t source_start, size_t source_end)
     return chain;
 }
 
-int ir_chain_append_branch(ir_t *ir, ir_chain_t *chain,
-                           const struct reflow_expression_t *condition,
-                           ir_node_t *node)
+static int append_branch(ir_t *ir, ir_branch_list_t *list,
+                         const struct reflow_expression_t *condition,
+                         ir_node_t *node)
 {
-    pool_t *pool           = ir_pool(ir);
-    ir_branch_t *branch    = NULL;
-    ir_branch_list_t *list = NULL;
+    pool_t *pool        = ir_pool(ir);
+    ir_branch_t *branch = NULL;
 
-    if (pool == NULL || chain == NULL || chain->node.type != IR_CHAIN ||
-        node == NULL || node->type != IR_ELEMENT) {
+    if (pool == NULL || node == NULL || node->type != IR_ELEMENT) {
         errno = EINVAL;
         return -1;
     }
-    list = &chain->branches;
     if (list->count == SIZE_MAX) {
         errno = ENOMEM;
         return -1;
@@ -805,6 +802,30 @@ int ir_chain_append_branch(ir_t *ir, ir_chain_t *chain,
     list->tail = branch;
     list->count++;
     return 0;
+}
+
+int ir_chain_append_branch(ir_t *ir, ir_chain_t *chain,
+                           const struct reflow_expression_t *condition,
+                           ir_node_t *node)
+{
+    if (chain == NULL || chain->node.type != IR_CHAIN) {
+        errno = EINVAL;
+        return -1;
+    }
+    return append_branch(ir, &chain->branches, condition, node);
+}
+
+int ir_append_match_branch(ir_t *ir, ir_element_t *element,
+                           const struct reflow_expression_t *condition,
+                           ir_node_t *node)
+{
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        !ir_element_has_match(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return append_branch(ir, &element->directives->match_branches, condition,
+                         node);
 }
 
 /* Return the mutable child list of a root or element node. */
@@ -826,4 +847,75 @@ ir_node_list_t *ir_node_children(ir_node_t *node)
     }
     errno = EINVAL;
     return NULL;
+}
+
+int ir_element_has_match(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->match_condition != NULL;
+}
+
+int ir_set_match(ir_element_t *element,
+                 const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || ir_element_has_match(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->match_condition = expression;
+    return 0;
+}
+
+int ir_element_has_case(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->case_condition != NULL;
+}
+
+int ir_set_case(ir_element_t *element,
+                const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || ir_element_has_case(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->case_condition = expression;
+    return 0;
+}
+
+int ir_element_has_nocase(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->has_nocase;
+}
+
+int ir_set_nocase(ir_element_t *element)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        ir_element_has_nocase(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->has_nocase = 1;
+    return 0;
 }

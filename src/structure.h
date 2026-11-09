@@ -25,15 +25,28 @@
 
 #include "ir.h"
 
+typedef enum {
+    STRUCTURE_FOUND_NONE = 0,
+    STRUCTURE_FOUND_TEXT,
+    STRUCTURE_FOUND_CHAIN,
+} structure_found_t;
+
 typedef struct structure_error_t {
     const char *message;
     const ir_element_t *element;
+    /* What an x-match element found in place of an x-case / x-nocase child.
+     * For STRUCTURE_FOUND_TEXT, text holds the leading 20 UTF-16 code units
+     * of that text (an astral character is never split). */
+    structure_found_t found;
+    const char *text;
+    size_t text_len;
 } structure_error_t;
 
 /**
  * Finalize the children of a root or element node once it is closed: merge
- * x-if / x-elseif / x-else siblings into chain nodes and reject branch
- * markers that are left without a preceding x-if.
+ * x-if / x-elseif / x-else siblings into chain nodes, move the x-case /
+ * x-nocase children of an x-match element into its match branches, and
+ * reject branch markers that are left outside their chain or x-match.
  *
  * @return 0 on success, or -1 with errno set. On EINVAL, error names the
  *         message and the offending element.
