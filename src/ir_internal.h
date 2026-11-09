@@ -107,6 +107,9 @@ int ir_set_case(ir_element_t *element,
                 const struct reflow_expression_t *expression);
 int ir_element_has_nocase(const ir_element_t *element);
 int ir_set_nocase(ir_element_t *element);
+int ir_element_has_for(const ir_element_t *element);
+int ir_set_for(ir_element_t *element, const char *name, size_t name_len,
+               double start, double stop, double step);
 int ir_append_match_branch(ir_t *ir, ir_element_t *element,
                            const struct reflow_expression_t *condition,
                            ir_node_t *node);

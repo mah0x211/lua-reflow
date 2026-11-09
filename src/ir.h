@@ -36,6 +36,7 @@ typedef struct ir_branch_t ir_branch_t;
 typedef struct ir_directives_t ir_directives_t;
 typedef struct ir_bind_t ir_bind_t;
 typedef struct ir_with_t ir_with_t;
+typedef struct ir_for_t ir_for_t;
 struct reflow_value_t;
 struct reflow_expression_t;
 
@@ -135,6 +136,16 @@ struct ir_directives_t {
     /* The x-case / x-nocase children collected when an x-match element
      * closes; they replace its children. condition is NULL for x-nocase. */
     ir_branch_list_t match_branches;
+    const ir_for_t *range;
+};
+
+/* An x-for range, fixed at compile time. Bounds are inclusive and step is
+ * never zero; -0 is stored as +0. */
+struct ir_for_t {
+    ir_string_t name;
+    double start;
+    double stop;
+    double step;
 };
 
 /* One x-with binding, kept in source order. */
