@@ -50,8 +50,13 @@ build = {
         ["reflow.interpret"] = {
             sources = {
                 "src/interpret.c",
+                "src/expr_eval.c",
+                "src/js_number.c",
                 "src/pool.c",
                 "src/render_output.c",
+                "src/scope.c",
+                "src/snippet.c",
+                "src/value_lua.c",
             },
             incdirs = {
                 "src",
