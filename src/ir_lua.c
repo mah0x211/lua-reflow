@@ -34,10 +34,18 @@
 
 #define IR_LUA_INITIAL_FRAMES 16
 
+/* A frame walks either a child list (next) or the branches of a chain. */
 typedef struct ir_lua_node_frame_t {
     const ir_node_t *next;
+    const ir_branch_t *branch;
     size_t count;
 } ir_lua_node_frame_t;
+
+enum {
+    NODE_LEAF     = 0,
+    NODE_CHILDREN = 1,
+    NODE_BRANCHES = 2
+};
 
 typedef struct ir_lua_value_frame_t {
     const reflow_value_item_t *item;
@@ -573,6 +581,18 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 }
                 lua_setfield(L, -2, "bind");
             }
+            if (element->directives->if_condition != NULL) {
+                push_expression(L, element->directives->if_condition);
+                lua_setfield(L, -2, "if");
+            }
+            if (element->directives->elseif_condition != NULL) {
+                push_expression(L, element->directives->elseif_condition);
+                lua_setfield(L, -2, "elseif");
+            }
+            if (element->directives->has_else) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "else");
+            }
             if (element->directives->with.head != NULL) {
                 const ir_with_t *with = NULL;
                 size_t index          = 0;
@@ -593,7 +613,20 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
         lua_createtable(L, table_size_hint(element->children.count), 0);
         lua_pushvalue(L, -1);
         lua_setfield(L, -3, "children");
-        return 1;
+        return NODE_CHILDREN;
+    }
+    case IR_CHAIN: {
+        const ir_chain_t *chain = (const ir_chain_t *)node;
+
+        lua_createtable(L, 0, 4);
+        lua_pushliteral(L, "chain");
+        lua_setfield(L, -2, "type");
+        set_size_field(L, "source_start", chain->source_start);
+        set_size_field(L, "source_end", chain->source_end);
+        lua_createtable(L, table_size_hint(chain->branches.count), 0);
+        lua_pushvalue(L, -1);
+        lua_setfield(L, -3, "branches");
+        return NODE_BRANCHES;
     }
     case IR_TEXT: {
         const ir_text_t *text = (const ir_text_t *)node;
@@ -602,7 +635,7 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
         lua_pushliteral(L, "text");
         lua_setfield(L, -2, "type");
         set_string_field(L, "text", text->text.data, text->text.len);
-        return 0;
+        return NODE_LEAF;
     }
     case IR_COMMENT: {
         const ir_comment_t *comment = (const ir_comment_t *)node;
@@ -611,10 +644,9 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
         lua_pushliteral(L, "comment");
         lua_setfield(L, -2, "type");
         set_string_field(L, "text", comment->text.data, comment->text.len);
-        return 0;
+        return NODE_LEAF;
     }
     case IR_ROOT:
-    case IR_CHAIN:
     default:
         break;
     }
@@ -666,23 +698,45 @@ static int to_table_lua(lua_State *L)
 
     while (depth > 0) {
         ir_lua_node_frame_t *frame = &frames[depth - 1];
-        const ir_node_t *node      = frame->next;
+        const ir_node_t *node      = NULL;
+        const ir_branch_t *branch  = NULL;
         size_t index               = 0;
+        int kind                   = NODE_LEAF;
 
-        if (node == NULL) {
+        if (frame->next != NULL) {
+            node        = frame->next;
+            frame->next = node->next;
+        } else if (frame->branch != NULL) {
+            branch        = frame->branch;
+            node          = branch->node;
+            frame->branch = branch->next;
+        } else {
             lua_pushnil(L);
             lua_rawseti(L, work_idx, checked_index(L, depth));
             depth--;
             continue;
         }
-        frame->next = node->next;
-        index       = ++frame->count;
+        index = ++frame->count;
 
         lua_rawgeti(L, work_idx, checked_index(L, depth));
-        if (push_node_shell(L, node)) {
-            const ir_element_t *element = (const ir_element_t *)node;
+        if (branch != NULL) {
+            lua_createtable(L, 0, 2);
+            if (branch->condition != NULL) {
+                push_expression(L, branch->condition);
+                lua_setfield(L, -2, "condition");
+            }
+        }
+        kind = push_node_shell(L, node);
+        if (kind != NODE_LEAF) {
+            const ir_node_t *first_child    = NULL;
+            const ir_branch_t *first_branch = NULL;
 
-            if (element->children.head == NULL) {
+            if (kind == NODE_CHILDREN) {
+                first_child = ((const ir_element_t *)node)->children.head;
+            } else {
+                first_branch = ((const ir_chain_t *)node)->branches.head;
+            }
+            if (first_child == NULL && first_branch == NULL) {
                 lua_pop(L, 1);
             } else {
                 if (depth == capacity) {
@@ -691,10 +745,14 @@ static int to_table_lua(lua_State *L)
                 }
                 lua_rawseti(L, work_idx, checked_index(L, depth + 1));
                 frames[depth] = (ir_lua_node_frame_t){
-                    .next = element->children.head,
+                    .next   = first_child,
+                    .branch = first_branch,
                 };
                 depth++;
             }
+        }
+        if (branch != NULL) {
+            lua_setfield(L, -2, "node");
         }
         lua_rawseti(L, -2, checked_index(L, index));
         lua_pop(L, 1);

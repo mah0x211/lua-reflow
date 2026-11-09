@@ -682,3 +682,148 @@ int ir_append_with(ir_element_t *element, const char *name, size_t name_len,
     list->count++;
     return 0;
 }
+
+int ir_element_has_if(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->if_condition != NULL;
+}
+
+int ir_set_if(ir_element_t *element,
+              const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || ir_element_has_if(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->if_condition = expression;
+    return 0;
+}
+
+int ir_element_has_elseif(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->elseif_condition != NULL;
+}
+
+int ir_set_elseif(ir_element_t *element,
+                  const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || ir_element_has_elseif(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->elseif_condition = expression;
+    return 0;
+}
+
+int ir_element_has_else(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->has_else;
+}
+
+int ir_set_else(ir_element_t *element)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        ir_element_has_else(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->has_else = 1;
+    return 0;
+}
+
+ir_chain_t *ir_new_chain(ir_t *ir, size_t source_start, size_t source_end)
+{
+    pool_t *pool      = ir_pool(ir);
+    ir_chain_t *chain = NULL;
+
+    if (pool == NULL || source_start > source_end) {
+        errno = EINVAL;
+        return NULL;
+    }
+    chain = (ir_chain_t *)pool_calloc(pool, 1, sizeof(*chain));
+    if (chain == NULL) {
+        return NULL;
+    }
+    chain->node.type    = IR_CHAIN;
+    chain->source_start = source_start;
+    chain->source_end   = source_end;
+    return chain;
+}
+
+int ir_chain_append_branch(ir_t *ir, ir_chain_t *chain,
+                           const struct reflow_expression_t *condition,
+                           ir_node_t *node)
+{
+    pool_t *pool           = ir_pool(ir);
+    ir_branch_t *branch    = NULL;
+    ir_branch_list_t *list = NULL;
+
+    if (pool == NULL || chain == NULL || chain->node.type != IR_CHAIN ||
+        node == NULL || node->type != IR_ELEMENT) {
+        errno = EINVAL;
+        return -1;
+    }
+    list = &chain->branches;
+    if (list->count == SIZE_MAX) {
+        errno = ENOMEM;
+        return -1;
+    }
+    branch = (ir_branch_t *)pool_calloc(pool, 1, sizeof(*branch));
+    if (branch == NULL) {
+        return -1;
+    }
+    branch->condition = condition;
+    branch->node      = node;
+    if (list->tail == NULL) {
+        list->head = branch;
+    } else {
+        list->tail->next = branch;
+    }
+    list->tail = branch;
+    list->count++;
+    return 0;
+}
+
+/* Return the mutable child list of a root or element node. */
+ir_node_list_t *ir_node_children(ir_node_t *node)
+{
+    if (node == NULL) {
+        errno = EINVAL;
+        return NULL;
+    }
+    switch (node->type) {
+    case IR_ROOT:
+        return &((ir_root_t *)node)->children;
+    case IR_ELEMENT:
+        return &((ir_element_t *)node)->children;
+    case IR_CHAIN:
+    case IR_TEXT:
+    case IR_COMMENT:
+        break;
+    }
+    errno = EINVAL;
+    return NULL;
+}

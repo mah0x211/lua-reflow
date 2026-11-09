@@ -126,6 +126,9 @@ struct ir_directives_t {
     const struct reflow_expression_t *include;
     ir_bind_list_t bind;
     ir_with_list_t with;
+    const struct reflow_expression_t *if_condition;
+    const struct reflow_expression_t *elseif_condition;
+    int has_else;
 };
 
 /* One x-with binding, kept in source order. */
@@ -148,9 +151,10 @@ struct ir_attr_t {
     ir_string_t value;
 };
 
+/* One branch of an x-if chain. condition is NULL for the x-else branch. */
 struct ir_branch_t {
     ir_branch_t *next;
-    const void *condition;
+    const struct reflow_expression_t *condition;
     ir_node_t *node;
 };
 

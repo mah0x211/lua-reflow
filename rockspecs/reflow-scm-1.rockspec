@@ -59,6 +59,7 @@ build = {
                 "src/expr_parse.c",
                 "src/json5.c",
                 "src/snippet.c",
+                "src/structure.c",
                 "src/value.c",
                 "deps/yyjson/src/yyjson.c",
             },

@@ -49,6 +49,9 @@ typedef struct reflow_html_handler_t {
     void (*on_element_end)(void *ctx);
     void (*on_text)(void *ctx, const char *text, size_t text_len);
     void (*on_comment)(void *ctx, const char *text, size_t text_len);
+    /* Optional. Called once after the last token, with elements that were
+     * never closed still open. */
+    void (*on_document_end)(void *ctx);
 } reflow_html_handler_t;
 
 /**
