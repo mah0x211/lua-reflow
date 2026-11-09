@@ -639,6 +639,14 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 lua_setfield(L, -2, "collection");
                 lua_setfield(L, -2, "each");
             }
+            if (element->directives->has_break) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "break");
+            }
+            if (element->directives->break_condition != NULL) {
+                push_expression(L, element->directives->break_condition);
+                lua_setfield(L, -2, "break_if");
+            }
             if (element->directives->with.head != NULL) {
                 const ir_with_t *with = NULL;
                 size_t index          = 0;
@@ -655,6 +663,10 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 lua_setfield(L, -2, "with");
             }
             lua_setfield(L, -2, "directives");
+            if (element->directives->invisible_marker) {
+                lua_pushboolean(L, 1);
+                lua_setfield(L, -2, "invisible_marker");
+            }
         }
         lua_createtable(L, table_size_hint(element->children.count), 0);
         lua_pushvalue(L, -1);

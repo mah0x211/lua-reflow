@@ -154,12 +154,29 @@ function testcase.compile_rejects_invalid_x_data_with_source_context()
     assert.rawequal(errorlib.typeof(errorlib.unwrap(err)), reflow_error.EREFLOW)
 end
 
-function testcase.compile_keeps_unimplemented_directives_rejected()
-    local result, err = compile('unimplemented', '<div x-with="scope"></div>',
-                                'x-', {})
+function testcase.compile_rejects_unknown_directives()
+    -- Expected messages were produced by the JavaScript version.
+    for html, attribute in pairs({
+        ['<p x-bogus="1"></p>'] = 'x-bogus',
+        ['<p x-="1"></p>'] = 'x-',
+        ['<p x-text-x="1"></p>'] = 'x-text-x',
+        ['<p x-break-iff="1"></p>'] = 'x-break-iff',
+    }) do
+        local result, err = compile('unknown', html, 'x-', {})
+        assert.is_nil(result)
+        assert_compile_error(err, 'unknown')
+        assert.equal(err.message.message,
+                     'unknown directive "' .. attribute .. '"')
+        assert.equal(err.meta.attribute, attribute)
+        assert.equal(err.meta.element, '<p>')
+    end
+
+    local result, err = compile('unknown', '<main>\n  <p r-bogus></p></main>',
+                                'r-', {})
     assert.is_nil(result)
-    assert_compile_error(err, 'unimplemented')
-    assert.equal(err.meta.attribute, 'x-with')
+    assert.equal(err.message.message, 'unknown directive "r-bogus"')
+    assert.equal(err.meta.line, 2)
+    assert.equal(err.meta.column, 3)
 end
 
 function testcase.result_remains_owned_after_input_values_are_collected()

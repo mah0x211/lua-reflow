@@ -813,6 +813,12 @@ static const marker_directive_t ELSE_DIRECTIVE = {
     .set               = ir_set_else,
 };
 
+static const marker_directive_t BREAK_DIRECTIVE = {
+    .duplicate_message = "duplicate x-break on element",
+    .has               = ir_element_has_break,
+    .set               = ir_set_break,
+};
+
 static const marker_directive_t NOCASE_DIRECTIVE = {
     .duplicate_message = "duplicate x-nocase on element",
     .has               = ir_element_has_nocase,
@@ -858,6 +864,33 @@ static int parse_else(const directive_parse_ctx_t *ctx, const char *suffix,
     (void)suffix_len;
     return parse_marker_directive(ctx, &ELSE_DIRECTIVE, source, source_len,
                                   error);
+}
+
+static int parse_break(const directive_parse_ctx_t *ctx, const char *suffix,
+                       size_t suffix_len, const char *source, size_t source_len,
+                       directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_marker_directive(ctx, &BREAK_DIRECTIVE, source, source_len,
+                                  error);
+}
+
+static const expression_directive_t BREAK_IF_DIRECTIVE = {
+    .duplicate_message = "duplicate x-break-if on element",
+    .oom_message       = "out of memory while parsing x-break-if",
+    .has               = ir_element_has_break_if,
+    .set               = ir_set_break_if,
+};
+
+static int parse_break_if(const directive_parse_ctx_t *ctx, const char *suffix,
+                          size_t suffix_len, const char *source,
+                          size_t source_len, directive_parse_error_t *error)
+{
+    (void)suffix;
+    (void)suffix_len;
+    return parse_expression_directive(ctx, &BREAK_IF_DIRECTIVE, source,
+                                      source_len, error);
 }
 
 static int parse_nocase(const directive_parse_ctx_t *ctx, const char *suffix,
@@ -1378,6 +1411,18 @@ static const directive_parser_t parsers[] = {
      .parse    = parse_each,
      },
     {
+     .name     = "break",
+     .name_len = sizeof("break") - 1,
+     .match    = match_exact,
+     .parse    = parse_break,
+     },
+    {
+     .name     = "break-if",
+     .name_len = sizeof("break-if") - 1,
+     .match    = match_exact,
+     .parse    = parse_break_if,
+     },
+    {
      .name     = "with",
      .name_len = sizeof("with") - 1,
      .match    = match_exact,
@@ -1398,6 +1443,7 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
     int structural              = 0;
     int iteration               = 0;
     int content                 = 0;
+    int control                 = 0;
 
     *error     = (directive_parse_error_t){0};
     structural = ir_element_has_if(element) + ir_element_has_elseif(element) +
@@ -1426,9 +1472,29 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
         errno          = EINVAL;
         return -1;
     }
+    control = ir_element_has_break(element) + ir_element_has_break_if(element);
+    if (control > 1) {
+        error->message = "conflicting control directives on same element "
+                         "(x-break / x-break-if are mutually exclusive)";
+        errno          = EINVAL;
+        return -1;
+    }
     if (structural > 0 && iteration > 0) {
         error->message = "cannot combine structural directive with iteration "
                          "directive on same element; use nesting";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (structural > 0 && control > 0) {
+        error->message = "cannot combine structural directive with control "
+                         "directive on same element; use nesting";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (iteration > 0 && control > 0) {
+        error->message = "cannot combine iteration directive with control "
+                         "directive on same element; place x-break / "
+                         "x-break-if on a child";
         errno          = EINVAL;
         return -1;
     }

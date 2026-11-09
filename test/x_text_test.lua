@@ -344,11 +344,13 @@ function testcase.x_text_parses_deep_expressions_without_c_recursion()
     assert_number_value(root, 1)
 end
 
-function testcase.x_text_keeps_other_directives_rejected()
-    local ir, err = compile('page', '<p x-break-if="ok(1)"></p>', 'x-', HELPERS)
+function testcase.x_text_keeps_unknown_directives_rejected()
+    local ir, err = compile('page', '<p x-text="ok(1)" x-bogus="1"></p>', 'x-',
+                            HELPERS)
     assert.is_nil(ir)
     assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
-    assert.equal(err.meta.attribute, 'x-break-if')
+    assert.equal(err.message.message, 'unknown directive "x-bogus"')
+    assert.equal(err.meta.attribute, 'x-bogus')
 end
 
 function testcase.x_text_oom_returns_no_ir_and_allows_a_later_compile()
