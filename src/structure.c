@@ -134,6 +134,110 @@ static int build_chain(ir_t *ir, ir_node_t *head, ir_chain_t **result,
     return 0;
 }
 
+/* The JavaScript version quotes text.slice(0, 20); measure the same prefix
+ * in UTF-8 bytes. */
+static size_t leading_utf16_units(const char *s, size_t len, size_t units)
+{
+    size_t i     = 0;
+    size_t count = 0;
+
+    while (i < len && count < units) {
+        unsigned char ch = (unsigned char)s[i];
+
+        count += ch >= 0xf0 ? 2 : 1;
+        i++;
+        while (i < len && ((unsigned char)s[i] & 0xc0) == 0x80) {
+            i++;
+        }
+    }
+    return i;
+}
+
+static int fail_found(structure_error_t *error, const ir_element_t *match,
+                      const ir_node_t *node)
+{
+    error->found = STRUCTURE_FOUND_CHAIN;
+    if (node->type == IR_TEXT) {
+        const ir_text_t *text = (const ir_text_t *)node;
+
+        error->found = STRUCTURE_FOUND_TEXT;
+        error->text  = text->text.data;
+        error->text_len =
+            leading_utf16_units(text->text.data, text->text.len, 20);
+    }
+    return fail(error,
+                "x-match: direct children must be x-case or x-nocase elements",
+                match);
+}
+
+/* Move the x-case / x-nocase children of an x-match element into its match
+ * branches. Only whitespace-only text and comments may accompany them, and
+ * those are dropped together with the children. */
+static int collect_match_branches(ir_t *ir, ir_element_t *match,
+                                  structure_error_t *error)
+{
+    ir_node_list_t *children = &match->children;
+    ir_node_t *node          = children->head;
+    size_t cases             = 0;
+    int saw_nocase           = 0;
+
+    while (node != NULL) {
+        ir_node_t *next             = node->next;
+        const ir_element_t *element = NULL;
+
+        if (is_ignorable(node)) {
+            node = next;
+            continue;
+        }
+        if (node->type != IR_ELEMENT) {
+            return fail_found(error, match, node);
+        }
+        element = (const ir_element_t *)node;
+        if (ir_element_has_case(element)) {
+            if (saw_nocase) {
+                return fail(error,
+                            "x-case must not appear after x-nocase in the "
+                            "same x-match",
+                            element);
+            }
+            cases++;
+        } else if (ir_element_has_nocase(element)) {
+            if (saw_nocase) {
+                return fail(error, "multiple x-nocase in the same x-match",
+                            element);
+            }
+            saw_nocase = 1;
+        } else {
+            return fail(error,
+                        "x-match: direct children must be x-case or x-nocase "
+                        "elements",
+                        element);
+        }
+        node = next;
+    }
+    if (cases == 0) {
+        return fail(error, "x-match requires at least one x-case", match);
+    }
+
+    for (node = children->head; node != NULL;) {
+        ir_node_t *next = node->next;
+
+        if (node->type == IR_ELEMENT) {
+            const ir_element_t *element = (const ir_element_t *)node;
+
+            node->next = NULL;
+            if (ir_append_match_branch(ir, match,
+                                       element->directives->case_condition,
+                                       node) != 0) {
+                return -1;
+            }
+        }
+        node = next;
+    }
+    *children = (ir_node_list_t){0};
+    return 0;
+}
+
 int structure_close_children(ir_t *ir, ir_node_t *parent,
                              structure_error_t *error)
 {
@@ -166,6 +270,12 @@ int structure_close_children(ir_t *ir, ir_node_t *parent,
     }
     *children = merged;
 
+    if (parent->type == IR_ELEMENT &&
+        ir_element_has_match((const ir_element_t *)parent) &&
+        collect_match_branches(ir, (ir_element_t *)parent, error) != 0) {
+        return -1;
+    }
+
     for (node = children->head; node != NULL; node = node->next) {
         const ir_element_t *element = as_marked_element(node);
 
@@ -177,6 +287,14 @@ int structure_close_children(ir_t *ir, ir_node_t *parent,
         }
         if (element->directives->has_else) {
             return fail(error, "x-else has no preceding x-if / x-elseif",
+                        element);
+        }
+        if (ir_element_has_case(element)) {
+            return fail(error, "x-case must be a direct child of x-match",
+                        element);
+        }
+        if (ir_element_has_nocase(element)) {
+            return fail(error, "x-nocase must be a direct child of x-match",
                         element);
         }
     }

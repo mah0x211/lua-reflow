@@ -129,6 +129,12 @@ struct ir_directives_t {
     const struct reflow_expression_t *if_condition;
     const struct reflow_expression_t *elseif_condition;
     int has_else;
+    const struct reflow_expression_t *match_condition;
+    const struct reflow_expression_t *case_condition;
+    int has_nocase;
+    /* The x-case / x-nocase children collected when an x-match element
+     * closes; they replace its children. condition is NULL for x-nocase. */
+    ir_branch_list_t match_branches;
 };
 
 /* One x-with binding, kept in source order. */

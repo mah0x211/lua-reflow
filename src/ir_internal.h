@@ -99,6 +99,17 @@ int ir_set_elseif(ir_element_t *element,
                   const struct reflow_expression_t *expression);
 int ir_element_has_else(const ir_element_t *element);
 int ir_set_else(ir_element_t *element);
+int ir_element_has_match(const ir_element_t *element);
+int ir_set_match(ir_element_t *element,
+                 const struct reflow_expression_t *expression);
+int ir_element_has_case(const ir_element_t *element);
+int ir_set_case(ir_element_t *element,
+                const struct reflow_expression_t *expression);
+int ir_element_has_nocase(const ir_element_t *element);
+int ir_set_nocase(ir_element_t *element);
+int ir_append_match_branch(ir_t *ir, ir_element_t *element,
+                           const struct reflow_expression_t *condition,
+                           ir_node_t *node);
 ir_chain_t *ir_new_chain(ir_t *ir, size_t source_start, size_t source_end);
 int ir_chain_append_branch(ir_t *ir, ir_chain_t *chain,
                            const struct reflow_expression_t *condition,
