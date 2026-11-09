@@ -76,6 +76,12 @@ int scope_push(scope_t *scope, scope_kind_t kind)
     return 0;
 }
 
+int scope_push_frame_of(scope_t *scope, size_t depth)
+{
+    lua_rawgeti(scope->L, scope->frames_idx, frame_index(scope->L, depth));
+    return scope_push(scope, SCOPE_DATA);
+}
+
 void scope_pop_to(scope_t *scope, size_t depth)
 {
     lua_State *L = scope->L;
@@ -104,7 +110,7 @@ static void push_binding(const scope_t *scope, int data_only, const char *name,
     size_t depth = scope->depth;
 
     lua_pushlstring(L, name, len);
-    for (; depth > 0; depth--) {
+    for (; depth > scope->floor; depth--) {
         if (data_only && scope->kinds[depth - 1] != SCOPE_DATA) {
             continue;
         }

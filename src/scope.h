@@ -46,6 +46,9 @@ typedef struct scope_t {
     unsigned char *kinds;
     size_t depth;
     size_t capacity;
+    /* Lookups see only the frames above this depth; an included template
+     * starts a new lexical scope by raising it. */
+    size_t floor;
 } scope_t;
 
 void scope_init(scope_t *scope, lua_State *L, pool_t *pool, int globals_idx,
@@ -58,6 +61,13 @@ void scope_init(scope_t *scope, lua_State *L, pool_t *pool, int globals_idx,
  *         either way.
  */
 int scope_push(scope_t *scope, scope_kind_t kind);
+
+/**
+ * Push the frame table at depth again as a new innermost data frame.
+ *
+ * @return 0, or -1 when the pool runs out of memory.
+ */
+int scope_push_frame_of(scope_t *scope, size_t depth);
 
 /* Drop the frames above depth. */
 void scope_pop_to(scope_t *scope, size_t depth);
@@ -72,12 +82,12 @@ void scope_push_undefined(lua_State *L);
 /* Push the globals table ($). */
 void scope_push_dollar(const scope_t *scope);
 
-/* Push the value bound to name by the innermost data frame that has the key
- * (@name), or nil. */
+/* Push the value bound to name by the innermost data frame above the floor
+ * that has the key (@name), or nil. */
 void scope_push_at(const scope_t *scope, const char *name, size_t len);
 
-/* Push the value bound to name by the innermost frame of any kind that has
- * the key (.name), or nil. */
+/* Push the value bound to name by the innermost frame of any kind above the
+ * floor that has the key (.name), or nil. */
 void scope_push_dot(const scope_t *scope, const char *name, size_t len);
 
 #endif /* REFLOW_SCOPE_H */

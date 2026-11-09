@@ -22,6 +22,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -32,6 +33,7 @@
 #include "error.h"
 #include "expr_eval.h"
 #include "ir.h"
+#include "js_number.h"
 #include "pool.h"
 #include "render_output.h"
 #include "scope.h"
@@ -41,17 +43,21 @@
 #define INTERPRET_OPERATION      "reflow.interpret.render"
 #define INTERPRET_INITIAL_FRAMES 16
 #define INTERPRET_OOM_MESSAGE    "out of memory while rendering"
+#define INTERPRET_INCLUDE_DEPTH  50
 
 /* Stack positions inside the protected body. */
-#define INTERPRET_CTX_IDX     1
-#define INTERPRET_DATA_IDX    2
-#define INTERPRET_HELPERS_IDX 3
-#define INTERPRET_FRAMES_IDX  4
+#define INTERPRET_CTX_IDX       1
+#define INTERPRET_DATA_IDX      2
+#define INTERPRET_HELPERS_IDX   3
+#define INTERPRET_TEMPLATES_IDX 4
+#define INTERPRET_HISTORY_IDX   5
+#define INTERPRET_FRAMES_IDX    6
 
 typedef enum {
     FRAME_CHILDREN, /* the children of an open element, or of the root */
     FRAME_FOR,      /* the iterations of an x-for element */
-    FRAME_EACH      /* the iterations of an x-each element */
+    FRAME_EACH,     /* the iterations of an x-each element */
+    FRAME_INCLUDE   /* an x-include element whose template is rendering */
 } frame_kind_t;
 
 /* A children frame holds an open element (NULL for the root) and the next
@@ -60,7 +66,8 @@ typedef enum {
  * hash table, the last key, kept on the Lua stack. scope_depth is restored
  * when the frame is dropped, and a loop frame also restores the Lua stack
  * to stack_base, dropping the collection, the key, and the table of loop
- * variables. */
+ * variables. An include frame holds the x-include element and the template
+ * and scope floor to return to when the included template is done. */
 typedef struct {
     frame_kind_t kind;
     const ir_element_t *element;
@@ -72,6 +79,8 @@ typedef struct {
     int is_hash;
     int index;
     double value;
+    const ir_t *ir;
+    size_t floor;
 } frame_t;
 
 typedef struct {
@@ -91,7 +100,16 @@ typedef struct {
     const ir_bind_t *error_bind;
     /* Set when x-break or x-break-if fired, until the innermost loop ends. */
     int breaking;
+    /* The names of the templates being rendered, from the entry, are kept
+     * in the history table; include_depth is their number. */
+    size_t include_depth;
+    lua_Number max_include_depth;
+    /* The reason of an include error, which makes the error an include
+     * error. */
+    const char *error_reason;
 } render_ctx_t;
+
+static const ir_t *to_ir(lua_State *L, int idx);
 
 /* HTML void elements never have an end tag. The list is the one used by the
  * JavaScript version and by Lexbor when the template is compiled. */
@@ -463,6 +481,85 @@ static int select_match_branch(render_ctx_t *ctx, const ir_element_t *element,
     return 0;
 }
 
+/* Raise an include error with its reason; the requested value on top of
+ * the stack is kept in the history table for the meta. */
+static int raise_include_error(render_ctx_t *ctx, const ir_element_t *element,
+                               const char *reason)
+{
+    lua_State *L = ctx->L;
+
+    lua_pushvalue(L, -2);
+    lua_setfield(L, INTERPRET_HISTORY_IDX, "requested");
+    ctx->error_reason = reason;
+    return raise_type_error(ctx, element, element->directives->include);
+}
+
+/* Start rendering the template named by the x-include of element, after its
+ * start tag. The template gets a new lexical scope that sees only the
+ * x-with frame of the element at with_depth (0 when it has none). The
+ * element is closed by render_tree when the template is done. */
+static int start_include(render_ctx_t *ctx, const ir_element_t *element,
+                         size_t scope_depth, size_t with_depth)
+{
+    lua_State *L   = ctx->L;
+    const ir_t *ir = NULL;
+    frame_t frame  = {0};
+    size_t i       = 0;
+
+    if (eval_expression(ctx, element, element->directives->include) != 0) {
+        return -1;
+    } else if (lua_type(L, -1) != LUA_TSTRING) {
+        lua_pushfstring(L,
+                        "x-include: value must evaluate to a template name "
+                        "(string), got %s",
+                        value_lua_type_name(L, -1));
+        return raise_include_error(ctx, element, "invalid");
+    }
+    if (lua_type(L, INTERPRET_TEMPLATES_IDX) == LUA_TTABLE) {
+        lua_pushvalue(L, -1);
+        lua_rawget(L, INTERPRET_TEMPLATES_IDX);
+        ir = to_ir(L, -1);
+        lua_pop(L, 1);
+    }
+    if (ir == NULL) {
+        lua_pushfstring(L, "template not found: \"%s\"", lua_tostring(L, -1));
+        return raise_include_error(ctx, element, "not_found");
+    } else if ((lua_Number)ctx->include_depth >= ctx->max_include_depth) {
+        char limit[JS_NUMBER_BUFSIZE];
+
+        js_number_format((double)ctx->max_include_depth, limit);
+        lua_pushfstring(L, "include depth limit exceeded (%s)", limit);
+        return raise_include_error(ctx, element, "depth_exceeded");
+    }
+    for (i = 1; i <= ctx->include_depth; i++) {
+        lua_rawgeti(L, INTERPRET_HISTORY_IDX, (int)i);
+        if (lua_rawequal(L, -1, -2)) {
+            lua_pop(L, 1);
+            lua_pushliteral(L, "include cycle detected");
+            return raise_include_error(ctx, element, "cycle");
+        }
+        lua_pop(L, 1);
+    }
+    lua_rawseti(L, INTERPRET_HISTORY_IDX, (int)++ctx->include_depth);
+
+    frame = (frame_t){
+        .kind        = FRAME_INCLUDE,
+        .element     = element,
+        .scope_depth = scope_depth,
+        .ir          = ctx->ir,
+        .floor       = ctx->scope.floor,
+    };
+    if (push_frame_value(ctx, &frame) != 0) {
+        return -1;
+    }
+    ctx->ir          = ir;
+    ctx->scope.floor = ctx->scope.depth;
+    if (with_depth > 0 && scope_push_frame_of(&ctx->scope, with_depth) != 0) {
+        return -1;
+    }
+    return push_frame(ctx, NULL, ir->root->children.head, ctx->scope.depth);
+}
+
 /* Called when an element has been written and its own frames dropped:
  * x-break, or x-break-if with a truthy value, ends the innermost loop. */
 static int finish_element(render_ctx_t *ctx, const ir_element_t *element)
@@ -494,6 +591,7 @@ static int render_element_once(render_ctx_t *ctx, const ir_element_t *element)
     size_t scope_depth                = ctx->scope.depth;
     int is_void                       = is_void_element(&element->tag_name);
     const ir_node_t *children         = element->children.head;
+    size_t with_depth                 = 0;
     int has_content                   = 0;
     int content_rc                    = 0;
 
@@ -505,11 +603,14 @@ static int render_element_once(render_ctx_t *ctx, const ir_element_t *element)
             (value_lua_push(ctx->L, ctx->pool, directives->data_scopes) != 0 ||
              scope_push(&ctx->scope, SCOPE_DATA) != 0)) {
             return -1;
-        } else if (directives->with.count > 0 &&
-                   push_with_frame(ctx, element) != 0) {
-            return -1;
-        } else if (directives->match_condition != NULL &&
-                   select_match_branch(ctx, element, &children) != 0) {
+        } else if (directives->with.count > 0) {
+            if (push_with_frame(ctx, element) != 0) {
+                return -1;
+            }
+            with_depth = ctx->scope.depth;
+        }
+        if (directives->match_condition != NULL &&
+            select_match_branch(ctx, element, &children) != 0) {
             return -1;
         } else if (push_bind_values(ctx, element) != 0) {
             return -1;
@@ -520,11 +621,13 @@ static int render_element_once(render_ctx_t *ctx, const ir_element_t *element)
     } else if (directives != NULL) {
         lua_pop(ctx->L, (int)directives->bind.count);
     }
-    /* x-text and x-html replace the children, except on an x-match element,
-     * whose content is the selected branch. A void element keeps no end tag
-     * even with content, as in the JavaScript version. */
+    /* x-text, x-html, and x-include replace the children, except on an
+     * x-match element, whose content is the selected branch. A void element
+     * keeps no end tag even with content, as in the JavaScript version. */
     if (directives != NULL && directives->match_condition == NULL) {
-        if (directives->text != NULL) {
+        if (directives->include != NULL) {
+            return start_include(ctx, element, scope_depth, with_depth);
+        } else if (directives->text != NULL) {
             has_content = 1;
             content_rc  = write_text_content(ctx, element, directives->text);
         } else if (directives->html != NULL) {
@@ -749,7 +852,28 @@ static int render_tree(render_ctx_t *ctx)
         frame_t *frame        = &ctx->frames[ctx->depth - 1];
         const ir_node_t *node = frame->next;
 
-        if (frame->kind != FRAME_CHILDREN) {
+        if (frame->kind == FRAME_INCLUDE) {
+            /* The included template is done: return to the including one
+             * and close the x-include element. */
+            const ir_element_t *element = frame->element;
+            size_t scope_depth          = frame->scope_depth;
+
+            ctx->ir          = frame->ir;
+            ctx->scope.floor = frame->floor;
+            lua_pushnil(ctx->L);
+            lua_rawseti(ctx->L, INTERPRET_HISTORY_IDX,
+                        (int)ctx->include_depth--);
+            ctx->depth--;
+            if (!is_void_element(&element->tag_name) &&
+                write_end_tag(&ctx->out, element) != 0) {
+                return -1;
+            }
+            scope_pop_to(&ctx->scope, scope_depth);
+            if (!ctx->breaking && finish_element(ctx, element) != 0) {
+                return -1;
+            }
+            continue;
+        } else if (frame->kind != FRAME_CHILDREN) {
             /* A break ends the innermost loop. render_element_once may move
              * the frame array, so the loop position is advanced first. */
             if (ctx->breaking) {
@@ -794,7 +918,7 @@ static int render_body(lua_State *L)
 {
     render_ctx_t *ctx = (render_ctx_t *)lua_touserdata(L, INTERPRET_CTX_IDX);
 
-    lua_settop(L, INTERPRET_HELPERS_IDX);
+    lua_settop(L, INTERPRET_HISTORY_IDX);
     if (lua_isnil(L, INTERPRET_DATA_IDX)) {
         lua_newtable(L);
         lua_replace(L, INTERPRET_DATA_IDX);
@@ -815,23 +939,29 @@ static int render_body(lua_State *L)
 
 /* Where an error happened, for its meta. */
 typedef struct {
-    const char *name;
-    size_t name_len;
+    int history_idx;
     const ir_t *ir;
     const ir_element_t *element;
     const reflow_expression_t *expression;
     const char *directive;
     const ir_bind_t *bind;
+    const char *reason;
 } error_site_t;
 
 static void push_error_meta(lua_State *L, const error_site_t *site)
 {
+    int depth = (int)value_lua_raw_length(L, site->history_idx);
+    int i     = 0;
+
+    /* The template being rendered is the last name of the history. */
     lua_createtable(L, 0, 8);
-    lua_pushlstring(L, site->name, site->name_len);
+    lua_rawgeti(L, site->history_idx, depth);
     lua_setfield(L, -2, "template_name");
-    lua_createtable(L, 1, 0);
-    lua_pushlstring(L, site->name, site->name_len);
-    lua_rawseti(L, -2, 1);
+    lua_createtable(L, depth, 0);
+    for (i = 1; i <= depth; i++) {
+        lua_rawgeti(L, site->history_idx, i);
+        lua_rawseti(L, -2, i);
+    }
     lua_setfield(L, -2, "include_stack");
     if (site->element != NULL) {
         const ir_element_t *element       = site->element;
@@ -870,10 +1000,17 @@ static void push_error_meta(lua_State *L, const error_site_t *site)
         lua_pushlstring(L, site->bind->name.data, site->bind->name.len);
         lua_setfield(L, -2, "attribute");
     }
+    if (site->reason != NULL) {
+        lua_pushstring(L, site->reason);
+        lua_setfield(L, -2, "reason");
+        lua_getfield(L, site->history_idx, "requested");
+        lua_setfield(L, -2, "requested");
+    }
 }
 
-/* Return nil and a runtime error. site is NULL when the template name is
- * not known; cause_idx is 0 when there is no cause. */
+/* Return nil and a runtime error, or an include error when the site has a
+ * reason. site is NULL when the template name is not known; cause_idx is 0
+ * when there is no cause. */
 static int return_runtime_error(lua_State *L, const char *message,
                                 const error_site_t *site, int cause_idx)
 {
@@ -883,8 +1020,13 @@ static int return_runtime_error(lua_State *L, const char *message,
         push_error_meta(L, site);
         meta_idx = lua_gettop(L);
     }
-    reflow_error_push_runtime(L, INTERPRET_OPERATION, message, cause_idx,
-                              meta_idx);
+    if (site != NULL && site->reason != NULL) {
+        reflow_error_push_include(L, INTERPRET_OPERATION, message, cause_idx,
+                                  meta_idx);
+    } else {
+        reflow_error_push_runtime(L, INTERPRET_OPERATION, message, cause_idx,
+                                  meta_idx);
+    }
     lua_pushnil(L);
     lua_insert(L, -2);
     return 2;
@@ -929,11 +1071,21 @@ static int render_lua(lua_State *L)
     int status        = LUA_OK;
     int base          = 0;
 
-    if (lua_type(L, 1) != LUA_TSTRING ||
-        (site.name = lua_tolstring(L, 1, &site.name_len), site.name_len == 0)) {
+    if (lua_type(L, 1) != LUA_TSTRING || value_lua_raw_length(L, 1) == 0) {
         return return_runtime_error(L, "name must be a non-empty string", NULL,
                                     0);
     }
+    /* The history of template names starts with the entry. It is created
+     * outside the protected call, so that it still names the template that
+     * failed after the call. */
+    lua_settop(L, 6);
+    lua_createtable(L, 1, 1);
+    lua_pushvalue(L, 1);
+    lua_rawseti(L, -2, 1);
+    site.history_idx      = lua_gettop(L);
+    ctx.include_depth     = 1;
+    ctx.max_include_depth = INTERPRET_INCLUDE_DEPTH;
+
     ctx.ir = site.ir = to_ir(L, 2);
     if (ctx.ir == NULL) {
         return return_runtime_error(L, "ir must be a compiled template", &site,
@@ -943,8 +1095,19 @@ static int render_lua(lua_State *L)
     } else if (!lua_isnoneornil(L, 4) && lua_type(L, 4) != LUA_TTABLE) {
         return return_runtime_error(L, "helpers must be a table or nil", &site,
                                     0);
+    } else if (!lua_isnil(L, 5) && lua_type(L, 5) != LUA_TTABLE) {
+        return return_runtime_error(L, "templates must be a table or nil",
+                                    &site, 0);
+    } else if (!lua_isnil(L, 6)) {
+        lua_Number max = lua_tonumber(L, 6);
+
+        if (lua_type(L, 6) != LUA_TNUMBER || !(max >= 0) || max > floor(max)) {
+            return return_runtime_error(
+                L, "max_include_depth must be a non-negative integer or nil",
+                &site, 0);
+        }
+        ctx.max_include_depth = max;
     }
-    lua_settop(L, 4);
     base = lua_gettop(L);
 
     lua_pushcfunction(L, render_body);
@@ -960,7 +1123,9 @@ static int render_lua(lua_State *L)
     lua_pushlightuserdata(L, &ctx);
     lua_pushvalue(L, 3);
     lua_pushvalue(L, 4);
-    status = lua_pcall(L, 3, 1, 0);
+    lua_pushvalue(L, 5);
+    lua_pushvalue(L, site.history_idx);
+    status = lua_pcall(L, 5, 1, 0);
     pool_delete(L, ctx.pool);
     lua_remove(L, base + 1);
     if (status != LUA_OK || lua_isnil(L, -1)) {
@@ -978,6 +1143,8 @@ static int render_lua(lua_State *L)
         site.expression = ctx.error_expression;
         site.directive  = ctx.error_directive;
         site.bind       = ctx.error_bind;
+        site.reason     = ctx.error_reason;
+        site.ir         = ctx.ir;
         if (ctx.eval.raised) {
             /* The renderer raised its own message. */
             message = lua_tostring(L, base + 1);
