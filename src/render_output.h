@@ -55,4 +55,13 @@ int render_output_write(render_output_t *out, const char *s, size_t len);
 int render_output_write_attr_value(render_output_t *out, const char *s,
                                    size_t len);
 
+/**
+ * Append text for an HTML text context, as JavaScript's escapeText does:
+ * '&', '<', '>', '"', and "'" become "&amp;", "&lt;", "&gt;", "&quot;", and
+ * "&#39;".
+ *
+ * @return 0 on success, or -1 with errno set to ENOMEM.
+ */
+int render_output_write_text(render_output_t *out, const char *s, size_t len);
+
 #endif /* REFLOW_RENDER_OUTPUT_H */

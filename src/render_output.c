@@ -88,3 +88,40 @@ int render_output_write_attr_value(render_output_t *out, const char *s,
     }
     return 0;
 }
+
+int render_output_write_text(render_output_t *out, const char *s, size_t len)
+{
+    size_t start = 0;
+    size_t i     = 0;
+
+    for (i = 0; i < len; i++) {
+        const char *entity = NULL;
+        size_t entity_len  = 0;
+
+        switch (s[i]) {
+        case '&':
+            entity = "&amp;", entity_len = 5;
+            break;
+        case '<':
+            entity = "&lt;", entity_len = 4;
+            break;
+        case '>':
+            entity = "&gt;", entity_len = 4;
+            break;
+        case '"':
+            entity = "&quot;", entity_len = 6;
+            break;
+        case '\'':
+            entity = "&#39;", entity_len = 5;
+            break;
+        default:
+            continue;
+        }
+        if (render_output_write(out, s + start, i - start) != 0 ||
+            render_output_write(out, entity, entity_len) != 0) {
+            return -1;
+        }
+        start = i + 1;
+    }
+    return render_output_write(out, s + start, len - start);
+}
