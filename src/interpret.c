@@ -399,15 +399,54 @@ static int push_bind_values(render_ctx_t *ctx, const ir_element_t *element)
     return 0;
 }
 
+/* Select the branch of an x-match element: evaluate the match value, then
+ * the x-case values in order until one is the same value (=== in
+ * JavaScript, which lua_rawequal gives). An x-nocase is selected when it is
+ * reached. *selected is left NULL when nothing matches. */
+static int select_match_branch(render_ctx_t *ctx, const ir_element_t *element,
+                               const ir_node_t **selected)
+{
+    lua_State *L               = ctx->L;
+    const ir_branch_t *branch  = NULL;
+    const ir_directives_t *dir = element->directives;
+
+    *selected = NULL;
+    if (eval_expression(ctx, element, dir->match_condition) != 0) {
+        return -1;
+    }
+    for (branch = dir->match_branches.head; branch != NULL;
+         branch = branch->next) {
+        int same = 0;
+
+        if (branch->condition != NULL) {
+            if (eval_expression(ctx, (const ir_element_t *)branch->node,
+                                branch->condition) != 0) {
+                return -1;
+            }
+            same = lua_rawequal(L, -1, -2);
+            lua_pop(L, 1);
+        }
+        if (branch->condition == NULL || same) {
+            *selected = branch->node;
+            break;
+        }
+    }
+    lua_pop(L, 1);
+    return 0;
+}
+
 /* Render an element as the JavaScript version does: push its x-data frame,
- * then its x-with frame, evaluate its x-bind directives, write the start tag
- * and its x-text or x-html content, and open a frame for its children unless
- * it has none. */
+ * then its x-with frame, select the branch of an x-match, evaluate its
+ * x-bind directives, write the start tag and its x-text or x-html content,
+ * and open a frame for its children, or for the selected branch alone,
+ * unless it has none. */
 static int render_element(render_ctx_t *ctx, const ir_element_t *element)
 {
     const ir_directives_t *directives = element->directives;
     size_t scope_depth                = ctx->scope.depth;
     int is_void                       = is_void_element(&element->tag_name);
+    const ir_node_t *children         = element->children.head;
+    int has_content                   = 0;
     int content_rc                    = 0;
 
     if (directives != NULL) {
@@ -418,6 +457,9 @@ static int render_element(render_ctx_t *ctx, const ir_element_t *element)
         } else if (directives->with.count > 0 &&
                    push_with_frame(ctx, element) != 0) {
             return -1;
+        } else if (directives->match_condition != NULL &&
+                   select_match_branch(ctx, element, &children) != 0) {
+            return -1;
         } else if (push_bind_values(ctx, element) != 0) {
             return -1;
         }
@@ -427,25 +469,58 @@ static int render_element(render_ctx_t *ctx, const ir_element_t *element)
     } else if (directives != NULL) {
         lua_pop(ctx->L, (int)directives->bind.count);
     }
-    /* x-text and x-html replace the children. A void element keeps no end
-     * tag even with content, as in the JavaScript version. */
-    if (directives != NULL && directives->text != NULL) {
-        content_rc = write_text_content(ctx, element, directives->text);
-    } else if (directives != NULL && directives->html != NULL) {
-        content_rc = write_html_content(ctx, element, directives->html);
-    } else if (!is_void) {
-        return push_frame(ctx, element, element->children.head, scope_depth);
+    /* x-text and x-html replace the children, except on an x-match element,
+     * whose content is the selected branch. A void element keeps no end tag
+     * even with content, as in the JavaScript version. */
+    if (directives != NULL && directives->match_condition == NULL) {
+        if (directives->text != NULL) {
+            has_content = 1;
+            content_rc  = write_text_content(ctx, element, directives->text);
+        } else if (directives->html != NULL) {
+            has_content = 1;
+            content_rc  = write_html_content(ctx, element, directives->html);
+        }
     }
-    if (content_rc != 0 ||
-        (!is_void && write_end_tag(&ctx->out, element) != 0)) {
+    if (!has_content && !is_void) {
+        return push_frame(ctx, element, children, scope_depth);
+    } else if (content_rc != 0 ||
+               (!is_void && write_end_tag(&ctx->out, element) != 0)) {
         return -1;
     }
     scope_pop_to(&ctx->scope, scope_depth);
     return 0;
 }
 
-/* Render one node. An element that may have children opens a new frame;
- * chain nodes render nothing until branch selection is implemented. */
+/* Render the first branch of an x-if chain whose condition is truthy, or
+ * its x-else branch. Conditions are evaluated in the enclosing scope, so a
+ * branch's own frames are not visible to them, and the conditions after the
+ * selected branch are not evaluated. */
+static int render_chain(render_ctx_t *ctx, const ir_chain_t *chain)
+{
+    lua_State *L              = ctx->L;
+    const ir_branch_t *branch = NULL;
+
+    for (branch = chain->branches.head; branch != NULL; branch = branch->next) {
+        const ir_element_t *element = (const ir_element_t *)branch->node;
+
+        if (branch->condition != NULL) {
+            int truthy = 0;
+
+            if (eval_expression(ctx, element, branch->condition) != 0) {
+                return -1;
+            }
+            truthy = value_lua_is_truthy(L, -1);
+            lua_pop(L, 1);
+            if (!truthy) {
+                continue;
+            }
+        }
+        return render_element(ctx, element);
+    }
+    return 0;
+}
+
+/* Render one node. An element that may have children opens a new frame. */
 static int render_node(render_ctx_t *ctx, const ir_node_t *node)
 {
     switch (node->type) {
@@ -464,8 +539,9 @@ static int render_node(render_ctx_t *ctx, const ir_node_t *node)
     }
     case IR_ELEMENT:
         return render_element(ctx, (const ir_element_t *)node);
-    case IR_ROOT:
     case IR_CHAIN:
+        return render_chain(ctx, (const ir_chain_t *)node);
+    case IR_ROOT:
         return 0;
     }
     return 0;
