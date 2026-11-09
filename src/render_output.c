@@ -89,7 +89,10 @@ int render_output_write_attr_value(render_output_t *out, const char *s,
     return 0;
 }
 
-int render_output_write_text(render_output_t *out, const char *s, size_t len)
+/* Write s with '&', '<', '>', and '"' replaced by entities, and "'" too when
+ * escape_apostrophe is set. */
+static int write_escaped(render_output_t *out, const char *s, size_t len,
+                         int escape_apostrophe)
 {
     size_t start = 0;
     size_t i     = 0;
@@ -112,6 +115,9 @@ int render_output_write_text(render_output_t *out, const char *s, size_t len)
             entity = "&quot;", entity_len = 6;
             break;
         case '\'':
+            if (!escape_apostrophe) {
+                continue;
+            }
             entity = "&#39;", entity_len = 5;
             break;
         default:
@@ -124,4 +130,15 @@ int render_output_write_text(render_output_t *out, const char *s, size_t len)
         start = i + 1;
     }
     return render_output_write(out, s + start, len - start);
+}
+
+int render_output_write_text(render_output_t *out, const char *s, size_t len)
+{
+    return write_escaped(out, s, len, 1);
+}
+
+int render_output_write_attr_text(render_output_t *out, const char *s,
+                                  size_t len)
+{
+    return write_escaped(out, s, len, 0);
 }

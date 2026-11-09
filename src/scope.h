@@ -62,6 +62,13 @@ int scope_push(scope_t *scope, scope_kind_t kind);
 /* Drop the frames above depth. */
 void scope_pop_to(scope_t *scope, size_t depth);
 
+/* Push the value a frame stores for a name bound to nil. A table cannot hold
+ * nil, so such a binding is kept as a private marker; the lookups below stop
+ * at the marker and push nil, so the binding hides outer ones as an
+ * undefined binding does in JavaScript. The marker never reaches an
+ * expression. */
+void scope_push_undefined(lua_State *L);
+
 /* Push the globals table ($). */
 void scope_push_dollar(const scope_t *scope);
 

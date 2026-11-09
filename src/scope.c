@@ -29,6 +29,9 @@
 
 #define SCOPE_INITIAL_FRAMES 8
 
+/* Only its address is used, as the marker of a name bound to nil. */
+static char undefined_marker;
+
 static int frame_index(lua_State *L, size_t depth)
 {
     if (depth > INT_MAX) {
@@ -84,6 +87,11 @@ void scope_pop_to(scope_t *scope, size_t depth)
     }
 }
 
+void scope_push_undefined(lua_State *L)
+{
+    lua_pushlightuserdata(L, &undefined_marker);
+}
+
 void scope_push_dollar(const scope_t *scope)
 {
     lua_pushvalue(scope->L, scope->globals_idx);
@@ -104,6 +112,10 @@ static void push_binding(const scope_t *scope, int data_only, const char *name,
         lua_pushvalue(L, -2);
         lua_rawget(L, -2);
         if (!lua_isnil(L, -1)) {
+            if (lua_touserdata(L, -1) == (void *)&undefined_marker) {
+                lua_pushnil(L);
+                lua_replace(L, -2);
+            }
             lua_replace(L, -3);
             lua_pop(L, 1);
             return;
