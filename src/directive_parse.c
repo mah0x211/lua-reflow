@@ -21,8 +21,11 @@
  */
 
 #include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <lauxlib.h>
@@ -563,6 +566,236 @@ static int parse_case(const directive_parse_ctx_t *ctx, const char *suffix,
                                       error);
 }
 
+#define FOR_MAX_ARGUMENTS 3
+
+static int is_ascii_digit(char ch)
+{
+    return ch >= '0' && ch <= '9';
+}
+
+static int is_identifier_start(char ch)
+{
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || ch == '_' ||
+           ch == '$';
+}
+
+/* The variable name rule of the JavaScript version, /^[a-zA-Z_$][\w$]*$/. */
+static int is_for_variable_name(const char *s, size_t len)
+{
+    size_t i = 0;
+
+    if (len == 0 || !is_identifier_start(s[0])) {
+        return 0;
+    }
+    for (i = 1; i < len; i++) {
+        if (!is_identifier_start(s[i]) && !is_ascii_digit(s[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* The integer rule of the JavaScript version, /^-?\d+$/. */
+static int is_for_integer(const char *s, size_t len)
+{
+    size_t i = s != NULL && len > 0 && s[0] == '-' ? 1 : 0;
+
+    if (i == len) {
+        return 0;
+    }
+    for (; i < len; i++) {
+        if (!is_ascii_digit(s[i])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Push n, an integer-valued double or an infinity, as JavaScript's String(n)
+ * writes it: the shortest digits that read back as n, padded with zeros
+ * below 1e21 and in exponent notation such as "3e+21" from there on.
+ * snprintf and strtod must round correctly, as C99 requires. */
+static void push_for_number(lua_State *L, double n)
+{
+    luaL_Buffer buffer;
+    char buf[32];
+    double magnitude = fabs(n);
+    int precision    = 0;
+    int exponent     = 0;
+    char *mark       = NULL;
+    int i            = 0;
+
+    if (isinf(n)) {
+        lua_pushstring(L, n < 0 ? "-Infinity" : "Infinity");
+        return;
+    }
+    if (fpclassify(magnitude) == FP_ZERO) {
+        /* -0 is written as "0". */
+        lua_pushliteral(L, "0");
+        return;
+    }
+    for (precision = 0; precision < 17; precision++) {
+        double parsed = 0;
+
+        (void)snprintf(buf, sizeof(buf), "%.*e", precision, magnitude);
+        parsed = strtod(buf, NULL);
+        /* Exact equality; neither value is NaN. */
+        if (!(parsed < magnitude) && !(parsed > magnitude)) {
+            break;
+        }
+    }
+    (void)snprintf(buf, sizeof(buf), "%.*e", precision, magnitude);
+    mark     = strchr(buf, 'e');
+    exponent = (int)strtol(mark + 1, NULL, 10);
+
+    luaL_buffinit(L, &buffer);
+    if (n < 0) {
+        luaL_addchar(&buffer, '-');
+    }
+    luaL_addchar(&buffer, buf[0]);
+    if (exponent < 21) {
+        /* An integer has no more significant digits than integer digits. */
+        if (precision > 0) {
+            luaL_addlstring(&buffer, buf + 2, (size_t)precision);
+        }
+        for (i = precision; i < exponent; i++) {
+            luaL_addchar(&buffer, '0');
+        }
+    } else {
+        if (precision > 0) {
+            luaL_addchar(&buffer, '.');
+            luaL_addlstring(&buffer, buf + 2, (size_t)precision);
+        }
+        lua_pushfstring(L, "e+%d", exponent);
+        luaL_addvalue(&buffer);
+    }
+    luaL_pushresult(&buffer);
+}
+
+static int fail_for_direction(lua_State *L, double start, double stop,
+                              double step, directive_parse_error_t *error)
+{
+    int ascending = start < stop;
+
+    lua_pushliteral(L, "x-for: direction mismatch (start=");
+    push_for_number(L, start);
+    lua_pushstring(L, ascending ? " < stop=" : " > stop=");
+    push_for_number(L, stop);
+    lua_pushliteral(L, " but step=");
+    push_for_number(L, step);
+    lua_pushstring(L, ascending ? " < 0)" : " > 0)");
+    lua_concat(L, 7);
+    return fail_with_pushed_message(L, error);
+}
+
+/* Parse `<var> = <start>, <stop>[, <step>]` into an inclusive integer range,
+ * with the checks and messages of the JavaScript version. The values are
+ * read as JavaScript's Number() reads decimal digits, so very large ones
+ * round to the nearest double. */
+static int parse_for(const directive_parse_ctx_t *ctx, const char *suffix,
+                     size_t suffix_len, const char *source, size_t source_len,
+                     directive_parse_error_t *error)
+{
+    lua_State *L      = ctx->L;
+    const char *equal = NULL;
+    size_t name_start = 0;
+    size_t name_end   = 0;
+    size_t part_start[FOR_MAX_ARGUMENTS + 1];
+    size_t part_end[FOR_MAX_ARGUMENTS + 1];
+    double values[FOR_MAX_ARGUMENTS] = {0, 0, 1};
+    size_t count                     = 0;
+    size_t pos                       = 0;
+    size_t i                         = 0;
+
+    (void)suffix;
+    (void)suffix_len;
+    if (ir_element_has_for(ctx->element)) {
+        error->message = "duplicate x-for on element";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (source_len > 0) {
+        equal = (const char *)memchr(source, '=', source_len);
+    }
+    if (equal == NULL) {
+        error->message = "x-for: missing \"=\", expected "
+                         "\"<var> = <start>, <stop>[, <step>]\"";
+        errno          = EINVAL;
+        return -1;
+    }
+
+    name_end = (size_t)(equal - source);
+    reflow_js_trim(source, &name_start, &name_end);
+    if (!is_for_variable_name(source + name_start, name_end - name_start)) {
+        lua_pushliteral(L, "x-for: invalid variable name \"");
+        lua_pushlstring(L, source + name_start, name_end - name_start);
+        lua_pushliteral(L, "\"");
+        lua_concat(L, 3);
+        return fail_with_pushed_message(L, error);
+    }
+
+    /* Split the rest at every comma; only the first FOR_MAX_ARGUMENTS + 1
+     * parts are kept, which is enough to tell a valid count. */
+    pos = (size_t)(equal - source) + 1;
+    for (;;) {
+        const char *comma =
+            (const char *)memchr(source + pos, ',', source_len - pos);
+        size_t end = comma != NULL ? (size_t)(comma - source) : source_len;
+
+        if (count <= FOR_MAX_ARGUMENTS) {
+            part_start[count] = pos;
+            part_end[count]   = end;
+        }
+        count++;
+        if (comma == NULL) {
+            break;
+        }
+        pos = end + 1;
+    }
+    if (count < 2 || count > FOR_MAX_ARGUMENTS) {
+        lua_pushfstring(L,
+                        "x-for: expected 2 or 3 arguments after \"=\", "
+                        "got %d",
+                        (int)(count > INT_MAX ? INT_MAX : count));
+        return fail_with_pushed_message(L, error);
+    }
+
+    for (i = 0; i < count; i++) {
+        const char *part = NULL;
+        size_t len       = 0;
+
+        reflow_js_trim(source, &part_start[i], &part_end[i]);
+        part = source + part_start[i];
+        len  = part_end[i] - part_start[i];
+        if (!is_for_integer(part, len)) {
+            lua_pushliteral(L, "x-for: \"");
+            lua_pushlstring(L, part, len);
+            lua_pushliteral(L, "\" is not an integer");
+            lua_concat(L, 3);
+            return fail_with_pushed_message(L, error);
+        }
+        lua_pushlstring(L, part, len);
+        values[i] = strtod(lua_tostring(L, -1), NULL);
+        lua_pop(L, 1);
+    }
+
+    if (fpclassify(values[2]) == FP_ZERO) {
+        error->message = "x-for: step must not be zero";
+        errno          = EINVAL;
+        return -1;
+    }
+    if ((values[0] < values[1] && values[2] < 0) ||
+        (values[0] > values[1] && values[2] > 0)) {
+        return fail_for_direction(L, values[0], values[1], values[2], error);
+    }
+    if (ir_set_for(ctx->element, source + name_start, name_end - name_start,
+                   values[0], values[1], values[2]) != 0) {
+        error->message = IR_BUILD_FAILURE_MESSAGE(errno);
+        return -1;
+    }
+    return 0;
+}
+
 typedef struct {
     const char *duplicate_message;
     int (*has)(const ir_element_t *element);
@@ -988,6 +1221,12 @@ static const directive_parser_t parsers[] = {
      .parse    = parse_nocase,
      },
     {
+     .name     = "for",
+     .name_len = sizeof("for") - 1,
+     .match    = match_exact,
+     .parse    = parse_for,
+     },
+    {
      .name     = "with",
      .name_len = sizeof("with") - 1,
      .match    = match_exact,
@@ -1005,13 +1244,14 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
                                directive_parse_error_t *error)
 {
     const ir_element_t *element = ctx->element;
+    int structural              = 0;
     int content                 = 0;
 
-    *error = (directive_parse_error_t){0};
-    if (ir_element_has_if(element) + ir_element_has_elseif(element) +
-            ir_element_has_else(element) + ir_element_has_match(element) +
-            ir_element_has_case(element) + ir_element_has_nocase(element) >
-        1) {
+    *error     = (directive_parse_error_t){0};
+    structural = ir_element_has_if(element) + ir_element_has_elseif(element) +
+                 ir_element_has_else(element) + ir_element_has_match(element) +
+                 ir_element_has_case(element) + ir_element_has_nocase(element);
+    if (structural > 1) {
         error->message =
             "conflicting structural directives on same element "
             "(x-if / x-elseif / x-else / x-match / x-case / x-nocase are "
@@ -1024,6 +1264,12 @@ int directive_validate_element(const directive_parse_ctx_t *ctx,
     if (content > 1) {
         error->message = "conflicting content directives on same element "
                          "(x-text / x-html / x-include are mutually exclusive)";
+        errno          = EINVAL;
+        return -1;
+    }
+    if (structural > 0 && ir_element_has_for(element)) {
+        error->message = "cannot combine structural directive with iteration "
+                         "directive on same element; use nesting";
         errno          = EINVAL;
         return -1;
     }

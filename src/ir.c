@@ -21,6 +21,7 @@
  */
 
 #include <errno.h>
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -917,5 +918,45 @@ int ir_set_nocase(ir_element_t *element)
         return -1;
     }
     directives->has_nocase = 1;
+    return 0;
+}
+
+int ir_element_has_for(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->range != NULL;
+}
+
+int ir_set_for(ir_element_t *element, const char *name, size_t name_len,
+               double start, double stop, double step)
+{
+    ir_directives_t *directives = NULL;
+    ir_t *ir                    = NULL;
+    ir_for_t *range             = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT || name == NULL ||
+        name_len == 0 || fpclassify(step) == FP_ZERO ||
+        ir_element_has_for(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    ir    = node_private(&element->node)->owner;
+    range = (ir_for_t *)pool_calloc(ir_pool(ir), 1, sizeof(*range));
+    if (range == NULL) {
+        return -1;
+    }
+    if (copy_string(ir, name, name_len, &range->name) != 0) {
+        (void)pool_free(ir_pool(ir), range);
+        return -1;
+    }
+    /* Adding +0.0 turns -0 into +0 and keeps every other value. */
+    range->start      = start + 0.0;
+    range->stop       = stop + 0.0;
+    range->step       = step + 0.0;
+    directives->range = range;
     return 0;
 }

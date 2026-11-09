@@ -613,6 +613,19 @@ static int push_node_shell(lua_State *L, const ir_node_t *node)
                 lua_pushboolean(L, 1);
                 lua_setfield(L, -2, "nocase");
             }
+            if (element->directives->range != NULL) {
+                const ir_for_t *range = element->directives->range;
+
+                lua_createtable(L, 0, 4);
+                set_string_field(L, "name", range->name.data, range->name.len);
+                lua_pushnumber(L, (lua_Number)range->start);
+                lua_setfield(L, -2, "start");
+                lua_pushnumber(L, (lua_Number)range->stop);
+                lua_setfield(L, -2, "stop");
+                lua_pushnumber(L, (lua_Number)range->step);
+                lua_setfield(L, -2, "step");
+                lua_setfield(L, -2, "for");
+            }
             if (element->directives->with.head != NULL) {
                 const ir_with_t *with = NULL;
                 size_t index          = 0;
