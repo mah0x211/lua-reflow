@@ -139,6 +139,11 @@ struct ir_directives_t {
     ir_branch_list_t match_branches;
     const ir_for_t *range;
     const ir_each_t *each;
+    int has_break;
+    const struct reflow_expression_t *break_condition;
+    /* Set on an element whose only directives are x-break / x-break-if and
+     * which has no regular attribute; such an element renders nothing. */
+    int invisible_marker;
 };
 
 /* An x-each loop. index.data is NULL when no index name is given. */

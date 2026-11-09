@@ -49,6 +49,11 @@ typedef struct compile_ctx_t {
     size_t prefix_len;
     const directive_helper_name_t *helpers;
     size_t helper_count;
+    /* The first x-break / x-break-if outside x-for / x-each in source order.
+     * It is reported once the whole document has been finalized, so that
+     * every other compile error takes precedence, as in the JavaScript
+     * version. */
+    const ir_element_t *misplaced_break;
     int structured_failure;
 } compile_ctx_t;
 
@@ -277,14 +282,31 @@ static void on_attribute(void *data, const char *name, size_t name_len,
             }
             compile_raise_directive_error(ctx, name, name_len, &error);
         }
-        compile_raise(
-            ctx, "directive attributes are not supported by this compile stage",
-            name, name_len);
+        lua_pushliteral(ctx->L, "unknown directive \"");
+        lua_pushlstring(ctx->L, name, name_len);
+        lua_pushliteral(ctx->L, "\"");
+        lua_concat(ctx->L, 3);
+        error.message = lua_tostring(ctx->L, -1);
+        compile_raise_directive_error(ctx, name, name_len, &error);
     }
     if (ir_append_attr(ctx->pending_element, name, name_len, value,
                        value_len) != 0) {
         compile_raise_ir_error(ctx);
     }
+}
+
+/* Report whether node or one of its ancestors carries x-for or x-each. */
+static int inside_loop(ir_node_t *node)
+{
+    for (; node != NULL && node->type == IR_ELEMENT;
+         node = ir_node_parent(node)) {
+        const ir_element_t *element = (const ir_element_t *)node;
+
+        if (ir_element_has_for(element) || ir_element_has_each(element)) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void on_start_tag_end(void *data, int is_void_element)
@@ -306,6 +328,15 @@ static void on_start_tag_end(void *data, int is_void_element)
 
         if (directive_validate_element(&parse_ctx, &error) != 0) {
             compile_raise_directive_error(ctx, NULL, 0, &error);
+        }
+    }
+    if (ir_element_has_break(element) || ir_element_has_break_if(element)) {
+        if (ir_element_is_control_only(element) &&
+            ir_set_invisible_marker(element) != 0) {
+            compile_raise_ir_error(ctx);
+        }
+        if (ctx->misplaced_break == NULL && !inside_loop(ctx->current_parent)) {
+            ctx->misplaced_break = element;
         }
     }
     if (ir_append_child(ctx->current_parent, &element->node) != 0) {
@@ -402,6 +433,11 @@ static void on_document_end(void *data)
     }
     if (ctx->current_parent != NULL) {
         close_children(ctx, ctx->current_parent);
+    }
+    if (ctx->misplaced_break != NULL) {
+        compile_raise_element_error(
+            ctx, ctx->misplaced_break,
+            "x-break / x-break-if outside of x-for or x-each");
     }
 }
 

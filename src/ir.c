@@ -1004,3 +1004,80 @@ int ir_set_each(ir_element_t *element, const char *item, size_t item_len,
     directives->each = each;
     return 0;
 }
+
+int ir_element_has_break(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->has_break;
+}
+
+int ir_set_break(ir_element_t *element)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        ir_element_has_break(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->has_break = 1;
+    return 0;
+}
+
+int ir_element_has_break_if(const ir_element_t *element)
+{
+    return element != NULL && element->directives != NULL &&
+           element->directives->break_condition != NULL;
+}
+
+int ir_set_break_if(ir_element_t *element,
+                    const struct reflow_expression_t *expression)
+{
+    ir_directives_t *directives = NULL;
+
+    if (element == NULL || element->node.type != IR_ELEMENT ||
+        expression == NULL || ir_element_has_break_if(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    directives = element_directives(element);
+    if (directives == NULL) {
+        return -1;
+    }
+    directives->break_condition = expression;
+    return 0;
+}
+
+/* Report whether x-break / x-break-if is the only thing on the element:
+ * no other directive and no regular attribute. */
+int ir_element_is_control_only(const ir_element_t *element)
+{
+    const ir_directives_t *d = NULL;
+
+    if (element == NULL || element->directives == NULL ||
+        element->attrs.count != 0) {
+        return 0;
+    }
+    d = element->directives;
+    return (d->has_break || d->break_condition != NULL) &&
+           d->data_scopes == NULL && d->with.head == NULL &&
+           d->if_condition == NULL && d->elseif_condition == NULL &&
+           !d->has_else && d->match_condition == NULL &&
+           d->case_condition == NULL && !d->has_nocase && d->range == NULL &&
+           d->each == NULL && d->text == NULL && d->html == NULL &&
+           d->include == NULL && d->bind.head == NULL;
+}
+
+int ir_set_invisible_marker(ir_element_t *element)
+{
+    if (!ir_element_is_control_only(element)) {
+        errno = EINVAL;
+        return -1;
+    }
+    element->directives->invisible_marker = 1;
+    return 0;
+}

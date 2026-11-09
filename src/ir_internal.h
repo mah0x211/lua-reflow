@@ -114,6 +114,13 @@ int ir_element_has_each(const ir_element_t *element);
 int ir_set_each(ir_element_t *element, const char *item, size_t item_len,
                 const char *index, size_t index_len,
                 const struct reflow_expression_t *collection);
+int ir_element_has_break(const ir_element_t *element);
+int ir_set_break(ir_element_t *element);
+int ir_element_has_break_if(const ir_element_t *element);
+int ir_set_break_if(ir_element_t *element,
+                    const struct reflow_expression_t *expression);
+int ir_element_is_control_only(const ir_element_t *element);
+int ir_set_invisible_marker(ir_element_t *element);
 int ir_append_match_branch(ir_t *ir, ir_element_t *element,
                            const struct reflow_expression_t *condition,
                            ir_node_t *node);
