@@ -114,4 +114,12 @@ static inline void reflow_error_push_runtime(lua_State *L, const char *op,
     reflow_error_push_named(L, "new_runtime", op, message, cause_idx, meta_idx);
 }
 
+/** Push reflow.error.new_include(op, message, cause, meta). */
+static inline void reflow_error_push_include(lua_State *L, const char *op,
+                                             const char *message, int cause_idx,
+                                             int meta_idx)
+{
+    reflow_error_push_named(L, "new_include", op, message, cause_idx, meta_idx);
+}
+
 #endif /* REFLOW_ERROR_H */
