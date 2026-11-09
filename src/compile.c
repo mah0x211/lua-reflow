@@ -149,6 +149,29 @@ static void push_directive_error_meta(compile_ctx_t *ctx, const char *attribute,
     lua_setfield(L, -2, "element");
 }
 
+/* Push { source, byte, char } locating an error inside an expression or a
+ * directive value. Both positions are 1-based: byte suits string.sub and
+ * char counts code points. */
+static void push_expression_location(lua_State *L,
+                                     const directive_parse_error_t *error)
+{
+    size_t characters = 0;
+    size_t i          = 0;
+
+    for (i = 0; i < error->expression_pos && i < error->expression_len; i++) {
+        if (((unsigned char)error->expression[i] & 0xc0) != 0x80) {
+            characters++;
+        }
+    }
+    lua_createtable(L, 0, 3);
+    lua_pushlstring(L, error->expression, error->expression_len);
+    lua_setfield(L, -2, "source");
+    lua_pushinteger(L, (lua_Integer)error->expression_pos + 1);
+    lua_setfield(L, -2, "byte");
+    lua_pushinteger(L, (lua_Integer)characters + 1);
+    lua_setfield(L, -2, "char");
+}
+
 static void compile_raise_directive_error(compile_ctx_t *ctx,
                                           const char *attribute,
                                           size_t attribute_len,
@@ -173,6 +196,10 @@ static void compile_raise_directive_error(compile_ctx_t *ctx,
     }
     push_directive_error_meta(ctx, attribute, attribute_len);
     meta_idx = lua_gettop(L);
+    if (error->expression != NULL) {
+        push_expression_location(L, error);
+        lua_setfield(L, meta_idx, "expression");
+    }
     reflow_error_push_compile(L, COMPILE_OPERATION, error->message, cause_idx,
                               meta_idx);
     lua_remove(L, meta_idx);
