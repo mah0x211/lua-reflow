@@ -262,6 +262,28 @@ local function render(html, data, config)
     return engine:render(INLINE_NAME, data, config and config.selector)
 end
 
+--- load html with config.loader and render it once with an engine that is
+--- not kept. config takes the settings of reflow.new and the selector to
+--- render.
+--- @param path any
+--- @param data table?
+--- @param config table?
+--- @return string? html
+--- @return any err
+local function render_file(path, data, config)
+    local engine, err = new(config)
+    if not engine then
+        return nil, err
+    end
+
+    local ok
+    ok, err = engine:compile_file(INLINE_NAME, path)
+    if not ok then
+        return nil, err
+    end
+    return engine:render(INLINE_NAME, data, config and config.selector)
+end
+
 --- compile a selector without caching it.
 --- @param source string
 --- @return userdata? sel reflow.selector
@@ -273,6 +295,7 @@ end
 return {
     new = new,
     render = render,
+    render_file = render_file,
     compile_selector = compile_selector,
     ReflowError = errors.EREFLOW,
     ReflowCompileError = errors.ECOMPILE,

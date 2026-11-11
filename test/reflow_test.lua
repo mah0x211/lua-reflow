@@ -666,3 +666,48 @@ function testcase.render_once_returns_errors_as_is()
     assert.rawequal(errorlib.typeof(err), reflow_error.ESELECTOR)
     assert.equal(err.meta.template_name, '<inline>')
 end
+
+-- reflow.render_file, porting test/reflow.selector.test.js of the
+-- JavaScript version
+
+function testcase.render_file_once()
+    local loader = function(path)
+        assert.equal(path, 'virtual/path')
+        return '<div><span id="x" x-text="$.v"></span></div>'
+    end
+    assert.equal(reflow.render_file('virtual/path', {
+        v = 'yo',
+    }, {
+        loader = loader,
+    }), '<div><span id="x">yo</span></div>')
+    assert.equal(reflow.render_file('virtual/path', {
+        v = 'yo',
+    }, {
+        loader = loader,
+        selector = '#x',
+    }), '<span id="x">yo</span>')
+end
+
+function testcase.render_file_returns_errors_as_is()
+    local out, err = reflow.render_file('p', nil, 'config')
+    assert.is_nil(out)
+    assert.equal(err.op, 'reflow.new')
+    out, err = reflow.render_file('p')
+    assert.is_nil(out)
+    assert.equal(err.op, 'reflow.engine.compile_file')
+    local raised = {}
+    out, err = reflow.render_file('p', nil, {
+        loader = function()
+            error(raised)
+        end,
+    })
+    assert.is_nil(out)
+    assert.rawequal(err, raised)
+    out, err = reflow.render_file('p', nil, {
+        loader = function()
+            return '<p x-text=".a.b"></p>'
+        end,
+    })
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
+end
