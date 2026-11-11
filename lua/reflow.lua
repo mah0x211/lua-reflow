@@ -23,6 +23,7 @@
 local floor = math.floor
 local huge = math.huge
 local format = string.format
+local ipairs = ipairs
 local pairs = pairs
 local setmetatable = setmetatable
 local tostring = tostring
@@ -107,6 +108,15 @@ function Engine:render(name, data, sel)
     end
     return interpret.render(name, ir, data, self._helpers, self._templates,
                             self._max_include_depth, sel)
+end
+
+--- @return string[] names registered names in registration order
+function Engine:templates()
+    local names = {}
+    for i, name in ipairs(self._order) do
+        names[i] = name
+    end
+    return names
 end
 
 --- @param message string

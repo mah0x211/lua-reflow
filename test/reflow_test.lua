@@ -398,3 +398,30 @@ function testcase.render_errors_are_returned_as_is()
     assert.is_nil(out)
     assert.rawequal(errorlib.unwrap(err), raised)
 end
+
+-- engine:templates
+
+function testcase.templates_lists_names_in_registration_order()
+    local engine = engine_with({
+        {
+            'b',
+            '<p></p>',
+        },
+        {
+            'a',
+            '<p></p>',
+        },
+    })
+    assert.equal(engine:templates(), {
+        'b',
+        'a',
+    })
+    -- a new array is returned each time
+    local names = engine:templates()
+    names[1] = 'changed'
+    assert.equal(engine:templates(), {
+        'b',
+        'a',
+    })
+    assert.equal(new_engine():templates(), {})
+end
