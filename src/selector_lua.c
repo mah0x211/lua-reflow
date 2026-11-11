@@ -28,13 +28,17 @@
 
 #include "compat.h"
 #include "error.h"
+#include "ir.h"
 #include "pool.h"
 #include "reflow_util.h"
 #include "selector.h"
 #include "selector_compile.h"
+#include "selector_exec.h"
 
 #define SELECTOR_OPERATION   "reflow.selector.compile"
 #define SELECTOR_OOM_MESSAGE "out of memory while compiling the selector"
+#define RESOLVE_OPERATION    "reflow.selector.resolve"
+#define RESOLVE_OOM_MESSAGE  "out of memory while resolving the selector"
 
 /* The userdata of a compiled selector. Its uservalue keeps the pool that
  * holds the source and every condition. */
@@ -122,14 +126,14 @@ static int compile_protected(lua_State *L)
 
 /* Push reflow.error.new_selector(op, message, nil, meta) with the message at
  * message_idx, which may hold any byte, and the meta on top, which it pops. */
-static void push_error(lua_State *L, int message_idx)
+static void push_error(lua_State *L, const char *op, int message_idx)
 {
     int meta_idx = lua_gettop(L);
 
     reflow_error_require(L, "reflow.error");
     lua_getfield(L, -1, "new_selector");
     lua_remove(L, -2);
-    lua_pushliteral(L, SELECTOR_OPERATION);
+    lua_pushstring(L, op);
     lua_pushvalue(L, message_idx);
     lua_pushnil(L);
     lua_pushvalue(L, meta_idx);
@@ -182,7 +186,7 @@ static int return_selector_error(lua_State *L, int message_idx,
             lua_setfield(L, -2, "feature");
         }
     }
-    push_error(L, message_idx);
+    push_error(L, SELECTOR_OPERATION, message_idx);
     lua_pushnil(L);
     lua_insert(L, -2);
     return 2;
@@ -269,15 +273,43 @@ static void set_string(lua_State *L, const char *key,
     }
 }
 
+static const char *const PSEUDO_NAMES[] = {
+    "first-child",  "last-child",       "only-child", "first-of-type",
+    "last-of-type", "only-of-type",     "nth-child",  "nth-last-child",
+    "nth-of-type",  "nth-last-of-type",
+};
+
+/* Push the positional conditions of c as { {name = ..., n = ...}, ... }. */
+static void push_pseudos(lua_State *L, const selector_compound_t *c)
+{
+    size_t i = 0;
+
+    luaL_checkstack(L, 3, "building the selector table");
+    lua_createtable(L, (int)c->npseudos, 0);
+    for (i = 0; i < c->npseudos; i++) {
+        const selector_pseudo_t *pseudo = &c->pseudos[i];
+
+        lua_createtable(L, 0, 2);
+        lua_pushstring(L, PSEUDO_NAMES[pseudo->kind]);
+        lua_setfield(L, -2, "name");
+        if (pseudo->kind >= SELECTOR_PSEUDO_NTH_CHILD) {
+            /* A Lua integer when the argument is one, as JavaScript has a
+             * single number type. */
+            if (pseudo->n <= 9007199254740992.0) {
+                lua_pushinteger(L, (lua_Integer)pseudo->n);
+            } else {
+                lua_pushnumber(L, (lua_Number)pseudo->n);
+            }
+            lua_setfield(L, -2, "n");
+        }
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+}
+
 static void push_compound(lua_State *L, const selector_compound_t *c)
 {
     static const char *const ops[] = {NULL, "=", "~=", "|=", "^=", "$=", "*="};
-    static const char *const pseudos[] = {
-        "first-child",  "last-child",       "only-child", "first-of-type",
-        "last-of-type", "only-of-type",     "nth-child",  "nth-last-child",
-        "nth-of-type",  "nth-last-of-type",
-    };
-    size_t i = 0;
+    size_t i                       = 0;
 
     luaL_checkstack(L, 4, "building the selector table");
     lua_createtable(L, 0, 5);
@@ -303,25 +335,7 @@ static void push_compound(lua_State *L, const selector_compound_t *c)
         lua_rawseti(L, -2, (int)i + 1);
     }
     lua_setfield(L, -2, "attrs");
-    lua_createtable(L, (int)c->npseudos, 0);
-    for (i = 0; i < c->npseudos; i++) {
-        const selector_pseudo_t *pseudo = &c->pseudos[i];
-
-        lua_createtable(L, 0, 2);
-        lua_pushstring(L, pseudos[pseudo->kind]);
-        lua_setfield(L, -2, "name");
-        if (pseudo->kind >= SELECTOR_PSEUDO_NTH_CHILD) {
-            /* A Lua integer when the argument is one, as JavaScript has a
-             * single number type. */
-            if (pseudo->n <= 9007199254740992.0) {
-                lua_pushinteger(L, (lua_Integer)pseudo->n);
-            } else {
-                lua_pushnumber(L, (lua_Number)pseudo->n);
-            }
-            lua_setfield(L, -2, "n");
-        }
-        lua_rawseti(L, -2, (int)i + 1);
-    }
+    push_pseudos(L, c);
     lua_setfield(L, -2, "pseudos");
 }
 
@@ -366,12 +380,117 @@ static int to_table_lua(lua_State *L)
     return 1;
 }
 
+typedef struct {
+    pool_t *pool;
+    const ir_t *ir;
+    const selector_t *selector;
+    const selector_pseudo_t *ancestor;
+    int rc;
+} resolve_ctx_t;
+
+/* Build the candidate table under the protection of reflow_pcall_ex, which
+ * deletes the scratch pool afterwards. Push nothing when the resolution
+ * fails, leaving the cause in the context. */
+static int resolve_operation(lua_State *L)
+{
+    resolve_ctx_t *ctx =
+        (resolve_ctx_t *)lua_touserdata(L, lua_upvalueindex(1));
+    selector_candidates_t cands = {0};
+    size_t i                    = 0;
+
+    ctx->rc = selector_exec_resolve(ctx->pool, ctx->ir->index, ctx->selector,
+                                    &cands, &ctx->ancestor);
+    if (ctx->rc != 0) {
+        ctx->rc = errno;
+        return 0;
+    }
+    lua_createtable(L, (int)cands.count, 0);
+    for (i = 0; i < cands.count; i++) {
+        lua_createtable(L, 0, 2);
+        lua_pushinteger(L,
+                        (lua_Integer)cands.items[i].element->structure.order);
+        lua_setfield(L, -2, "order");
+        push_pseudos(L, selector_exec_rightmost(cands.items[i].complex));
+        lua_setfield(L, -2, "positional");
+        lua_rawseti(L, -2, (int)i + 1);
+    }
+    return 1;
+}
+
+static void resolve_cleanup(lua_State *L, void *ctx)
+{
+    pool_delete(L, ((resolve_ctx_t *)ctx)->pool);
+}
+
+/* Return nil and a selector error with the message at message_idx, whose
+ * meta holds the selector source and, when reason is not NULL, the reason and
+ * the feature of an unsupported selector. */
+static int return_resolve_error(lua_State *L, const selector_t *selector,
+                                int message_idx, const char *reason,
+                                const char *feature)
+{
+    lua_createtable(L, 0, 3);
+    push_string(L, &selector->source);
+    lua_setfield(L, -2, "source");
+    if (reason != NULL) {
+        lua_pushstring(L, reason);
+        lua_setfield(L, -2, "reason");
+        lua_pushstring(L, feature);
+        lua_setfield(L, -2, "feature");
+    }
+    push_error(L, RESOLVE_OPERATION, message_idx);
+    lua_pushnil(L);
+    lua_insert(L, -2);
+    return 2;
+}
+
+/* Reference interface: the static candidates of a selector in a compiled
+ * template, in document order, shaped like the result of the JavaScript
+ * resolveSelector. Each candidate gives the 0-based document order of the
+ * element and the positional conditions to confirm at render time. */
+static int resolve_lua(lua_State *L)
+{
+    resolve_ctx_t ctx = {0};
+    int status        = LUA_OK;
+
+    ctx.ir       = ir_check(L, 1);
+    ctx.selector = selector_check(L, 2);
+    lua_settop(L, 2);
+    ctx.pool = pool_new(L, 0);
+    if (ctx.pool == NULL) {
+        lua_pushliteral(L, RESOLVE_OOM_MESSAGE);
+        return return_resolve_error(L, ctx.selector, lua_gettop(L), NULL, NULL);
+    }
+    status = reflow_pcall_ex(L, resolve_operation, &ctx, 0, 1, resolve_cleanup);
+    if (status == LUA_OK && ctx.rc == 0) {
+        return 1;
+    } else if (status != LUA_OK && status != LUA_ERRMEM) {
+        return lua_error(L);
+    }
+    lua_settop(L, 2);
+    if (status == LUA_OK && ctx.rc == EINVAL) {
+        const char *name = PSEUDO_NAMES[ctx.ancestor->kind];
+
+        lua_pushfstring(L,
+                        "positional pseudo-class \":%s\" is only supported on "
+                        "the rightmost compound selector",
+                        name);
+        lua_pushfstring(L, "pseudo-ancestor:%s", name);
+        return return_resolve_error(L, ctx.selector, 3, "unsupported",
+                                    lua_tostring(L, -1));
+    }
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_pushliteral(L, RESOLVE_OOM_MESSAGE);
+    return return_resolve_error(L, ctx.selector, lua_gettop(L), NULL, NULL);
+}
+
 LUALIB_API int luaopen_reflow_selector(lua_State *L)
 {
     struct luaL_Reg funcs[] = {
         {"compile",     compile_lua    },
         {"is_compiled", is_compiled_lua},
         {"source",      source_lua     },
+        {"resolve",     resolve_lua    },
         {NULL,          NULL           },
     };
 
