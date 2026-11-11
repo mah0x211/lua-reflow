@@ -25,6 +25,7 @@ local huge = math.huge
 local format = string.format
 local ipairs = ipairs
 local pairs = pairs
+local remove = table.remove
 local setmetatable = setmetatable
 local tostring = tostring
 local type = type
@@ -108,6 +109,29 @@ function Engine:render(name, data, sel)
     end
     return interpret.render(name, ir, data, self._helpers, self._templates,
                             self._max_include_depth, sel)
+end
+
+--- remove the template name, or every template when name is nil.
+--- @param name string?
+--- @return string[] removed names
+function Engine:clear(name)
+    local order = self._order
+    if name == nil then
+        self._templates = {}
+        self._order = {}
+        return order
+    end
+
+    for i = 1, #order do
+        if order[i] == name then
+            remove(order, i)
+            self._templates[name] = nil
+            return {
+                name,
+            }
+        end
+    end
+    return {}
 end
 
 --- @return string[] names registered names in registration order

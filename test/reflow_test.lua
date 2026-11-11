@@ -425,3 +425,76 @@ function testcase.templates_lists_names_in_registration_order()
     })
     assert.equal(new_engine():templates(), {})
 end
+
+-- engine:clear, porting test/unit/reflow-api.test.js of the JavaScript
+-- version
+
+function testcase.clear_removes_templates()
+    local engine = engine_with({
+        {
+            'a',
+            '<p>A</p>',
+        },
+        {
+            'b',
+            '<p>B</p>',
+        },
+    })
+    assert.equal(engine:clear('a'), {
+        'a',
+    })
+    assert.equal(engine:templates(), {
+        'b',
+    })
+    assert.equal(engine:clear('nope'), {})
+    assert.equal(engine:clear(42), {})
+    assert.equal(engine:templates(), {
+        'b',
+    })
+    assert(engine:compile('c', '<p>C</p>'))
+    assert.equal(engine:clear(), {
+        'b',
+        'c',
+    })
+    assert.equal(engine:templates(), {})
+    assert.equal(engine:clear(), {})
+end
+
+function testcase.recompile_after_clear_is_allowed()
+    local engine = engine_with({
+        {
+            't',
+            '<p>v1</p>',
+        },
+    })
+    engine:clear('t')
+    assert(engine:compile('t', '<p>v2</p>'))
+    assert.equal(engine:render('t'), '<p>v2</p>')
+end
+
+function testcase.cleared_templates_are_collectable()
+    local refs = setmetatable({}, {
+        __mode = 'v',
+    })
+    local engine = engine_with({
+        {
+            'a',
+            '<p></p>',
+        },
+        {
+            'b',
+            '<p></p>',
+        },
+    })
+    refs[1] = engine._templates.a
+    refs[2] = engine._templates.b
+    engine:clear('a')
+    collectgarbage('collect')
+    collectgarbage('collect')
+    assert.is_nil(refs[1])
+    assert.not_nil(refs[2])
+    engine:clear()
+    collectgarbage('collect')
+    collectgarbage('collect')
+    assert.is_nil(refs[2])
+end
