@@ -498,3 +498,20 @@ function testcase.cleared_templates_are_collectable()
     collectgarbage('collect')
     assert.is_nil(refs[2])
 end
+
+-- reflow.compile_selector
+
+function testcase.compile_selector_returns_a_compiled_selector()
+    local engine = engine_with({
+        {
+            't',
+            '<div><p id="a">1</p></div>',
+        },
+    })
+    local sel = assert(reflow.compile_selector('#a'))
+    assert.is_true(selector.is_compiled(sel))
+    assert.equal(engine:render('t', {}, sel), '<p id="a">1</p>')
+    local _, err = reflow.compile_selector('??')
+    assert.rawequal(errorlib.typeof(err), reflow_error.ESELECTOR)
+    assert.equal(err.op, 'reflow.selector.compile')
+end

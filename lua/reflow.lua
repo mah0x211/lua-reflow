@@ -32,6 +32,7 @@ local type = type
 local errors = require('reflow.error')
 local compile = require('reflow.compile')
 local interpret = require('reflow.interpret')
+local selector = require('reflow.selector')
 local selector_cache = require('reflow.selector_cache')
 
 local DEFAULT_PREFIX = 'x-'
@@ -213,6 +214,15 @@ local function new(config)
     }, Engine)
 end
 
+--- compile a selector without caching it.
+--- @param source string
+--- @return userdata? sel reflow.selector
+--- @return any err
+local function compile_selector(source)
+    return selector.compile(source)
+end
+
 return {
     new = new,
+    compile_selector = compile_selector,
 }
