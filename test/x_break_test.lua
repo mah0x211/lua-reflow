@@ -132,7 +132,7 @@ function testcase.x_break_outside_a_loop_is_rejected_at_the_marker()
     assert.equal(err.message.message, OUTSIDE)
     assert.equal(err.meta.line, 3)
     assert.equal(err.meta.column, 3)
-    assert.equal(err.meta.element, '<p>')
+    assert.equal(err.meta.element, '<p class="a">')
     assert.is_nil(err.meta.attribute)
 end
 

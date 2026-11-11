@@ -1679,10 +1679,7 @@ static void push_error_meta(lua_State *L, const error_site_t *site)
         reflow_snippet_push(L, site->ir->html.data, site->ir->html.len,
                             element->source_start, element->source_end, 2);
         lua_setfield(L, -2, "snippet");
-        lua_pushliteral(L, "<");
-        lua_pushlstring(L, element->tag_name.data, element->tag_name.len);
-        lua_pushliteral(L, ">");
-        lua_concat(L, 3);
+        reflow_open_tag_push(L, element);
         lua_setfield(L, -2, "element");
     }
     if (site->expression != NULL) {

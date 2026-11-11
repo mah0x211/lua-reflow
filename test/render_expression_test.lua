@@ -1306,7 +1306,7 @@ function testcase.render_reports_runtime_errors_with_their_site()
     })
     assert.equal(err.meta.line, 2)
     assert.equal(err.meta.column, 3)
-    assert.equal(err.meta.element, '<p>')
+    assert.equal(err.meta.element, '<p class="x">')
     assert.equal(err.meta.expression, {
         source = '$.user.name',
     })
