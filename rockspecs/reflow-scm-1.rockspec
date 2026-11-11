@@ -38,6 +38,7 @@ build = {
     modules = {
         reflow = "lua/reflow.lua",
         ["reflow.error"] = "lua/error.lua",
+        ["reflow.selector_cache"] = "lua/selector_cache.lua",
         ["reflow.pool"] = {
             sources = {
                 "src/pool.c",
