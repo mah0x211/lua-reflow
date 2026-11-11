@@ -527,3 +527,83 @@ function testcase.error_types_are_exported()
     local _, err = new_engine():render('missing')
     assert.rawequal(errorlib.is(err, reflow.ReflowRuntimeError), err)
 end
+
+-- engine:compile_file, porting test/unit/reflow-api.test.js of the
+-- JavaScript version
+
+function testcase.compile_file_requires_a_loader()
+    local ok, err = new_engine():compile_file('t', '/some/path')
+    assert.is_nil(ok)
+    assert.rawequal(errorlib.typeof(err), reflow_error.EREFLOW)
+    assert.equal(err.op, 'reflow.engine.compile_file')
+    assert.equal(err.message.message, 'compile_file: loader is required; ' ..
+                     'provide config.loader in reflow.new')
+end
+
+function testcase.compile_file_uses_the_loader()
+    local engine = new_engine({
+        loader = function(path)
+            return '<p>path=' .. path .. '</p>'
+        end,
+    })
+    assert.is_true(engine:compile_file('t', 'x/y'))
+    assert.equal(engine:render('t'), '<p>path=x/y</p>')
+    -- the name is registered once, as with compile
+    local ok, err = engine:compile_file('t', 'x/y')
+    assert.is_nil(ok)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
+end
+
+function testcase.compile_file_keeps_loader_errors()
+    local raised = errorlib.new('cannot read')
+    local returned = {}
+    for _, case in ipairs({
+        {
+            function()
+                error(raised)
+            end,
+            raised,
+        },
+        {
+            function()
+                error('plain', 0)
+            end,
+            'plain',
+        },
+        {
+            function()
+                return nil, returned
+            end,
+            returned,
+        },
+    }) do
+        local ok, err = new_engine({
+            loader = case[1],
+        }):compile_file('t', 'p')
+        assert.is_nil(ok)
+        assert.rawequal(err, case[2])
+    end
+end
+
+function testcase.compile_file_rejects_a_result_that_is_not_html()
+    for _, loader in ipairs({
+        function()
+        end,
+        function()
+            return nil, nil
+        end,
+        function()
+            return 42
+        end,
+        function()
+            return false, 'err'
+        end,
+    }) do
+        local ok, err = new_engine({
+            loader = loader,
+        }):compile_file('t', 'p')
+        assert.is_nil(ok)
+        assert.rawequal(errorlib.typeof(err), reflow_error.EREFLOW)
+        assert.equal(err.message.message, 'loader must return an HTML string')
+    end
+end

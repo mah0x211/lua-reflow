@@ -25,6 +25,7 @@ local huge = math.huge
 local format = string.format
 local ipairs = ipairs
 local pairs = pairs
+local pcall = pcall
 local remove = table.remove
 local setmetatable = setmetatable
 local tostring = tostring
@@ -80,6 +81,31 @@ function Engine:compile(name, html)
     self._templates[name] = ir
     self._order[#self._order + 1] = name
     return true
+end
+
+--- load html with the loader of the engine and register the template under
+--- name. an error raised or returned by the loader is returned as is.
+--- @param name string
+--- @param path any
+--- @return boolean? ok
+--- @return any err
+function Engine:compile_file(name, path)
+    if not self._loader then
+        return nil, errors.new('reflow.engine.compile_file',
+                               'compile_file: loader is required; provide config.loader in reflow.new')
+    end
+
+    local ok, html, err = pcall(self._loader, path)
+    if not ok then
+        return nil, html
+    elseif type(html) ~= 'string' then
+        if html == nil and err ~= nil then
+            return nil, err
+        end
+        return nil, errors.new('reflow.engine.compile_file',
+                               'loader must return an HTML string')
+    end
+    return self:compile(name, html)
 end
 
 --- render the registered template name, or only the single element
