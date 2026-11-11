@@ -1,6 +1,7 @@
 require('luacov')
 local testcase = require('testcase')
 local assert = require('assert')
+local errorlib = require('error')
 local cjson = require('cjson')
 local reflow = require('reflow')
 
@@ -22,6 +23,12 @@ local function root()
     end
     error('test/fixtures not found')
 end
+local ERROR_TYPES = {
+    ReflowCompileError = reflow.ReflowCompileError,
+    ReflowRuntimeError = reflow.ReflowRuntimeError,
+    ReflowIncludeError = reflow.ReflowIncludeError,
+}
+
 local function read(path)
     local f = io.open(path, 'rb')
     if not f then
@@ -46,7 +53,7 @@ local function trim(s)
     return (s:gsub('\r\n', '\n'):gsub('^%s+', ''):gsub('%s+$', ''))
 end
 
--- Load the data and the Lua fixture of a fixture.
+-- Load the data, the expected error, and the Lua fixture of a fixture.
 local function load_fixture(dir)
     local fixture = {}
     local src = read(dir .. '/fixture.lua')
@@ -55,6 +62,8 @@ local function load_fixture(dir)
     end
     local data = read(dir .. '/data.json')
     fixture.data = data and cjson.decode(data) or {}
+    local expected_error = read(dir .. '/expected-error.json')
+    fixture.expected_error = expected_error and cjson.decode(expected_error)
     return fixture
 end
 
@@ -66,6 +75,32 @@ local function new_engine(fixture)
         fixture.setup(engine)
     end
     return engine
+end
+
+-- Translate a messagePattern, a JavaScript regular expression, into Lua
+-- patterns. Only '.*' and top-level '|' are used by the fixtures; any other
+-- metacharacter of JavaScript is rejected.
+local function to_lua_patterns(source)
+    local patterns = {}
+    for alternative in (source .. '|'):gmatch('([^|]*)|') do
+        local literal = alternative:gsub('%.%*', '')
+        assert(not literal:find('[%^%$%(%)%[%]%+%?%.\\{}*]'),
+               'unsupported messagePattern: ' .. source)
+        local pattern = alternative:gsub('%.%*', '\0'):gsub(
+                            '[%%%-%^%$%(%)%[%]%+%?%.%*]', '%%%0')
+                            :gsub('%z', '.-')
+        patterns[#patterns + 1] = pattern
+    end
+    return patterns
+end
+
+local function matches(message, source)
+    for _, pattern in ipairs(to_lua_patterns(source)) do
+        if message:find(pattern) then
+            return true
+        end
+    end
+    return false
 end
 
 function testcase.valid_fixtures_render_the_expected_output()
@@ -80,6 +115,48 @@ function testcase.valid_fixtures_render_the_expected_output()
         assert.not_nil(out, dir .. ': ' .. tostring(err))
         assert.equal(trim(out), trim(assert(read(dir .. '/expected.html'))), dir)
     end
+end
+
+function testcase.invalid_fixtures_fail_as_expected()
+    local names = list('invalid')
+    assert.equal(#names, 24)
+    for _, name in ipairs(names) do
+        local dir = root() .. 'invalid/' .. name
+        local fixture = load_fixture(dir)
+        local expected = assert(fixture.expected_error, dir)
+        local engine = new_engine(fixture)
+        local ok, err = engine:compile('main',
+                                       assert(read(dir .. '/template.html')))
+        if expected.phase == 'render' then
+            assert.is_true(ok, dir .. ': ' .. tostring(err))
+            ok, err = engine:render('main', fixture.data)
+        end
+        assert.is_nil(ok, dir)
+        local errt = assert(ERROR_TYPES[expected.class], dir)
+        assert.rawequal(errorlib.typeof(err), errt, dir .. ': ' .. tostring(err))
+        if expected.reason then
+            assert.equal(err.meta.reason, expected.reason, dir)
+        end
+        if expected.messagePattern then
+            assert.is_true(
+                matches(err.message.message, expected.messagePattern),
+                dir .. ': ' .. err.message.message)
+        end
+    end
+end
+
+function testcase.message_patterns_are_translated()
+    assert.is_true(matches('a structural and iteration',
+                           'structural.*iteration|iteration.*structural'))
+    assert.is_true(matches('iteration then structural',
+                           'structural.*iteration|iteration.*structural'))
+    assert.is_false(matches('structural only',
+                            'structural.*iteration|iteration.*structural'))
+    assert.is_true(matches('expected "=" here', 'expected "="'))
+    assert.is_true(matches('outside of x-for', 'of x-for'))
+    assert.is_false(matches('xxfor', 'x-for'))
+    assert.throws(to_lua_patterns, 'a.c')
+    assert.throws(to_lua_patterns, 'a+b')
 end
 
 function testcase.cjson_null_is_the_null_of_rendering()

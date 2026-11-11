@@ -1,0 +1,1 @@
+{ "phase": "compile", "class": "ReflowCompileError", "messagePattern": "x-case must not appear after x-nocase" }
