@@ -336,6 +336,40 @@ static int walk(build_t *build, ir_root_t *root)
     return 0;
 }
 
+static int is_loop(const ir_element_t *element)
+{
+    const ir_directives_t *directives = element->directives;
+
+    return directives != NULL &&
+           (directives->range != NULL || directives->each != NULL);
+}
+
+/* Set breaks_out from the leaves up: walking the elements in reverse
+ * document order visits every element after its descendants. A break stops
+ * the innermost enclosing loop, so the flag of an element that is not a loop
+ * passes to its structural parent, and the flag of a loop stays with it. */
+static void annotate_breaks(const ir_dom_index_t *index)
+{
+    size_t i = index->elements.count;
+
+    while (i > 0) {
+        ir_element_t *element =
+            (ir_element_t *)(uintptr_t)index->elements.items[--i];
+        const ir_directives_t *directives = element->directives;
+        ir_element_t *parent =
+            (ir_element_t *)(uintptr_t)element->structure.parent;
+
+        if (directives != NULL &&
+            (directives->has_break || directives->break_condition != NULL)) {
+            element->structure.breaks_out = 1;
+        }
+        if (parent != NULL && element->structure.breaks_out &&
+            !is_loop(element)) {
+            parent->structure.breaks_out = 1;
+        }
+    }
+}
+
 int dom_index_build(ir_t *ir)
 {
     build_t build = {0};
@@ -363,6 +397,7 @@ int dom_index_build(ir_t *ir)
     (void)pool_free(build.pool, build.frames);
     errno = errnum;
     if (status == 0) {
+        annotate_breaks(build.index);
         ir->index = build.index;
     }
     return status;

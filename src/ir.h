@@ -114,6 +114,10 @@ typedef struct ir_structure_t {
     ir_branch_kind_t branch_kind;
     const struct ir_chain_t *chain; /* set for IR_BRANCH_CHAIN */
     size_t branch_index;            /* 0-based, unless IR_BRANCH_NONE */
+    /* Set when an x-break or x-break-if in the subtree of an element stops
+     * the element's own loop, for an x-for or x-each element, or a loop of
+     * an ancestor otherwise. */
+    int breaks_out;
 } ir_structure_t;
 
 typedef struct ir_element_t {

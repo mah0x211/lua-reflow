@@ -69,6 +69,18 @@ typedef enum selector_pseudo_kind_t {
     SELECTOR_PSEUDO_NTH_LAST_OF_TYPE
 } selector_pseudo_kind_t;
 
+/* Return the name of a positional pseudo-class, as written in a selector. */
+static inline const char *selector_pseudo_name(selector_pseudo_kind_t kind)
+{
+    static const char *const names[] = {
+        "first-child",  "last-child",       "only-child", "first-of-type",
+        "last-of-type", "only-of-type",     "nth-child",  "nth-last-child",
+        "nth-of-type",  "nth-last-of-type",
+    };
+
+    return names[kind];
+}
+
 /* A positional pseudo-class. n is the positive integer argument of the
  * nth-* kinds and 0 for the others. */
 typedef struct selector_pseudo_t {

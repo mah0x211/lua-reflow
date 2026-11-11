@@ -35,6 +35,8 @@ typedef struct render_output_t {
     char *data;
     size_t len;
     size_t capacity;
+    /* While set, writes succeed without changing the buffer. */
+    int discard;
 } render_output_t;
 
 /**
