@@ -527,3 +527,187 @@ function testcase.error_types_are_exported()
     local _, err = new_engine():render('missing')
     assert.rawequal(errorlib.is(err, reflow.ReflowRuntimeError), err)
 end
+
+-- engine:compile_file, porting test/unit/reflow-api.test.js of the
+-- JavaScript version
+
+function testcase.compile_file_requires_a_loader()
+    local ok, err = new_engine():compile_file('t', '/some/path')
+    assert.is_nil(ok)
+    assert.rawequal(errorlib.typeof(err), reflow_error.EREFLOW)
+    assert.equal(err.op, 'reflow.engine.compile_file')
+    assert.equal(err.message.message, 'compile_file: loader is required; ' ..
+                     'provide config.loader in reflow.new')
+end
+
+function testcase.compile_file_uses_the_loader()
+    local engine = new_engine({
+        loader = function(path)
+            return '<p>path=' .. path .. '</p>'
+        end,
+    })
+    assert.is_true(engine:compile_file('t', 'x/y'))
+    assert.equal(engine:render('t'), '<p>path=x/y</p>')
+    -- the name is registered once, as with compile
+    local ok, err = engine:compile_file('t', 'x/y')
+    assert.is_nil(ok)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
+end
+
+function testcase.compile_file_keeps_loader_errors()
+    local raised = errorlib.new('cannot read')
+    local returned = {}
+    for _, case in ipairs({
+        {
+            function()
+                error(raised)
+            end,
+            raised,
+        },
+        {
+            function()
+                error('plain', 0)
+            end,
+            'plain',
+        },
+        {
+            function()
+                return nil, returned
+            end,
+            returned,
+        },
+    }) do
+        local ok, err = new_engine({
+            loader = case[1],
+        }):compile_file('t', 'p')
+        assert.is_nil(ok)
+        assert.rawequal(err, case[2])
+    end
+end
+
+function testcase.compile_file_rejects_a_result_that_is_not_html()
+    for _, loader in ipairs({
+        function()
+        end,
+        function()
+            return nil, nil
+        end,
+        function()
+            return 42
+        end,
+        function()
+            return false, 'err'
+        end,
+    }) do
+        local ok, err = new_engine({
+            loader = loader,
+        }):compile_file('t', 'p')
+        assert.is_nil(ok)
+        assert.rawequal(errorlib.typeof(err), reflow_error.EREFLOW)
+        assert.equal(err.message.message, 'loader must return an HTML string')
+    end
+end
+
+-- reflow.render, porting test/unit/reflow-api.test.js and
+-- test/reflow.selector.test.js of the JavaScript version
+
+function testcase.render_once()
+    assert.equal(reflow.render('<p x-text="$.x"></p>', {
+        x = 'hello',
+    }), '<p>hello</p>')
+    assert.equal(reflow.render('<p>plain</p>'), '<p>plain</p>')
+end
+
+function testcase.render_once_with_a_selector()
+    local html = '<div><span id="x">yo</span><span>other</span></div>'
+    assert.equal(reflow.render(html, {}, {
+        selector = '#x',
+    }), '<span id="x">yo</span>')
+    local sel = assert(reflow.compile_selector('#x'))
+    assert.equal(reflow.render(html, {}, {
+        selector = sel,
+    }), '<span id="x">yo</span>')
+end
+
+function testcase.render_once_uses_the_settings()
+    assert.equal(reflow.render('<p v-text="up($.x)"></p>', {
+        x = 'a',
+    }, {
+        prefix = 'v-',
+        helpers = {
+            up = function(s)
+                return s:upper()
+            end,
+        },
+    }), '<p>A</p>')
+end
+
+function testcase.render_once_keeps_no_state()
+    -- every call compiles under the same temporary name
+    assert.equal(reflow.render('<p>1</p>'), '<p>1</p>')
+    assert.equal(reflow.render('<p>2</p>'), '<p>2</p>')
+end
+
+function testcase.render_once_returns_errors_as_is()
+    local out, err = reflow.render('<p></p>', nil, 'config')
+    assert.is_nil(out)
+    assert.equal(err.op, 'reflow.new')
+    out, err = reflow.render(42)
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
+    assert.equal(err.message.message, 'html must be a string')
+    out, err = reflow.render('<p x-text=".a.b"></p>')
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
+    out, err = reflow.render('<p></p>', nil, {
+        selector = '#none',
+    })
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ESELECTOR)
+    assert.equal(err.meta.template_name, '<inline>')
+end
+
+-- reflow.render_file, porting test/reflow.selector.test.js of the
+-- JavaScript version
+
+function testcase.render_file_once()
+    local loader = function(path)
+        assert.equal(path, 'virtual/path')
+        return '<div><span id="x" x-text="$.v"></span></div>'
+    end
+    assert.equal(reflow.render_file('virtual/path', {
+        v = 'yo',
+    }, {
+        loader = loader,
+    }), '<div><span id="x">yo</span></div>')
+    assert.equal(reflow.render_file('virtual/path', {
+        v = 'yo',
+    }, {
+        loader = loader,
+        selector = '#x',
+    }), '<span id="x">yo</span>')
+end
+
+function testcase.render_file_returns_errors_as_is()
+    local out, err = reflow.render_file('p', nil, 'config')
+    assert.is_nil(out)
+    assert.equal(err.op, 'reflow.new')
+    out, err = reflow.render_file('p')
+    assert.is_nil(out)
+    assert.equal(err.op, 'reflow.engine.compile_file')
+    local raised = {}
+    out, err = reflow.render_file('p', nil, {
+        loader = function()
+            error(raised)
+        end,
+    })
+    assert.is_nil(out)
+    assert.rawequal(err, raised)
+    out, err = reflow.render_file('p', nil, {
+        loader = function()
+            return '<p x-text=".a.b"></p>'
+        end,
+    })
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
+end

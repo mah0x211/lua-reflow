@@ -25,6 +25,7 @@ local huge = math.huge
 local format = string.format
 local ipairs = ipairs
 local pairs = pairs
+local pcall = pcall
 local remove = table.remove
 local setmetatable = setmetatable
 local tostring = tostring
@@ -37,6 +38,7 @@ local selector_cache = require('reflow.selector_cache')
 
 local DEFAULT_PREFIX = 'x-'
 local DEFAULT_MAX_INCLUDE_DEPTH = 50
+local INLINE_NAME = '<inline>'
 
 --- @param v any
 --- @return boolean
@@ -80,6 +82,31 @@ function Engine:compile(name, html)
     self._templates[name] = ir
     self._order[#self._order + 1] = name
     return true
+end
+
+--- load html with the loader of the engine and register the template under
+--- name. an error raised or returned by the loader is returned as is.
+--- @param name string
+--- @param path any
+--- @return boolean? ok
+--- @return any err
+function Engine:compile_file(name, path)
+    if not self._loader then
+        return nil, errors.new('reflow.engine.compile_file',
+                               'compile_file: loader is required; provide config.loader in reflow.new')
+    end
+
+    local ok, html, err = pcall(self._loader, path)
+    if not ok then
+        return nil, html
+    elseif type(html) ~= 'string' then
+        if html == nil and err ~= nil then
+            return nil, err
+        end
+        return nil, errors.new('reflow.engine.compile_file',
+                               'loader must return an HTML string')
+    end
+    return self:compile(name, html)
 end
 
 --- render the registered template name, or only the single element
@@ -214,6 +241,49 @@ local function new(config)
     }, Engine)
 end
 
+--- compile html and render it once with an engine that is not kept.
+--- config takes the settings of reflow.new and the selector to render.
+--- @param html string
+--- @param data table?
+--- @param config table?
+--- @return string? html
+--- @return any err
+local function render(html, data, config)
+    local engine, err = new(config)
+    if not engine then
+        return nil, err
+    end
+
+    local ok
+    ok, err = engine:compile(INLINE_NAME, html)
+    if not ok then
+        return nil, err
+    end
+    return engine:render(INLINE_NAME, data, config and config.selector)
+end
+
+--- load html with config.loader and render it once with an engine that is
+--- not kept. config takes the settings of reflow.new and the selector to
+--- render.
+--- @param path any
+--- @param data table?
+--- @param config table?
+--- @return string? html
+--- @return any err
+local function render_file(path, data, config)
+    local engine, err = new(config)
+    if not engine then
+        return nil, err
+    end
+
+    local ok
+    ok, err = engine:compile_file(INLINE_NAME, path)
+    if not ok then
+        return nil, err
+    end
+    return engine:render(INLINE_NAME, data, config and config.selector)
+end
+
 --- compile a selector without caching it.
 --- @param source string
 --- @return userdata? sel reflow.selector
@@ -224,6 +294,8 @@ end
 
 return {
     new = new,
+    render = render,
+    render_file = render_file,
     compile_selector = compile_selector,
     ReflowError = errors.EREFLOW,
     ReflowCompileError = errors.ECOMPILE,
