@@ -27,6 +27,7 @@ local pairs = pairs
 local setmetatable = setmetatable
 local type = type
 local errors = require('reflow.error')
+local compile = require('reflow.compile')
 local selector_cache = require('reflow.selector_cache')
 
 local DEFAULT_PREFIX = 'x-'
@@ -50,6 +51,31 @@ end
 local Engine = {}
 Engine.__index = Engine
 Engine.__metatable = 'reflow.engine'
+
+--- compile html and register the template under name.
+--- @param name string
+--- @param html string
+--- @return boolean? ok
+--- @return any err
+function Engine:compile(name, html)
+    if type(name) == 'string' and name ~= '' and type(html) == 'string' and
+        self._templates[name] then
+        return nil, errors.new_compile('reflow.engine.compile',
+                                       format(
+                                           'template "%s" already exists; call clear("%s") before recompiling',
+                                           name, name), nil, {
+            template_name = name,
+        })
+    end
+
+    local ir, err = compile(name, html, self._prefix, self._helper_names)
+    if not ir then
+        return nil, err
+    end
+    self._templates[name] = ir
+    self._order[#self._order + 1] = name
+    return true
+end
 
 --- @param message string
 --- @return nil
