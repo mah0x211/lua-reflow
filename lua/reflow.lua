@@ -225,4 +225,9 @@ end
 return {
     new = new,
     compile_selector = compile_selector,
+    ReflowError = errors.EREFLOW,
+    ReflowCompileError = errors.ECOMPILE,
+    ReflowRuntimeError = errors.ERUNTIME,
+    ReflowIncludeError = errors.EINCLUDE,
+    ReflowSelectorError = errors.ESELECTOR,
 }

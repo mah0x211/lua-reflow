@@ -515,3 +515,15 @@ function testcase.compile_selector_returns_a_compiled_selector()
     assert.rawequal(errorlib.typeof(err), reflow_error.ESELECTOR)
     assert.equal(err.op, 'reflow.selector.compile')
 end
+
+-- error types
+
+function testcase.error_types_are_exported()
+    assert.rawequal(reflow.ReflowError, reflow_error.EREFLOW)
+    assert.rawequal(reflow.ReflowCompileError, reflow_error.ECOMPILE)
+    assert.rawequal(reflow.ReflowRuntimeError, reflow_error.ERUNTIME)
+    assert.rawequal(reflow.ReflowIncludeError, reflow_error.EINCLUDE)
+    assert.rawequal(reflow.ReflowSelectorError, reflow_error.ESELECTOR)
+    local _, err = new_engine():render('missing')
+    assert.rawequal(errorlib.is(err, reflow.ReflowRuntimeError), err)
+end
