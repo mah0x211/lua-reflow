@@ -58,19 +58,6 @@ typedef struct {
     size_t depth;
 } build_t;
 
-static size_t hash_bytes(const char *s, size_t len)
-{
-    /* FNV-1a */
-    uint64_t hash = UINT64_C(14695981039346656037);
-    size_t i      = 0;
-
-    for (i = 0; i < len; i++) {
-        hash ^= (unsigned char)s[i];
-        hash *= UINT64_C(1099511628211);
-    }
-    return (size_t)hash;
-}
-
 static int list_append(pool_t *pool, ir_element_list_t *list,
                        const ir_element_t *element)
 {
@@ -93,25 +80,6 @@ static int list_append(pool_t *pool, ir_element_list_t *list,
     }
     list->items[list->count++] = element;
     return 0;
-}
-
-static ir_index_entry_t *axis_lookup(const ir_index_axis_t *axis,
-                                     const char *key, size_t key_len,
-                                     size_t hash)
-{
-    ir_index_entry_t *entry = NULL;
-
-    if (axis->slot_count == 0) {
-        return NULL;
-    }
-    for (entry = axis->slots[hash & (axis->slot_count - 1)]; entry != NULL;
-         entry = entry->slot_next) {
-        if (entry->hash == hash && entry->key.len == key_len &&
-            (key_len == 0 || memcmp(entry->key.data, key, key_len) == 0)) {
-            return entry;
-        }
-    }
-    return NULL;
 }
 
 /* Keep at most one key per slot on average by doubling the slot array. */
@@ -148,8 +116,8 @@ static int axis_grow(pool_t *pool, ir_index_axis_t *axis)
 static int axis_add(pool_t *pool, ir_index_axis_t *axis, const char *key,
                     size_t key_len, const ir_element_t *element)
 {
-    size_t hash             = hash_bytes(key, key_len);
-    ir_index_entry_t *entry = axis_lookup(axis, key, key_len, hash);
+    size_t hash             = ir_index_hash(key, key_len);
+    ir_index_entry_t *entry = ir_index_entry(axis, key, key_len, hash);
 
     if (entry == NULL) {
         size_t slot = 0;

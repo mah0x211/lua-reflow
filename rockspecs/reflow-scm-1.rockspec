@@ -67,6 +67,7 @@ build = {
             sources = {
                 "src/selector_lua.c",
                 "src/selector_compile.c",
+                "src/selector_exec.c",
                 "src/pool.c",
                 "src/reflow_util.c",
             },

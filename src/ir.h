@@ -26,6 +26,8 @@
 #include <lauxlib.h>
 #include <lua.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <string.h>
 
 #define REFLOW_IR_MT "reflow.ir"
 
@@ -248,6 +250,51 @@ struct ir_dom_index_t {
     ir_element_list_t elements;
     ir_element_list_t includes;
 };
+
+/* The FNV-1a hash of a key of a DOM index axis. */
+static inline size_t ir_index_hash(const char *key, size_t len)
+{
+    uint64_t hash = UINT64_C(14695981039346656037);
+    size_t i      = 0;
+
+    for (i = 0; i < len; i++) {
+        hash ^= (unsigned char)key[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return (size_t)hash;
+}
+
+/* Return the entry of key on axis, whose hash is ir_index_hash(key, len), or
+ * NULL when the key is not indexed. */
+static inline ir_index_entry_t *ir_index_entry(const ir_index_axis_t *axis,
+                                               const char *key, size_t len,
+                                               size_t hash)
+{
+    ir_index_entry_t *entry = NULL;
+
+    if (axis->slot_count == 0) {
+        return NULL;
+    }
+    for (entry = axis->slots[hash & (axis->slot_count - 1)]; entry != NULL;
+         entry = entry->slot_next) {
+        if (entry->hash == hash && entry->key.len == len &&
+            (len == 0 || memcmp(entry->key.data, key, len) == 0)) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+/* Return the elements listed under key on axis in document order, or NULL
+ * when the key is not indexed. */
+static inline const ir_element_list_t *
+ir_index_find(const ir_index_axis_t *axis, const char *key, size_t len)
+{
+    const ir_index_entry_t *entry =
+        ir_index_entry(axis, key, len, ir_index_hash(key, len));
+
+    return entry != NULL ? &entry->elements : NULL;
+}
 
 struct ir_t {
     ir_root_t *root;
