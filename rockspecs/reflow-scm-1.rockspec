@@ -62,6 +62,17 @@ build = {
                 "src",
             },
         },
+        ["reflow.selector"] = {
+            sources = {
+                "src/selector_lua.c",
+                "src/selector_compile.c",
+                "src/pool.c",
+                "src/reflow_util.c",
+            },
+            incdirs = {
+                "src",
+            },
+        },
         ["reflow.compile"] = {
             sources = {
                 "src/compile.c",
