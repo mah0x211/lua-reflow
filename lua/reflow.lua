@@ -38,6 +38,7 @@ local selector_cache = require('reflow.selector_cache')
 
 local DEFAULT_PREFIX = 'x-'
 local DEFAULT_MAX_INCLUDE_DEPTH = 50
+local INLINE_NAME = '<inline>'
 
 --- @param v any
 --- @return boolean
@@ -240,6 +241,27 @@ local function new(config)
     }, Engine)
 end
 
+--- compile html and render it once with an engine that is not kept.
+--- config takes the settings of reflow.new and the selector to render.
+--- @param html string
+--- @param data table?
+--- @param config table?
+--- @return string? html
+--- @return any err
+local function render(html, data, config)
+    local engine, err = new(config)
+    if not engine then
+        return nil, err
+    end
+
+    local ok
+    ok, err = engine:compile(INLINE_NAME, html)
+    if not ok then
+        return nil, err
+    end
+    return engine:render(INLINE_NAME, data, config and config.selector)
+end
+
 --- compile a selector without caching it.
 --- @param source string
 --- @return userdata? sel reflow.selector
@@ -250,6 +272,7 @@ end
 
 return {
     new = new,
+    render = render,
     compile_selector = compile_selector,
     ReflowError = errors.EREFLOW,
     ReflowCompileError = errors.ECOMPILE,

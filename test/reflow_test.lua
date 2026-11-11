@@ -607,3 +607,62 @@ function testcase.compile_file_rejects_a_result_that_is_not_html()
         assert.equal(err.message.message, 'loader must return an HTML string')
     end
 end
+
+-- reflow.render, porting test/unit/reflow-api.test.js and
+-- test/reflow.selector.test.js of the JavaScript version
+
+function testcase.render_once()
+    assert.equal(reflow.render('<p x-text="$.x"></p>', {
+        x = 'hello',
+    }), '<p>hello</p>')
+    assert.equal(reflow.render('<p>plain</p>'), '<p>plain</p>')
+end
+
+function testcase.render_once_with_a_selector()
+    local html = '<div><span id="x">yo</span><span>other</span></div>'
+    assert.equal(reflow.render(html, {}, {
+        selector = '#x',
+    }), '<span id="x">yo</span>')
+    local sel = assert(reflow.compile_selector('#x'))
+    assert.equal(reflow.render(html, {}, {
+        selector = sel,
+    }), '<span id="x">yo</span>')
+end
+
+function testcase.render_once_uses_the_settings()
+    assert.equal(reflow.render('<p v-text="up($.x)"></p>', {
+        x = 'a',
+    }, {
+        prefix = 'v-',
+        helpers = {
+            up = function(s)
+                return s:upper()
+            end,
+        },
+    }), '<p>A</p>')
+end
+
+function testcase.render_once_keeps_no_state()
+    -- every call compiles under the same temporary name
+    assert.equal(reflow.render('<p>1</p>'), '<p>1</p>')
+    assert.equal(reflow.render('<p>2</p>'), '<p>2</p>')
+end
+
+function testcase.render_once_returns_errors_as_is()
+    local out, err = reflow.render('<p></p>', nil, 'config')
+    assert.is_nil(out)
+    assert.equal(err.op, 'reflow.new')
+    out, err = reflow.render(42)
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
+    assert.equal(err.message.message, 'html must be a string')
+    out, err = reflow.render('<p x-text=".a.b"></p>')
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
+    out, err = reflow.render('<p></p>', nil, {
+        selector = '#none',
+    })
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ESELECTOR)
+    assert.equal(err.meta.template_name, '<inline>')
+end
