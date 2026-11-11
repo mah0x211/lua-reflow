@@ -25,9 +25,11 @@ local huge = math.huge
 local format = string.format
 local pairs = pairs
 local setmetatable = setmetatable
+local tostring = tostring
 local type = type
 local errors = require('reflow.error')
 local compile = require('reflow.compile')
+local interpret = require('reflow.interpret')
 local selector_cache = require('reflow.selector_cache')
 
 local DEFAULT_PREFIX = 'x-'
@@ -75,6 +77,36 @@ function Engine:compile(name, html)
     self._templates[name] = ir
     self._order[#self._order + 1] = name
     return true
+end
+
+--- render the registered template name, or only the single element
+--- matched by selector.
+--- @param name string
+--- @param data table?
+--- @param sel any selector string or compiled selector
+--- @return string? html
+--- @return any err
+function Engine:render(name, data, sel)
+    local ir = self._templates[name]
+    if not ir then
+        return nil, errors.new_runtime('reflow.engine.render', format(
+                                           'template not found: "%s"',
+                                           tostring(name)), nil, {
+            template_name = name,
+            reason = 'not_found',
+            requested = name,
+        })
+    end
+
+    if sel ~= nil then
+        local err
+        sel, err = self._selector_cache:resolve(sel)
+        if not sel then
+            return nil, err
+        end
+    end
+    return interpret.render(name, ir, data, self._helpers, self._templates,
+                            self._max_include_depth, sel)
 end
 
 --- @param message string

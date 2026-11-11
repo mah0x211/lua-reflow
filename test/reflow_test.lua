@@ -3,6 +3,7 @@ local testcase = require('testcase')
 local assert = require('assert')
 local errorlib = require('error')
 local reflow_error = require('reflow.error')
+local selector = require('reflow.selector')
 local reflow = require('reflow')
 
 local function new_engine(config)
@@ -155,4 +156,245 @@ function testcase.compile_errors_are_returned_as_is()
     assert.is_nil(ok)
     assert.equal(err.message.message, 'html must be a string')
     assert.is_nil(next(engine._templates))
+end
+
+-- engine:render, porting test/unit/reflow-api.test.js and
+-- test/reflow.selector.test.js of the JavaScript version except the file
+-- loading and one-shot rendering
+
+function testcase.render_of_an_unregistered_template_is_a_runtime_error()
+    local engine = new_engine()
+    for _, name in ipairs({
+        'missing',
+        42,
+    }) do
+        local out, err = engine:render(name)
+        assert.is_nil(out)
+        assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
+        assert.equal(err.op, 'reflow.engine.render')
+        assert.equal(err.message.message,
+                     'template not found: "' .. tostring(name) .. '"')
+        assert.equal(err.meta, {
+            template_name = name,
+            reason = 'not_found',
+            requested = name,
+        })
+    end
+end
+
+function testcase.helpers_are_available()
+    local engine = engine_with({
+        {
+            't',
+            '<p x-text="upper($.n)"></p>',
+        },
+    }, {
+        helpers = {
+            upper = function(s)
+                return tostring(s):upper()
+            end,
+        },
+    })
+    assert.equal(engine:render('t', {
+        n = 'alice',
+    }), '<p>ALICE</p>')
+end
+
+function testcase.render_with_a_selector_returns_the_fragment()
+    local engine = engine_with({
+        {
+            't',
+            '<div><header id="h"><h1>Hi</h1></header><main>x</main></div>',
+        },
+    })
+    assert.equal(engine:render('t', {}, '#h'),
+                 '<header id="h"><h1>Hi</h1></header>')
+    -- without a selector the whole template is rendered
+    assert.equal(engine:render('t', {}),
+                 '<div><header id="h"><h1>Hi</h1></header><main>x</main></div>')
+end
+
+function testcase.compiled_selector_bypasses_the_cache()
+    local engine = engine_with({
+        {
+            't',
+            '<div><p id="a">1</p></div>',
+        },
+    })
+    local sel = assert(selector.compile('#a'))
+    assert.equal(engine:render('t', {}, sel), '<p id="a">1</p>')
+    assert.equal(engine:render('t', {}, sel), '<p id="a">1</p>')
+    assert.equal(engine._selector_cache:size(), 0)
+end
+
+function testcase.string_selector_populates_the_cache()
+    local engine = engine_with({
+        {
+            't',
+            '<div><p id="a">1</p></div>',
+        },
+    }, {
+        selector_cache_size = 4,
+    })
+    assert.equal(engine:render('t', {}, '#a'), '<p id="a">1</p>')
+    assert.equal(engine._selector_cache:size(), 1)
+    local cached = engine._selector_cache:peek('#a')
+    assert.equal(engine:render('t', {}, '#a'), '<p id="a">1</p>')
+    assert.equal(engine._selector_cache:size(), 1)
+    assert.rawequal(engine._selector_cache:peek('#a'), cached)
+end
+
+function testcase.selector_cache_size_zero_disables_caching()
+    local engine = engine_with({
+        {
+            't',
+            '<div><p id="a">1</p></div>',
+        },
+    }, {
+        selector_cache_size = 0,
+    })
+    assert.equal(engine:render('t', {}, '#a'), '<p id="a">1</p>')
+    assert.equal(engine._selector_cache:size(), 0)
+end
+
+function testcase.selector_errors_surface_from_render()
+    local engine = engine_with({
+        {
+            't',
+            '<div><p class="a">1</p><p class="a">2</p></div>',
+        },
+    })
+    local out, err = engine:render('t', {}, '#missing')
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ESELECTOR)
+    assert.equal(err.meta.reason, 'no_match')
+    out, err = engine:render('t', {}, '.a')
+    assert.is_nil(out)
+    assert.equal(err.meta.reason, 'multiple_matches')
+    out, err = engine:render('t', {}, '??')
+    assert.is_nil(out)
+    assert.equal(err.meta.reason, 'syntax')
+    -- a selector that is neither a string nor a compiled one
+    out, err = engine:render('t', {}, 42)
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ESELECTOR)
+end
+
+function testcase.template_not_found_comes_first_with_a_selector()
+    local engine = new_engine()
+    local out, err = engine:render('missing', {}, '#x')
+    assert.is_nil(out)
+    assert.equal(err.meta.reason, 'not_found')
+end
+
+function testcase.include_searches_the_registered_templates()
+    local engine = engine_with({
+        {
+            'layout',
+            '<div><main x-include="$.body"></main></div>',
+        },
+        {
+            'page',
+            '<section><p id="t">hello</p></section>',
+        },
+    })
+    assert.equal(engine:render('layout', {
+        body = 'page',
+    }), '<div><main><section><p id="t">hello</p></section></main></div>')
+    assert.equal(engine:render('layout', {
+        body = 'page',
+    }, '#t'), '<p id="t">hello</p>')
+end
+
+function testcase.prefix_retargets_directives()
+    local engine = engine_with({
+        {
+            't',
+            '<p data-text="$.v" x-text="$.w"></p>',
+        },
+    }, {
+        prefix = 'data-',
+    })
+    assert.equal(engine:render('t', {
+        v = 'V',
+    }), '<p x-text="$.w">V</p>')
+end
+
+function testcase.max_include_depth_is_applied()
+    local engine = engine_with({
+        {
+            'a',
+            '<div x-include="\'b\'"></div>',
+        },
+        {
+            'b',
+            '<p>b</p>',
+        },
+    }, {
+        max_include_depth = 1,
+    })
+    local out, err = engine:render('a')
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.EINCLUDE)
+    assert.equal(err.meta.reason, 'depth_exceeded')
+end
+
+function testcase.helpers_are_copied_when_created()
+    local helpers = {
+        f = function()
+            return 'one'
+        end,
+    }
+    local engine = engine_with({
+        {
+            't',
+            '<p x-text="f()"></p>',
+        },
+    }, {
+        helpers = helpers,
+    })
+    helpers.f = function()
+        return 'two'
+    end
+    helpers.g = function()
+        return 'three'
+    end
+    assert.equal(engine:render('t'), '<p>one</p>')
+    -- a helper added later is not registered
+    local ok, err = engine:compile('u', '<p x-text="g()"></p>')
+    assert.is_nil(ok)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ECOMPILE)
+end
+
+function testcase.render_errors_are_returned_as_is()
+    local engine = engine_with({
+        {
+            't',
+            '<p x-text=".a.b"></p>',
+        },
+    })
+    local out, err = engine:render('t', {})
+    assert.is_nil(out)
+    assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
+    out, err = engine:render('t', 'data')
+    assert.is_nil(out)
+    assert.equal(err.message.message, 'data must be a table or nil')
+
+    -- an error value raised by a helper is kept as the cause
+    local raised = errorlib.new('boom')
+    engine = engine_with({
+        {
+            't',
+            '<p x-text="boom()"></p>',
+        },
+    }, {
+        helpers = {
+            boom = function()
+                error(raised)
+            end,
+        },
+    })
+    out, err = engine:render('t')
+    assert.is_nil(out)
+    assert.rawequal(errorlib.unwrap(err), raised)
 end
