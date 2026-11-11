@@ -56,7 +56,7 @@ static int reserve(render_output_t *out, size_t len)
 
 int render_output_write(render_output_t *out, const char *s, size_t len)
 {
-    if (len == 0) {
+    if (len == 0 || out->discard) {
         return 0;
     } else if (reserve(out, len) != 0) {
         return -1;

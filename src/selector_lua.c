@@ -273,12 +273,6 @@ static void set_string(lua_State *L, const char *key,
     }
 }
 
-static const char *const PSEUDO_NAMES[] = {
-    "first-child",  "last-child",       "only-child", "first-of-type",
-    "last-of-type", "only-of-type",     "nth-child",  "nth-last-child",
-    "nth-of-type",  "nth-last-of-type",
-};
-
 /* Push the positional conditions of c as { {name = ..., n = ...}, ... }. */
 static void push_pseudos(lua_State *L, const selector_compound_t *c)
 {
@@ -290,7 +284,7 @@ static void push_pseudos(lua_State *L, const selector_compound_t *c)
         const selector_pseudo_t *pseudo = &c->pseudos[i];
 
         lua_createtable(L, 0, 2);
-        lua_pushstring(L, PSEUDO_NAMES[pseudo->kind]);
+        lua_pushstring(L, selector_pseudo_name(pseudo->kind));
         lua_setfield(L, -2, "name");
         if (pseudo->kind >= SELECTOR_PSEUDO_NTH_CHILD) {
             /* A Lua integer when the argument is one, as JavaScript has a
@@ -469,7 +463,7 @@ static int resolve_lua(lua_State *L)
     }
     lua_settop(L, 2);
     if (status == LUA_OK && ctx.rc == EINVAL) {
-        const char *name = PSEUDO_NAMES[ctx.ancestor->kind];
+        const char *name = selector_pseudo_name(ctx.ancestor->kind);
 
         lua_pushfstring(L,
                         "positional pseudo-class \":%s\" is only supported on "
