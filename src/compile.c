@@ -122,14 +122,6 @@ static void compile_raise(compile_ctx_t *ctx, const char *message,
     (void)lua_error(ctx->L);
 }
 
-static void push_element_name(lua_State *L, const ir_element_t *element)
-{
-    lua_pushliteral(L, "<");
-    lua_pushlstring(L, element->tag_name.data, element->tag_name.len);
-    lua_pushliteral(L, ">");
-    lua_concat(L, 3);
-}
-
 static void push_element_error_meta(compile_ctx_t *ctx,
                                     const ir_element_t *element,
                                     const char *attribute, size_t attribute_len)
@@ -152,7 +144,7 @@ static void push_element_error_meta(compile_ctx_t *ctx,
     reflow_snippet_push(L, ctx->ir->html.data, ctx->ir->html.len,
                         element->source_start, element->source_end, 2);
     lua_setfield(L, -2, "snippet");
-    push_element_name(L, element);
+    reflow_open_tag_push(L, element);
     lua_setfield(L, -2, "element");
 }
 

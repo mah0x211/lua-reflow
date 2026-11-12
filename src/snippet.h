@@ -26,6 +26,8 @@
 #include <lua.h>
 #include <stddef.h>
 
+#include "ir.h"
+
 typedef struct reflow_source_location_t {
     size_t line;
     size_t column;
@@ -37,5 +39,13 @@ reflow_source_location(const char *source, size_t source_len, size_t offset);
 /** Push a context snippet with line gutters and a caret range. */
 void reflow_snippet_push(lua_State *L, const char *source, size_t source_len,
                          size_t start, size_t end, size_t context_lines);
+
+/**
+ * Push the opening tag of element rebuilt from its tag name and regular
+ * attributes, as the JavaScript reconstructOpenTag does: an attribute with
+ * an empty value is written by name, and '&', '"', and '<' of a value are
+ * written as character references. Directives are not included.
+ */
+void reflow_open_tag_push(lua_State *L, const ir_element_t *element);
 
 #endif /* REFLOW_SNIPPET_H */

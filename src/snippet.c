@@ -182,3 +182,41 @@ void reflow_snippet_push(lua_State *L, const char *source, size_t source_len,
     }
     luaL_pushresult(&buffer);
 }
+
+void reflow_open_tag_push(lua_State *L, const ir_element_t *element)
+{
+    const ir_attr_t *attr = NULL;
+    luaL_Buffer b;
+
+    luaL_buffinit(L, &b);
+    luaL_addchar(&b, '<');
+    luaL_addlstring(&b, element->tag_name.data, element->tag_name.len);
+    for (attr = element->attrs.head; attr != NULL; attr = attr->next) {
+        size_t i = 0;
+
+        luaL_addchar(&b, ' ');
+        luaL_addlstring(&b, attr->name.data, attr->name.len);
+        if (attr->value.len == 0) {
+            continue;
+        }
+        luaL_addstring(&b, "=\"");
+        for (i = 0; i < attr->value.len; i++) {
+            switch (attr->value.data[i]) {
+            case '&':
+                luaL_addstring(&b, "&amp;");
+                break;
+            case '"':
+                luaL_addstring(&b, "&quot;");
+                break;
+            case '<':
+                luaL_addstring(&b, "&lt;");
+                break;
+            default:
+                luaL_addchar(&b, attr->value.data[i]);
+            }
+        }
+        luaL_addchar(&b, '"');
+    }
+    luaL_addchar(&b, '>');
+    luaL_pushresult(&b);
+}

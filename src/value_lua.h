@@ -28,6 +28,27 @@
 #include "pool.h"
 #include "value.h"
 
+/* Push a JavaScript number. JavaScript has a single number type, so a
+ * number with an integral value within the exact range of a double is
+ * pushed as a Lua integer on Lua 5.3 and later, where tostring and
+ * math.type tell the two subtypes apart; -0 becomes 0, as String(-0) is
+ * "0". */
+static inline void value_lua_push_number(lua_State *L, double value)
+{
+#if LUA_VERSION_NUM >= 503
+    if (value >= -9007199254740992.0 && value <= 9007199254740992.0) {
+        lua_Integer i = (lua_Integer)value;
+
+        /* integral when truncation lost nothing, compared without == */
+        if (!((double)i < value) && !((double)i > value)) {
+            lua_pushinteger(L, i);
+            return;
+        }
+    }
+#endif
+    lua_pushnumber(L, (lua_Number)value);
+}
+
 /* JavaScript null is the NULL light userdata, the same value as lua-cjson's
  * cjson.null. JavaScript undefined is nil. */
 static inline void value_lua_push_null(lua_State *L)

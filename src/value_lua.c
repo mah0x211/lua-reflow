@@ -66,7 +66,7 @@ static int push_shell(lua_State *L, const reflow_value_t *value)
         lua_pushboolean(L, value->as.boolean);
         return 0;
     case REFLOW_VALUE_NUMBER:
-        lua_pushnumber(L, (lua_Number)value->as.number);
+        value_lua_push_number(L, value->as.number);
         return 0;
     case REFLOW_VALUE_STRING:
         lua_pushlstring(L, value->as.string.data, value->as.string.len);
