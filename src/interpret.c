@@ -60,11 +60,17 @@
 #define SEL_PARENT   0x2 /* the parent of positional candidates */
 #define SEL_INCLUDE  0x4 /* an x-include element whose template is searched */
 
-/* The distinct tag names of the positional candidates of one parent. */
+/* The distinct tag names of the positional candidates of one parent, and
+ * the last position that can match when every condition of them is
+ * :first-child or :nth-child(n): later children are not counted or
+ * captured, as the JavaScript computeForwardBound does. bound is 0 when
+ * there is no such position. */
 typedef struct {
     const ir_string_t **tags;
     size_t ntags;
     size_t capacity;
+    size_t bound;
+    int needs_total;
 } sel_parent_t;
 
 /* The selection of a template being searched by a partial render: its
@@ -277,6 +283,29 @@ static int sel_add_tag(pool_t *pool, sel_parent_t *parent,
 }
 
 /* Mark element and its structural ancestors as holding what is searched. */
+/* Add the positional conditions of a candidate to the bound of its parent.
+ * Any other condition than :first-child and :nth-child(n) needs the totals
+ * of the parent, which leaves the parent without a bound. */
+static void sel_add_bound(sel_parent_t *parent,
+                          const selector_compound_t *compound)
+{
+    size_t i = 0;
+
+    for (i = 0; i < compound->npseudos; i++) {
+        const selector_pseudo_t *pseudo = &compound->pseudos[i];
+
+        if (pseudo->kind == SELECTOR_PSEUDO_FIRST_CHILD) {
+            parent->bound = parent->bound > 1 ? parent->bound : 1;
+        } else if (pseudo->kind != SELECTOR_PSEUDO_NTH_CHILD) {
+            parent->needs_total = 1;
+        } else if (pseudo->n >= (double)SIZE_MAX) {
+            parent->bound = SIZE_MAX;
+        } else if (pseudo->n > (double)parent->bound) {
+            parent->bound = (size_t)pseudo->n;
+        }
+    }
+}
+
 static void sel_mark_relevant(sel_context_t *sel, const ir_element_t *element)
 {
     while (element != NULL &&
@@ -362,21 +391,24 @@ static int sel_context_new(render_ctx_t *ctx, const ir_t *ir,
         const ir_element_t *element = cands.items[i].element;
         const ir_element_t *parent  = element->structure.parent;
 
+        const selector_compound_t *last =
+            selector_exec_rightmost(cands.items[i].complex);
+        sel_parent_t *record = NULL;
+
         sel->candidates[element->structure.order] = cands.items[i].complex;
         sel_mark_relevant(sel, parent);
-        if (selector_exec_rightmost(cands.items[i].complex)->npseudos == 0) {
+        if (last->npseudos == 0) {
             continue;
         } else if (parent == NULL) {
-            if (sel_add_tag(pool, &sel->root, &element->tag_name) != 0) {
-                goto failed;
-            }
+            record = &sel->root;
         } else {
             sel->marks[parent->structure.order] |= SEL_PARENT;
-            if (sel_add_tag(pool, &sel->parents[parent->structure.order],
-                            &element->tag_name) != 0) {
-                goto failed;
-            }
+            record = &sel->parents[parent->structure.order];
         }
+        if (sel_add_tag(pool, record, &element->tag_name) != 0) {
+            goto failed;
+        }
+        sel_add_bound(record, last);
     }
     (void)pool_free(pool, cands.items);
     *out = sel;
@@ -1039,6 +1071,16 @@ static size_t add_saturated(size_t a, size_t b)
     return a > SIZE_MAX - b ? SIZE_MAX : a + b;
 }
 
+/* Report whether a counted parent has passed the last position that can
+ * match, so that its later children are neither counted nor captured. */
+static int sel_bound_reached(const sel_track_t *track)
+{
+    const sel_parent_t *parent = track->parent;
+
+    return !parent->needs_total && parent->bound > 0 &&
+           track->total >= parent->bound;
+}
+
 /* Count n emissions of element under its open parent. */
 static void sel_count_emissions(sel_track_t *track, const ir_element_t *element,
                                 size_t n)
@@ -1060,9 +1102,11 @@ static int sel_begin_emission(render_ctx_t *ctx, const ir_element_t *element,
     sel_track_t *track                = sel_sibling_track(ctx, element);
     const selector_complex_t *complex = NULL;
     size_t tag                        = SIZE_MAX;
+    int past                          = 0;
 
     if (track != NULL) {
-        tag = sel_tag_index(track->parent, &element->tag_name);
+        past = sel_bound_reached(track);
+        tag  = sel_tag_index(track->parent, &element->tag_name);
         sel_count_emissions(track, element, 1);
     }
     if (sel != NULL && sel->candidates != NULL) {
@@ -1072,8 +1116,9 @@ static int sel_begin_emission(render_ctx_t *ctx, const ir_element_t *element,
         return 0;
     } else if (selector_exec_rightmost(complex)->npseudos == 0) {
         track = NULL;
-    } else if (track == NULL || tag == SIZE_MAX) {
-        /* Not emitted under its counted parent: it cannot match. */
+    } else if (track == NULL || tag == SIZE_MAX || past) {
+        /* Not emitted under its counted parent, or after the last position
+         * that can match: it cannot match. */
         return 0;
     }
     *capture = (sel_capture_t){
@@ -1155,26 +1200,59 @@ typedef enum {
 } sel_action_t;
 
 /* Decide what a partial render does with an element it reaches outside a
- * capture: execute it when it holds what is searched; otherwise count it
+ * capture, as a child of the parent counted by track (NULL when it is not
+ * counted): execute it when it holds what is searched; otherwise count it
  * when it is a sibling under a counted parent, or leave it out, unless a
- * break inside it can change what is emitted. */
-static sel_action_t sel_action(const render_ctx_t *ctx,
-                               const ir_element_t *element)
+ * break inside it can change what is emitted. Once the counted parent has
+ * passed its bound, its positional candidates cannot match and its children
+ * are not counted. */
+static sel_action_t sel_action_under(const render_ctx_t *ctx,
+                                     const ir_element_t *element,
+                                     const sel_track_t *track)
 {
     const sel_context_t *sel = ctx->sel;
     size_t order             = element->structure.order;
+    int counted              = track != NULL && !sel_bound_reached(track);
+    const selector_complex_t *complex = NULL;
 
-    if (ctx->selector == NULL || ctx->capturing > 0) {
+    if (sel != NULL && sel->marks != NULL && sel->candidates != NULL) {
+        complex = sel->candidates[order];
+    }
+    if (sel != NULL && sel->marks != NULL &&
+        (sel->marks[order] & SEL_RELEVANT)) {
         return SEL_RUN;
-    } else if (sel != NULL && sel->marks != NULL &&
-               ((sel->marks[order] & SEL_RELEVANT) ||
-                (sel->candidates != NULL && sel->candidates[order] != NULL))) {
+    } else if (complex != NULL &&
+               (track == NULL || counted ||
+                selector_exec_rightmost(complex)->npseudos == 0)) {
         return SEL_RUN;
-    } else if (sel_sibling_track(ctx, NULL) != NULL) {
+    } else if (counted) {
         return element->structure.breaks_out ? SEL_RUN : SEL_COUNT;
     }
     return element->structure.breaks_out && !is_loop(element) ? SEL_RUN :
                                                                 SEL_SKIP;
+}
+
+static sel_action_t sel_action(const render_ctx_t *ctx,
+                               const ir_element_t *element)
+{
+    if (ctx->selector == NULL || ctx->capturing > 0) {
+        return SEL_RUN;
+    }
+    return sel_action_under(ctx, element, sel_sibling_track(ctx, NULL));
+}
+
+/* Report whether the iterations left of a loop element can be left out
+ * because its counted parent has passed its bound. */
+static int sel_loop_done(const render_ctx_t *ctx, const ir_element_t *element)
+{
+    const sel_track_t *track = NULL;
+
+    if (ctx->selector == NULL || ctx->capturing > 0) {
+        return 0;
+    }
+    track = sel_sibling_track(ctx, element);
+    return track != NULL && sel_bound_reached(track) &&
+           sel_action_under(ctx, element, track) == SEL_SKIP;
 }
 
 /* Report whether an x-include element is searched by the partial render. */
@@ -1450,9 +1528,13 @@ static int render_child(render_ctx_t *ctx, const ir_element_t *element)
 static int sel_chain_needed(const render_ctx_t *ctx, const ir_chain_t *chain)
 {
     const ir_branch_t *branch = NULL;
+    const sel_track_t *track  = NULL;
 
-    if (ctx->selector == NULL || ctx->capturing > 0 ||
-        sel_sibling_track(ctx, NULL) != NULL) {
+    if (ctx->selector == NULL || ctx->capturing > 0) {
+        return 1;
+    }
+    track = sel_sibling_track(ctx, NULL);
+    if (track != NULL && !sel_bound_reached(track)) {
         return 1;
     }
     for (branch = chain->branches.head; branch != NULL; branch = branch->next) {
@@ -1562,7 +1644,8 @@ static int render_tree(render_ctx_t *ctx)
             if (ctx->breaking) {
                 ctx->breaking = 0;
                 end_loop(ctx);
-            } else if (!next_iteration(ctx, frame)) {
+            } else if (sel_loop_done(ctx, frame->element) ||
+                       !next_iteration(ctx, frame)) {
                 end_loop(ctx);
             } else if (render_element_once(ctx, frame->element) != 0) {
                 return -1;
