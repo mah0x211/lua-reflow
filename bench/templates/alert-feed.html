@@ -1,0 +1,39 @@
+<div class="alerts-panel">
+<div class="panel-header">
+  <h2>Active Alerts</h2>
+  <span class="badge red" x-text="plural($.activeCount, 'active alert')"></span>
+</div>
+
+<ul class="alert-list">
+  <li x-each="a in $.alerts" x-bind:class="cat('alert-item severity-', .a.severity)">
+    <div class="alert-header">
+      <span x-match=".a.severity">
+        <span x-case="'critical'" class="icon">🔴</span>
+        <span x-case="'high'"     class="icon">🟠</span>
+        <span x-case="'medium'"   class="icon">🟡</span>
+        <span x-case="'low'"      class="icon">🟢</span>
+        <span x-nocase             class="icon">ℹ️</span>
+      </span>
+      <strong class="title" x-text=".a.title"></strong>
+      <span class="channel badge" x-text=".a.channel"></span>
+    </div>
+
+    <div class="alert-meta">
+      <span>Fired: <time x-text="fmtDate(.a.firedAt)"></time></span>
+      <template x-if=".a.resolvedAt != null">
+        <span class="resolved">Resolved: <time x-text="fmtDate(.a.resolvedAt)"></time></span>
+      </template>
+      <template x-if=".a.acknowledged">
+        <span class="ack badge">ACK</span>
+      </template>
+      <template x-else>
+        <span class="unack badge red">Unacknowledged</span>
+      </template>
+    </div>
+
+    <template x-if=".a.notes != null">
+      <p class="alert-notes" x-text=".a.notes"></p>
+    </template>
+  </li>
+</ul>
+</div>

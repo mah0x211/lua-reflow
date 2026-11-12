@@ -1,0 +1,44 @@
+<div class="audit-panel">
+<div class="panel-header"><h2>Audit Log</h2></div>
+
+<div class="filter-bar">
+  Page:
+  <span x-for="p = 1, 5">
+    <a x-bind:href="cat('?page=', .p)" class="page-link" x-text=".p"></a>
+  </span>
+</div>
+
+<table class="audit-table">
+  <thead>
+    <tr><th>Time</th><th>Actor</th><th>Action</th><th>Resource</th><th>IP</th><th>Result</th><th>Details</th></tr>
+  </thead>
+  <tbody>
+    <tr x-each="e in $.entries" x-bind:class=".e.success ? '' : 'row-failure'">
+      <td><time x-text="fmtDate(.e.at)"></time></td>
+      <td>
+        <span x-text=".e.actorName"></span>
+        <small class="uid" x-text=".e.actor"></small>
+      </td>
+      <td><code x-text=".e.action"></code></td>
+      <td><code x-text=".e.resource"></code></td>
+      <td><code x-text=".e.ip"></code></td>
+      <td>
+        <template x-if=".e.success">
+          <span class="badge green">OK</span>
+        </template>
+        <template x-else>
+          <span class="badge red">Failed</span>
+        </template>
+      </td>
+      <td>
+        <template x-if=".e.meta != null">
+          <dl class="meta">
+            <dt>Reason</dt><dd x-text=".e.meta.reason"></dd>
+            <dt>Ticket</dt><dd x-text=".e.meta.ticket"></dd>
+          </dl>
+        </template>
+      </td>
+    </tr>
+  </tbody>
+</table>
+</div>
