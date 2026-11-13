@@ -1,0 +1,58 @@
+<div>
+<header class="page-header">
+  <h1 x-text="$.org.name"></h1>
+  <span class="badge" x-text="plural($.summaryStats.total, 'service')"></span>
+</header>
+
+<div class="summary-bar">
+  <div x-match="$.summaryStats.down == 0 ? 'ok' : 'incidents'">
+    <span x-case="'ok'" class="status-ok">All services operational</span>
+    <span x-case="'incidents'" class="status-warn">
+      <b x-text="$.summaryStats.down"></b> service(s) down,
+      <b x-text="$.summaryStats.degraded"></b> degraded
+    </span>
+  </div>
+  <div class="stat">Healthy: <b x-text="$.summaryStats.healthy"></b></div>
+  <div class="stat">Maintenance: <b x-text="$.summaryStats.maintenance"></b></div>
+</div>
+
+<table class="services-table">
+  <thead>
+    <tr><th>ID</th><th>Name</th><th>Type</th><th>Region</th><th>Status</th><th>Uptime</th><th>RPS</th><th>p50</th><th>Errors</th><th>Deployed</th></tr>
+  </thead>
+  <tbody>
+    <tr x-each="svc in $.services">
+      <td x-text=".svc.id"></td>
+      <td class="name" x-text=".svc.name"></td>
+      <td x-text=".svc.type"></td>
+      <td x-text=".svc.region"></td>
+      <td>
+        <span x-match=".svc.status">
+          <span x-case="'healthy'" class="badge green">Healthy</span>
+          <span x-case="'degraded'" class="badge yellow">Degraded</span>
+          <span x-case="'down'" class="badge red">Down</span>
+          <span x-case="'maintenance'" class="badge blue">Maintenance</span>
+          <span x-nocase class="badge grey" x-text=".svc.status"></span>
+        </span>
+      </td>
+      <td x-text=".svc.uptime"></td>
+      <td x-text=".svc.requestsPerMin"></td>
+      <td x-text=".svc.responseTimeMs"></td>
+      <td x-text=".svc.errorRate"></td>
+      <td x-text="fmtDate(.svc.deployed)"></td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="tags-section">
+  <h2>Service Tags</h2>
+  <ul>
+    <li x-each="svc in $.services">
+      <b x-text=".svc.id"></b>:
+      <span x-each="tag, ti in .svc.tags">
+        <template x-if=".ti > 0">, </template><span class="tag" x-text=".tag"></span>
+      </span>
+    </li>
+  </ul>
+</div>
+</div>

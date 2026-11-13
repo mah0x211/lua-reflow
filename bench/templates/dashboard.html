@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title x-text="cat($.org.name, ' — Dashboard')"></title>
+</head>
+<body class="dashboard">
+  <nav class="sidebar">
+    <span class="logo" x-text="$.org.name"></span>
+    <ul>
+      <li class="active">Dashboard</li>
+      <li>Services</li>
+      <li>Alerts</li>
+      <li>Users</li>
+      <li>Billing</li>
+    </ul>
+  </nav>
+  <main class="main-content">
+    <section class="panel" x-include="'services-list'"></section>
+    <section class="panel" x-include="'alert-feed'"></section>
+    <section class="panel" x-include="'user-management'"></section>
+    <section class="panel" x-include="'metrics-overview'"></section>
+    <section class="panel" x-include="'audit-log'"></section>
+  </main>
+</body>
+</html>

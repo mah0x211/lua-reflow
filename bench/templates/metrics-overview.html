@@ -1,0 +1,54 @@
+<div class="metrics-panel">
+<div class="panel-header">
+  <h2>Performance Metrics — <span x-text="$.window"></span></h2>
+</div>
+
+<div class="kpis">
+  <div class="kpi">
+    <span class="kpi-label">Total Requests</span>
+    <span class="kpi-value" x-text="$.totalRequests"></span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Error Rate</span>
+    <span x-bind:class="$.errorRatePct > 1 ? 'kpi-value bad' : 'kpi-value good'"
+          x-text="$.errorRatePct"></span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">Avg Response</span>
+    <span class="kpi-value" x-text="$.avgResponseMs"></span><span>ms</span>
+  </div>
+  <div class="kpi">
+    <span class="kpi-label">p95 Response</span>
+    <span class="kpi-value" x-text="$.p95ResponseMs"></span><span>ms</span>
+  </div>
+</div>
+
+<h3>Hourly time series</h3>
+<table class="timeseries">
+  <thead><tr><th>Hour</th><th>Requests</th><th>Errors</th><th>p50</th><th>p95</th><th>p99</th></tr></thead>
+  <tbody>
+    <tr x-each="pt in $.timeSeries">
+      <td x-text="pad2(.pt.hour)"></td>
+      <td x-text=".pt.requests"></td>
+      <td x-bind:class=".pt.errors > 300 ? 'cell-warn' : ''" x-text=".pt.errors"></td>
+      <td x-text=".pt.p50"></td>
+      <td x-text=".pt.p95"></td>
+      <td x-text=".pt.p99"></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>Top endpoints</h3>
+<table class="endpoints">
+  <thead><tr><th>Method</th><th>Path</th><th>Requests</th><th>Avg ms</th><th>Error %</th></tr></thead>
+  <tbody>
+    <tr x-each="ep in $.topEndpoints">
+      <td><code x-text=".ep.method"></code></td>
+      <td><code x-text=".ep.path"></code></td>
+      <td x-text=".ep.count"></td>
+      <td x-text=".ep.avgMs"></td>
+      <td x-bind:class=".ep.errorPct > 0.1 ? 'cell-warn' : ''" x-text=".ep.errorPct"></td>
+    </tr>
+  </tbody>
+</table>
+</div>

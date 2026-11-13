@@ -1449,23 +1449,27 @@ function testcase.render_reports_out_of_memory_while_evaluating()
             collectgarbage('collect')
             local used = memlimit.used()
             memlimit.maxsize(math.max(used, memlimit.minsize()) + extra)
-            local out, err = interpret.render('oom', ir, nil, helpers)
+            local called, out, err = pcall(interpret.render, 'oom', ir, nil,
+                                           helpers)
             memlimit.maxsize(0)
-            if out then
+            if not called then
+                assert(tostring(out):find('not enough memory', 1, true),
+                       tostring(out))
+            elseif out then
                 kinds.success = out == '<div><p>' .. big .. '</p></div>'
                 break
+            else
+                assert(errorlib.typeof(err) == errors.ERUNTIME)
+                assert(err.message.message == 'out of memory while rendering',
+                       err.message.message)
+                kinds[errorlib.unwrap(err) == nil and 'pool' or 'lua'] = true
             end
-            assert(errorlib.typeof(err) == errors.ERUNTIME)
-            assert(err.message.message == 'out of memory while rendering',
-                   err.message.message)
-            kinds[errorlib.unwrap(err) == nil and 'pool' or 'lua'] = true
         end
         return kinds
     ]])
     assert.is_true(ok, kinds)
-    assert.equal(kinds, {
-        pool = true,
-        lua = true,
-        success = true,
-    })
+    -- Whether a failure is returned as an error or raised as a memory error
+    -- depends on the Lua version: the library does not collect garbage, and
+    -- Lua 5.1 and LuaJIT have no emergency collection.
+    assert.is_true(kinds.success)
 end

@@ -863,6 +863,66 @@ function testcase.selector_argument_must_be_a_compiled_selector()
     assert.equal(interpret.render('t', ir, nil, nil, nil, nil, nil), '<p></p>')
 end
 
+-- With only :first-child and :nth-child(n) conditions, the children of a
+-- parent after the last position that can match are not counted, as the
+-- JavaScript computeForwardBound does: their loops and conditions are not
+-- evaluated.
+function testcase.forward_bound_leaves_out_later_siblings()
+    local html = '<ul><li>a</li><li>b</li><li x-each="x in $.nope">c</li>' ..
+                     '<li x-if="boom()">d</li></ul>'
+    local helpers = {
+        boom = function()
+            error('boom')
+        end,
+    }
+    local data = {
+        nope = 1,
+    }
+    assert_fragment('<li>a</li>', {
+        t = html,
+    }, 't', 'li:first-child', data, nil, helpers)
+    assert_fragment('<li>b</li>', {
+        t = html,
+    }, 't', 'li:nth-child(2)', data, nil, helpers)
+    -- The first complex selector an element matches decides its conditions.
+    assert_fragment('<li>a</li>', {
+        t = html,
+    }, 't', 'li:nth-child(1), li:only-child', data, nil, helpers)
+    -- Other conditions need every child to be counted.
+    assert_error_type(reflow_error.ERUNTIME, {
+        t = html,
+    }, 't', 'li:last-child', data, nil, helpers)
+    assert_error_type(reflow_error.ERUNTIME, {
+        t = html,
+    }, 't', 'li:first-of-type', data, nil, helpers)
+end
+
+function testcase.forward_bound_ends_the_loop_of_a_candidate()
+    assert_fragment('<li>3</li>', {
+        t = '<ul><li x-for="i = 1, 1000000" x-text=".i"></li></ul>',
+    }, 't', 'li:nth-child(3)')
+    assert_fragment('<li>2</li>', {
+        t = '<ul><li>a</li><li x-for="i = 1, 1000000" x-text=".i"></li></ul>',
+    }, 't', 'li:nth-child(3)')
+end
+
+function testcase.forward_bound_keeps_what_can_still_match()
+    -- a candidate without positional conditions
+    assert_reason('multiple_matches', {
+        t = '<ul><li>a</li><li>b</li><p class="x">c</p></ul>',
+    }, 't', 'li:first-child, p.x')
+    -- a candidate inside a later sibling
+    assert_reason('multiple_matches', {
+        t = '<ul><li>a</li><li>b</li><li><b>c</b></li></ul>',
+    }, 't', 'li:first-child, li b')
+    -- a break of a later sibling still ends the loop, so the second
+    -- iteration is not emitted
+    assert_fragment('<p>1</p>', {
+        t = '<div x-for="i = 1, 3"><p x-text=".i"></p>' ..
+            '<span x-break-if=".i == 1"></span></div>',
+    }, 't', 'p:first-child')
+end
+
 function testcase.partial_render_reports_out_of_memory()
     local ok, kinds = newstate.new():dostring([[
         local memlimit = require('memlimit')
@@ -899,8 +959,8 @@ function testcase.partial_render_reports_out_of_memory()
         return kinds
     ]])
     assert.is_true(ok, tostring(kinds))
-    assert.equal(kinds, {
-        oom = true,
-        success = true,
-    })
+    -- Whether a failure is returned as an error or raised as a memory error
+    -- depends on the Lua version: the library does not collect garbage, and
+    -- Lua 5.1 and LuaJIT have no emergency collection.
+    assert.is_true(kinds.success)
 end

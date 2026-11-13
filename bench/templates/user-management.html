@@ -1,0 +1,66 @@
+<div class="users-panel">
+<div class="panel-header">
+  <h2>Members</h2>
+  <span x-text="plural($.pagination.total, 'member')"></span>
+  <span>Page <b x-text="$.pagination.page"></b></span>
+</div>
+
+<table class="users-table">
+  <thead>
+    <tr>
+      <th>ID</th><th>Name</th><th>Email</th><th>Role</th>
+      <th>Plan</th><th>MFA</th><th>API Keys</th><th>Last Login</th><th>Status</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr x-each="u in $.users" x-bind:class=".u.invitePending ? 'row-pending' : 'row-active'">
+      <td x-text=".u.id"></td>
+      <td x-text=".u.name"></td>
+      <td><a x-bind:href="cat('mailto:', .u.email)" x-text=".u.email"></a></td>
+      <td>
+        <span x-match=".u.role">
+          <span x-case="'owner'"   class="role owner">Owner</span>
+          <span x-case="'admin'"   class="role admin">Admin</span>
+          <span x-case="'member'"  class="role member">Member</span>
+          <span x-case="'viewer'"  class="role viewer">Viewer</span>
+          <span x-case="'billing'" class="role billing">Billing</span>
+          <span x-nocase class="role" x-text=".u.role"></span>
+        </span>
+      </td>
+      <td x-text=".u.plan"></td>
+      <td>
+        <template x-if=".u.mfaEnabled">
+          <span class="badge green">Enabled</span>
+        </template>
+        <template x-else>
+          <span class="badge red">Disabled</span>
+        </template>
+      </td>
+      <td x-text=".u.apiKeyCount"></td>
+      <td>
+        <template x-if=".u.lastLoginAt != null">
+          <time x-text="fmtDate(.u.lastLoginAt)"></time>
+        </template>
+        <template x-else>—</template>
+      </td>
+      <td>
+        <template x-if=".u.invitePending">
+          <span class="badge yellow">Invite pending</span>
+        </template>
+        <template x-else>
+          <span class="badge green">Active</span>
+        </template>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="pagination">
+  <button x-bind:disabled="$.pagination.page <= 1">Prev</button>
+  <span>
+    Page <b x-text="$.pagination.page"></b> of
+    <b x-text="pct($.pagination.page, ceil($.pagination.total, $.pagination.perPage))"></b>
+  </span>
+  <button>Next</button>
+</div>
+</div>
