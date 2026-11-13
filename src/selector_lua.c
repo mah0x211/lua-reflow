@@ -226,8 +226,6 @@ static int compile_lua(lua_State *L)
         return lua_error(L);
     }
     lua_settop(L, base);
-    /* Reclaim the failed selector before building the error. */
-    lua_gc(L, LUA_GCCOLLECT, 0);
     lua_pushliteral(L, SELECTOR_OOM_MESSAGE);
     return return_selector_error(L, -1, NULL, 1, 0, 0);
 }
@@ -473,7 +471,6 @@ static int resolve_lua(lua_State *L)
         return return_resolve_error(L, ctx.selector, 3, "unsupported",
                                     lua_tostring(L, -1));
     }
-    lua_gc(L, LUA_GCCOLLECT, 0);
     lua_pushliteral(L, RESOLVE_OOM_MESSAGE);
     return return_resolve_error(L, ctx.selector, lua_gettop(L), NULL, NULL);
 }

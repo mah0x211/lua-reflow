@@ -1993,12 +1993,6 @@ static int render_lua(lua_State *L)
     status = lua_pcall(L, 5, 1, 0);
     pool_delete(L, ctx.pool);
     lua_remove(L, base + 1);
-    if (status != LUA_OK || lua_isnil(L, -1)) {
-        /* Reclaim the render's pool before building the error, so that the
-         * error can be created after an out-of-memory failure on Lua 5.1 and
-         * LuaJIT, which have no emergency collection. */
-        lua_gc(L, LUA_GCCOLLECT, 0);
-    }
 
     if (status == LUA_ERRRUN && ctx.ancestor != NULL) {
         return return_selector_error(L, &ctx, 1);
