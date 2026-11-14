@@ -20,6 +20,7 @@
  * THE SOFTWARE.
  */
 
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 
@@ -99,7 +100,12 @@ int value_lua_push(lua_State *L, pool_t *pool, const reflow_value_t *value)
     size_t depth          = 0;
     int work              = 0;
 
-    luaL_checkstack(L, 6, "converting a static value");
+    /* Lua 5.2 and later report a stack that cannot grow instead of a memory
+     * error when memory runs out. */
+    if (!lua_checkstack(L, 6)) {
+        errno = ENOMEM;
+        return -1;
+    }
     if (!push_shell(L, value)) {
         return 0;
     }

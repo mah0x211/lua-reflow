@@ -271,12 +271,16 @@ static void set_string(lua_State *L, const char *key,
     }
 }
 
-/* Push the positional conditions of c as { {name = ..., n = ...}, ... }. */
-static void push_pseudos(lua_State *L, const selector_compound_t *c)
+/* Push the positional conditions of c as { {name = ..., n = ...}, ... }.
+ * Return -1 with nothing pushed when the stack cannot grow, which Lua 5.2 and
+ * later report instead of a memory error when memory runs out. */
+static int push_pseudos(lua_State *L, const selector_compound_t *c)
 {
     size_t i = 0;
 
-    luaL_checkstack(L, 3, "building the selector table");
+    if (!lua_checkstack(L, 3)) {
+        return -1;
+    }
     lua_createtable(L, (int)c->npseudos, 0);
     for (i = 0; i < c->npseudos; i++) {
         const selector_pseudo_t *pseudo = &c->pseudos[i];
@@ -296,6 +300,7 @@ static void push_pseudos(lua_State *L, const selector_compound_t *c)
         }
         lua_rawseti(L, -2, (int)i + 1);
     }
+    return 0;
 }
 
 static void push_compound(lua_State *L, const selector_compound_t *c)
@@ -327,7 +332,9 @@ static void push_compound(lua_State *L, const selector_compound_t *c)
         lua_rawseti(L, -2, (int)i + 1);
     }
     lua_setfield(L, -2, "attrs");
-    push_pseudos(L, c);
+    if (push_pseudos(L, c) != 0) {
+        luaL_error(L, "stack overflow (building the selector table)");
+    }
     lua_setfield(L, -2, "pseudos");
 }
 
@@ -396,13 +403,22 @@ static int resolve_operation(lua_State *L)
         ctx->rc = errno;
         return 0;
     }
+    /* A stack that cannot grow is reported as running out of memory. */
+    if (!lua_checkstack(L, 3)) {
+        ctx->rc = ENOMEM;
+        return 0;
+    }
     lua_createtable(L, (int)cands.count, 0);
     for (i = 0; i < cands.count; i++) {
         lua_createtable(L, 0, 2);
         lua_pushinteger(L,
                         (lua_Integer)cands.items[i].element->structure.order);
         lua_setfield(L, -2, "order");
-        push_pseudos(L, selector_exec_rightmost(cands.items[i].complex));
+        if (push_pseudos(L, selector_exec_rightmost(cands.items[i].complex)) !=
+            0) {
+            ctx->rc = ENOMEM;
+            return 0;
+        }
         lua_setfield(L, -2, "positional");
         lua_rawseti(L, -2, (int)i + 1);
     }
