@@ -49,6 +49,16 @@ build = {
                 "src",
             },
         },
+        ["reflow.slab"] = {
+            sources = {
+                "src/arena.c",
+                "src/slab.c",
+                "src/slab_lua.c",
+            },
+            incdirs = {
+                "src",
+            },
+        },
         ["reflow.pool"] = {
             sources = {
                 "src/arena.c",
