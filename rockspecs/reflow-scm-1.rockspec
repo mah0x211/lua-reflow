@@ -40,6 +40,15 @@ build = {
         reflow = "lua/reflow.lua",
         ["reflow.error"] = "lua/error.lua",
         ["reflow.selector_cache"] = "lua/selector_cache.lua",
+        ["reflow.arena"] = {
+            sources = {
+                "src/arena.c",
+                "src/arena_lua.c",
+            },
+            incdirs = {
+                "src",
+            },
+        },
         ["reflow.pool"] = {
             sources = {
                 "src/pool.c",
