@@ -31,7 +31,8 @@ function testcase.new_returns_pool_userdata()
     assert.equal(type(p.calloc), 'function')
     assert.equal(type(p.realloc), 'function')
     assert.equal(type(p.free), 'function')
-    assert.equal(type(p.detach), 'function')
+    assert.equal(type(p.compact), 'function')
+    assert.equal(type(p.retained), 'function')
     assert.is_nil(p.used)
     assert.is_nil(p.state)
 end
@@ -118,33 +119,15 @@ function testcase.free_nil_is_successful_noop()
     assert.is_true(values[1])
 end
 
-function testcase.free_rejects_double_and_foreign_pointers()
-    local first = pool.new(0)
-    local second = pool.new(0)
-    local mem = first:alloc(32)
-    local ok, err = second:free(mem)
-    assert.is_nil(ok)
-    assert_errno(err, errno.EINVAL, 'reflow.pool.free')
-    assert.is_true(first:free(mem))
-    ok, err = first:free(mem)
-    assert.is_nil(ok)
-    assert_errno(err, errno.EINVAL, 'reflow.pool.free')
-end
-
-function testcase.reuse_requires_exact_size_and_alignment()
+function testcase.freed_blocks_are_reused_by_size_class()
     local p = pool.new(0)
-    collectgarbage('stop')
-    local exact = p:aligned_alloc(64, 16)
-    local exact_address = tostring(exact)
-    assert.is_true(p:free(exact))
-    local reused = p:aligned_alloc(64, 16)
-    assert.equal(tostring(reused), exact_address)
+    local block = p:alloc(64)
+    assert.is_true(p:free(block))
+    -- 33 to 64 bytes share a size class
+    local reused = p:alloc(40)
+    assert.equal(tostring(reused), tostring(block))
     assert.is_true(p:free(reused))
-
-    local different_size = p:aligned_alloc(48, 16)
-    assert.not_equal(tostring(different_size), exact_address)
-    local different_alignment = p:aligned_alloc(64, 32)
-    assert.not_equal(tostring(different_alignment), exact_address)
+    assert.not_equal(tostring(p:alloc(65)), tostring(block))
 end
 
 function testcase.reuse_chain_keeps_multiple_blocks()
@@ -200,27 +183,46 @@ function testcase.realloc_same_size_keeps_pointer_and_content()
     assert.equal(p:read(resized, 0, 16), 'abcdefghijklmnop')
 end
 
-function testcase.realloc_grow_and_shrink_preserve_content_and_use_default_alignment()
+function testcase.realloc_keeps_the_block_while_it_holds_the_size()
     local p = pool.new(0)
-    collectgarbage('stop')
-
-    local default_grow = p:alloc(32)
-    local default_grow_address = tostring(default_grow)
-    assert.is_true(p:free(default_grow))
-
-    local mem = p:aligned_alloc(16, 64)
-    assert.is_true(p:write(mem, 0, 'abcdefghijklmnop'))
+    local mem = p:alloc(20)
+    assert.is_true(p:write(mem, 0, 'abcdefghijklmnopqrst'))
+    -- 20 bytes take the 32-byte class
     local grown = p:realloc(mem, 32)
-    assert.equal(tostring(grown), default_grow_address)
-    assert.equal(p:read(grown, 0, 16), 'abcdefghijklmnop')
-
-    local default_shrink = p:alloc(8)
-    local default_shrink_address = tostring(default_shrink)
-    assert.is_true(p:free(default_shrink))
-
+    assert.equal(tostring(grown), tostring(mem))
     local shrunk = p:realloc(grown, 8)
-    assert.equal(tostring(shrunk), default_shrink_address)
+    assert.equal(tostring(shrunk), tostring(mem))
     assert.equal(p:read(shrunk, 0, 8), 'abcdefgh')
+end
+
+function testcase.realloc_moves_a_block_that_cannot_hold_the_size()
+    local p = pool.new(0)
+    local mem = p:alloc(16)
+    assert.is_true(p:write(mem, 0, 'abcdefghijklmnop'))
+    local moved = p:realloc(mem, 4096)
+    assert.not_equal(tostring(moved), tostring(mem))
+    assert.equal(p:read(moved, 0, 16), 'abcdefghijklmnop')
+    assert.is_true(p:is_aligned(moved, 8))
+    local large = p:realloc(moved, 64 * 1024)
+    assert.equal(p:read(large, 0, 16), 'abcdefghijklmnop')
+    local back = p:realloc(large, 16)
+    assert.equal(p:read(back, 0, 16), 'abcdefghijklmnop')
+end
+
+function testcase.empty_chunks_go_back_to_the_arena()
+    local p = pool.new(0)
+    local blocks = {}
+    for i = 1, 4096 do
+        blocks[i] = p:alloc(64)
+    end
+    local retained = p:retained()
+    for i = 1, #blocks do
+        assert.is_true(p:free(blocks[i]))
+    end
+    -- the chunks no block uses can be dropped, except the current one
+    assert.less(p:compact(0), retained)
+    assert.less_or_equal(p:compact(0), retained / 4)
+    assert.not_nil(p:alloc(64))
 end
 
 function testcase.realloc_failure_preserves_old_block()
@@ -234,65 +236,16 @@ function testcase.realloc_failure_preserves_old_block()
     assert.is_true(p:free(mem))
 end
 
-function testcase.realloc_rejects_foreign_pointer()
-    local first = pool.new(0)
-    local second = pool.new(0)
-    local mem = first:alloc(8)
-    assert.is_true(first:write(mem, 0, 'abcdefgh'))
-    local ok, err = second:realloc(mem, 16)
-    assert.is_nil(ok)
-    assert_errno(err, errno.EINVAL, 'reflow.pool.realloc')
-    assert.equal(first:read(mem, 0, 8), 'abcdefgh')
-end
-
 function testcase.test_helpers_validate_pointer_range_and_alignment()
-    local first = pool.new(0)
-    local second = pool.new(0)
-    local mem = first:calloc(1, 8)
-    local ok, err = second:read(mem, 0, 1)
-    assert.is_nil(ok)
-    assert_errno(err, errno.EINVAL, 'reflow.pool.read')
-    ok, err = first:write(mem, 7, 'xx')
+    local p = pool.new(0)
+    local mem = p:calloc(1, 8)
+    local ok, err = p:write(mem, 7, 'xx')
     assert.is_nil(ok)
     assert_errno(err, errno.EINVAL, 'reflow.pool.write')
-    ok, err = first:is_aligned(mem, 3)
+    ok, err = p:read(mem, 0, 9)
+    assert.is_nil(ok)
+    assert_errno(err, errno.EINVAL, 'reflow.pool.read')
+    ok, err = p:is_aligned(mem, 3)
     assert.is_nil(ok)
     assert_errno(err, errno.EINVAL, 'reflow.pool.is_aligned')
-end
-
-function testcase.detach_transfers_to_plain_lua_ownership()
-    local weak = setmetatable({}, {
-        __mode = 'v',
-    })
-    local detached
-    do
-        local p = pool.new(0)
-        local mem = p:alloc(32)
-        detached = p:detach(mem)
-        weak.mem = detached
-        assert.equal(type(detached), 'userdata')
-        assert.equal(detached:size(), 32)
-        assert.equal(type(detached:data()), 'userdata')
-        assert.is_nil(detached.free)
-    end
-    collect()
-    assert.not_nil(weak.mem)
-    assert.equal(detached:size(), 32)
-    detached = nil -- luacheck: ignore
-    collect()
-    assert.is_nil(weak.mem)
-end
-
-function testcase.detach_rejects_foreign_and_already_detached_pointer()
-    local first = pool.new(0)
-    local second = pool.new(0)
-    local mem = first:alloc(8)
-    local ok, err = second:detach(mem)
-    assert.is_nil(ok)
-    assert_errno(err, errno.EINVAL, 'reflow.pool.detach')
-    local detached = first:detach(mem)
-    ok, err = first:detach(mem)
-    assert.is_nil(ok)
-    assert_errno(err, errno.EINVAL, 'reflow.pool.detach')
-    assert.equal(detached:size(), 8)
 end

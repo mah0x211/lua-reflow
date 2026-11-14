@@ -20,49 +20,17 @@
  * THE SOFTWARE.
  */
 
-/*
- * Private interface shared between pool.c and its Lua test bridge pool_lua.c.
- * These symbols are intentionally kept out of the public pool.h; they exist
- * only so the bridge can inspect internal state for testing and diagnostics.
- */
-
 #ifndef REFLOW_POOL_INTERNAL_H
 #define REFLOW_POOL_INTERNAL_H
 
-#include <lua.h>
 #include <stddef.h>
 
 #include "pool.h"
 
 /**
- * @brief Slot keys of the pool's internal state table.
- *
- * Mirrors the private enum in pool.c so the bridge and tests can read specific
- * internal tables without depending on their layout by number.
+ * @brief Requested size of a block of the pool, for the Lua bridge's test
+ * helpers.  mem must be a block in use.
  */
-enum pool_state_slot {
-    POOL_STATE_USED_MEM_BY_BLOCK = 1, /* data pointer -> block (strong) */
-    POOL_STATE_UNUSED_MEM_BY_SIZE,    /* size key -> chain head (weak value) */
-    POOL_STATE_UNUSED_MEM_NEXT        /* block -> next block (weak kv) */
-};
-
-/** Private block header shared with the Lua bridge. */
-struct pool_mem_t {
-    pool_t *pool;
-    size_t size;
-    size_t alignment;
-    int ref;
-    void *data;
-};
-
-/**
- * @brief Push the pool's internal state table onto the Lua stack.
- *
- * For testing and diagnostics only.  The pool must not have been deleted.
- */
-void pool_push_state(lua_State *L, pool_t *pool);
-
-/** Push the userdata held by a detached block's registry reference. */
-void pool_mem_push(lua_State *L, pool_mem_t *mem);
+size_t pool_block_size(const void *mem);
 
 #endif /* REFLOW_POOL_INTERNAL_H */

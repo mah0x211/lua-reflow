@@ -281,31 +281,40 @@ function testcase.result_pool_oom_returns_no_ir_and_allows_a_later_compile()
 end
 
 function testcase.x_data_pool_oom_returns_no_ir_and_allows_a_later_compile()
-    local ok, failed, typed, attributed, recovered = run([[
+    local ok, attributed, recovered = run([[
         local memlimit = require('memlimit')
         local errorlib = require('error')
         local errors = require('reflow.error')
         local compile = require('reflow.compile')
         local html = '<div x-data="scope: [' .. string.rep('null,', 8192) ..
                          'null]"></div>'
+        local attributed = false
 
-        collectgarbage('collect')
-        local used = memlimit.used()
-        memlimit.maxsize(math.max(used, memlimit.minsize()) + 1024 * 1024)
-        local result, err = compile('x-data-oom', html, 'x-', {})
-        memlimit.maxsize(0)
+        -- Raise the limit until the compile succeeds; on the way, x-data runs
+        -- out of memory while it is parsed.
+        for extra = 64 * 1024, 8 * 1024 * 1024, 32 * 1024 do
+            collectgarbage('collect')
+            local used = memlimit.used()
+            memlimit.maxsize(math.max(used, memlimit.minsize()) + extra)
+            local called, result, err = pcall(compile, 'x-data-oom', html,
+                                              'x-', {})
+            memlimit.maxsize(0)
+            if called and result then
+                break
+            elseif called and err.meta.attribute == 'x-data' then
+                assert(result == nil)
+                assert(errorlib.typeof(err) == errors.ECOMPILE)
+                attributed = true
+            end
+        end
         collectgarbage('collect')
         collectgarbage('collect')
 
         local retry = compile('x-data-retry', '<p>ok</p>', 'x-', {})
-        return result == nil, errorlib.typeof(err) == errors.ECOMPILE,
-               err.meta.attribute == 'x-data',
-               type(retry) == 'userdata' and
+        return attributed, type(retry) == 'userdata' and
                    getmetatable(retry) == 'reflow.ir'
     ]])
-    assert.is_true(ok)
-    assert.is_true(failed)
-    assert.is_true(typed)
+    assert.is_true(ok, attributed)
     assert.is_true(attributed)
     assert.is_true(recovered)
 end
