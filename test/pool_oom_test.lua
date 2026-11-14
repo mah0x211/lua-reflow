@@ -8,23 +8,29 @@ local function run(source)
     return state:dostring(source)
 end
 
-function testcase.unused_blocks_are_held_only_weakly()
+function testcase.compact_releases_the_memory_of_empty_chunks()
     local ok, before, allocated, after = run([[
         local memlimit = require('memlimit')
         local p = require('reflow.pool').new(0)
         collectgarbage('collect')
         local before = memlimit.used()
-        local mem = p:alloc(1024 * 1024)
+        local blocks = {}
+        for i = 1, 16384 do
+            blocks[i] = p:alloc(64)
+        end
         local allocated = memlimit.used()
-        p:free(mem)
-        mem = nil
+        for i = 1, #blocks do
+            p:free(blocks[i])
+        end
+        blocks = nil
+        p:compact(0)
         collectgarbage('collect')
         collectgarbage('collect')
         return before, allocated, memlimit.used()
     ]])
     assert.is_true(ok)
     assert.greater(allocated - after, 1024 * 1024)
-    assert.less(after - before, 4096)
+    assert.less(after - before, 128 * 1024)
 end
 
 function testcase.alloc_oom_returns_enomem_without_changing_old_block()

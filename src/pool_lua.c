@@ -30,8 +30,7 @@
 #include "pool.h"
 #include "pool_internal.h"
 
-#define POOL_METATABLE_NAME     "reflow.pool"
-#define POOL_MEM_METATABLE_NAME "reflow.pool.mem"
+#define POOL_METATABLE_NAME "reflow.pool"
 
 static void *check_lightuserdata(lua_State *L, int idx)
 {
@@ -39,30 +38,6 @@ static void *check_lightuserdata(lua_State *L, int idx)
         luaL_argerror(L, idx, "light userdata expected");
     }
     return lua_touserdata(L, idx);
-}
-
-/* Push a used block userdata and return its private header, or NULL on miss. */
-static pool_mem_t *push_used_mem(lua_State *L, pool_t *pool, void *data)
-{
-    int state_idx   = 0;
-    int used_idx    = 0;
-    pool_mem_t *mem = NULL;
-
-    pool_push_state(L, pool);
-    state_idx = lua_gettop(L);
-    lua_rawgeti(L, state_idx, POOL_STATE_USED_MEM_BY_BLOCK);
-    used_idx = lua_gettop(L);
-    lua_pushlightuserdata(L, data);
-    lua_rawget(L, used_idx);
-    if (lua_isnil(L, -1)) {
-        lua_pop(L, 3);
-        return NULL;
-    }
-
-    mem = (pool_mem_t *)lua_touserdata(L, -1);
-    lua_remove(L, used_idx);
-    lua_remove(L, state_idx);
-    return mem;
 }
 
 static int pool_gc_lua(lua_State *L)
@@ -186,126 +161,96 @@ static int pool_free_lua(lua_State *L)
     return 1;
 }
 
-static int pool_detach_lua(lua_State *L)
+/* Test helper: check that [offset, offset + len) lies in the block. */
+static int in_block(void *data, lua_Integer offset, size_t len)
 {
-    pool_t *pool         = (pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME);
-    void *data           = check_lightuserdata(L, 2);
-    pool_mem_t *detached = pool_detach(pool, data);
-    int ref              = LUA_NOREF;
+    size_t size = pool_block_size(data);
 
-    if (detached == NULL) {
-        int errnum = errno;
-        lua_pushnil(L);
-        lua_errno_new(L, errnum, "reflow.pool.detach");
-        return 2;
-    }
-
-    pool_mem_push(L, detached);
-    luaL_getmetatable(L, POOL_MEM_METATABLE_NAME);
-    lua_setmetatable(L, -2);
-
-    /* Transfer registry ownership to the Lua value now on the stack. */
-    ref           = detached->ref;
-    detached->ref = LUA_NOREF;
-    luaL_unref(L, LUA_REGISTRYINDEX, ref);
-    return 1;
+    return offset >= 0 && (size_t)offset <= size &&
+           len <= size - (size_t)offset;
 }
 
 static int pool_write_lua(lua_State *L)
 {
-    pool_t *pool       = (pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME);
-    void *data         = check_lightuserdata(L, 2);
-    lua_Integer offset = luaL_checkinteger(L, 3);
+    void *data         = NULL;
+    lua_Integer offset = 0;
     size_t len         = 0;
     const char *src    = NULL;
-    pool_mem_t *mem    = NULL;
 
+    luaL_checkudata(L, 1, POOL_METATABLE_NAME);
+    data   = check_lightuserdata(L, 2);
+    offset = luaL_checkinteger(L, 3);
     if (offset < 0) {
         return luaL_argerror(L, 3, "offset must be non-negative");
     }
     src = luaL_checklstring(L, 4, &len);
-    mem = push_used_mem(L, pool, data);
-    if (mem == NULL || (size_t)offset > mem->size ||
-        len > mem->size - (size_t)offset) {
-        if (mem != NULL) {
-            lua_pop(L, 1);
-        }
+    if (!in_block(data, offset, len)) {
         lua_pushnil(L);
         lua_errno_new(L, EINVAL, "reflow.pool.write");
         return 2;
     }
-    memcpy((char *)mem->data + (size_t)offset, src, len);
-    lua_pop(L, 1);
+    memcpy((char *)data + (size_t)offset, src, len);
     lua_pushboolean(L, 1);
     return 1;
 }
 
 static int pool_read_lua(lua_State *L)
 {
-    pool_t *pool       = (pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME);
-    void *data         = check_lightuserdata(L, 2);
-    lua_Integer offset = luaL_checkinteger(L, 3);
-    lua_Integer size   = luaL_checkinteger(L, 4);
-    pool_mem_t *mem    = NULL;
+    void *data         = NULL;
+    lua_Integer offset = 0;
+    lua_Integer size   = 0;
 
+    luaL_checkudata(L, 1, POOL_METATABLE_NAME);
+    data   = check_lightuserdata(L, 2);
+    offset = luaL_checkinteger(L, 3);
+    size   = luaL_checkinteger(L, 4);
     if (offset < 0) {
         return luaL_argerror(L, 3, "offset must be non-negative");
     } else if (size < 0) {
         return luaL_argerror(L, 4, "size must be non-negative");
-    }
-    mem = push_used_mem(L, pool, data);
-    if (mem == NULL || (size_t)offset > mem->size ||
-        (size_t)size > mem->size - (size_t)offset) {
-        if (mem != NULL) {
-            lua_pop(L, 1);
-        }
+    } else if (!in_block(data, offset, (size_t)size)) {
         lua_pushnil(L);
         lua_errno_new(L, EINVAL, "reflow.pool.read");
         return 2;
     }
-    lua_pushlstring(L, (const char *)mem->data + (size_t)offset, (size_t)size);
-    lua_remove(L, -2);
+    lua_pushlstring(L, (const char *)data + (size_t)offset, (size_t)size);
     return 1;
 }
 
 static int pool_is_aligned_lua(lua_State *L)
 {
-    pool_t *pool = (pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME);
-    void *data   = check_lightuserdata(L, 2);
-    lua_Integer alignment = luaL_checkinteger(L, 3);
-    pool_mem_t *mem       = NULL;
+    void *data            = NULL;
+    lua_Integer alignment = 0;
 
+    luaL_checkudata(L, 1, POOL_METATABLE_NAME);
+    data      = check_lightuserdata(L, 2);
+    alignment = luaL_checkinteger(L, 3);
     if (alignment <= 0 || ((size_t)alignment & ((size_t)alignment - 1)) != 0) {
         lua_pushnil(L);
         lua_errno_new(L, EINVAL, "reflow.pool.is_aligned");
         return 2;
     }
-    mem = push_used_mem(L, pool, data);
-    if (mem == NULL) {
-        lua_pushnil(L);
-        lua_errno_new(L, EINVAL, "reflow.pool.is_aligned");
-        return 2;
-    }
-    lua_pop(L, 1);
     lua_pushboolean(L, ((uintptr_t)data % (size_t)alignment) == 0);
     return 1;
 }
 
-static int mem_size_lua(lua_State *L)
+static int pool_compact_lua(lua_State *L)
 {
-    pool_mem_t *mem =
-        (pool_mem_t *)luaL_checkudata(L, 1, POOL_MEM_METATABLE_NAME);
+    pool_t *pool     = (pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME);
+    lua_Integer size = luaL_checkinteger(L, 2);
 
-    lua_pushinteger(L, (lua_Integer)pool_mem_size(mem));
+    if (size < 0) {
+        return luaL_argerror(L, 2, "size must be non-negative");
+    }
+    lua_pushinteger(L, (lua_Integer)pool_compact(pool, (size_t)size));
     return 1;
 }
 
-static int mem_data_lua(lua_State *L)
+static int pool_retained_lua(lua_State *L)
 {
-    pool_mem_t *mem =
-        (pool_mem_t *)luaL_checkudata(L, 1, POOL_MEM_METATABLE_NAME);
+    pool_t *pool = (pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME);
 
-    lua_pushlightuserdata(L, pool_mem_data(mem));
+    lua_pushinteger(L, (lua_Integer)pool_retained(pool));
     return 1;
 }
 
@@ -337,16 +282,12 @@ LUALIB_API int luaopen_reflow_pool(lua_State *L)
         {"calloc",        pool_calloc_lua       },
         {"realloc",       pool_realloc_lua      },
         {"free",          pool_free_lua         },
-        {"detach",        pool_detach_lua       },
         {"write",         pool_write_lua        },
         {"read",          pool_read_lua         },
         {"is_aligned",    pool_is_aligned_lua   },
+        {"compact",       pool_compact_lua      },
+        {"retained",      pool_retained_lua     },
         {NULL,            NULL                  },
-    };
-    static const luaL_Reg mem_methods[] = {
-        {"size", mem_size_lua},
-        {"data", mem_data_lua},
-        {NULL,   NULL        },
     };
     static const luaL_Reg module_funcs[] = {
         {"new", new_lua},
@@ -361,14 +302,6 @@ LUALIB_API int luaopen_reflow_pool(lua_State *L)
         lua_pushliteral(L, POOL_METATABLE_NAME);
         lua_setfield(L, -2, "__metatable");
         luaL_newlib(L, pool_methods);
-        lua_setfield(L, -2, "__index");
-    }
-    lua_pop(L, 1);
-
-    if (luaL_newmetatable(L, POOL_MEM_METATABLE_NAME)) {
-        lua_pushliteral(L, POOL_MEM_METATABLE_NAME);
-        lua_setfield(L, -2, "__metatable");
-        luaL_newlib(L, mem_methods);
         lua_setfield(L, -2, "__index");
     }
     lua_pop(L, 1);

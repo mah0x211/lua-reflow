@@ -395,6 +395,7 @@ static lxb_html_token_t *html_close_elements(lxb_html_tokenizer_t *tokenizer,
                                              reflow_html_parse_ctx_t *ctx)
 {
     reflow_html_open_element_t *match = ctx->open_element;
+    reflow_html_open_element_t *outer = NULL;
 
     while (match != NULL && match->tag_id != token->tag_id) {
         match = match->previous;
@@ -403,7 +404,9 @@ static lxb_html_token_t *html_close_elements(lxb_html_tokenizer_t *tokenizer,
         return token;
     }
 
-    while (ctx->open_element != match->previous) {
+    /* The matched element itself is released by the last iteration. */
+    outer = match->previous;
+    while (ctx->open_element != outer) {
         reflow_html_open_element_t *closed = ctx->open_element;
 
         ctx->handler->on_element_end(ctx->handler->ctx);
