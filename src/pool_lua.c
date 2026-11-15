@@ -234,6 +234,12 @@ static int pool_is_aligned_lua(lua_State *L)
     return 1;
 }
 
+static int pool_reset_lua(lua_State *L)
+{
+    pool_reset((pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME));
+    return 0;
+}
+
 static int pool_compact_lua(lua_State *L)
 {
     pool_t *pool     = (pool_t *)luaL_checkudata(L, 1, POOL_METATABLE_NAME);
@@ -285,6 +291,7 @@ LUALIB_API int luaopen_reflow_pool(lua_State *L)
         {"write",         pool_write_lua        },
         {"read",          pool_read_lua         },
         {"is_aligned",    pool_is_aligned_lua   },
+        {"reset",         pool_reset_lua        },
         {"compact",       pool_compact_lua      },
         {"retained",      pool_retained_lua     },
         {NULL,            NULL                  },

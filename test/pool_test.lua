@@ -209,6 +209,34 @@ function testcase.realloc_moves_a_block_that_cannot_hold_the_size()
     assert.equal(p:read(back, 0, 16), 'abcdefghijklmnop')
 end
 
+function testcase.reset_releases_every_block_and_keeps_the_chunks()
+    local p = pool.new(4096)
+    local first = p:alloc(64)
+    for _ = 1, 31 do
+        assert.not_nil(p:alloc(64))
+    end
+    local retained = p:retained()
+    p:reset()
+    -- the capacity counts no block
+    assert.not_nil(p:alloc(4096))
+    p:reset()
+    -- the chunks are reused from the start, and released by compact
+    assert.equal(tostring(p:alloc(64)), tostring(first))
+    assert.less_or_equal(p:retained(), retained)
+    p:reset()
+    assert.equal(p:compact(0), 0)
+end
+
+function testcase.reset_releases_large_blocks()
+    local p = pool.new(0)
+    p:alloc(64)
+    local retained = p:retained()
+    assert.not_nil(p:alloc(64 * 1024))
+    assert.greater(p:retained(), retained)
+    p:reset()
+    assert.equal(p:retained(), retained)
+end
+
 function testcase.empty_chunks_go_back_to_the_arena()
     local p = pool.new(0)
     local blocks = {}
