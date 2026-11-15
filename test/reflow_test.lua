@@ -401,6 +401,72 @@ end
 
 -- engine:templates
 
+function testcase.memory_and_compact_report_the_memory_of_renders()
+    local engine = engine_with({
+        {
+            'page',
+            string.rep('<p>abcdefgh</p>', 4096),
+        },
+    })
+    assert.equal(engine:memory(), {
+        render = 0,
+    })
+    local html = assert(engine:render('page'))
+    local held = engine:memory().render
+    assert.greater(held, 0)
+    -- a target not named is left as is
+    assert.equal(engine:compact({}), {
+        render = held,
+    })
+    assert.equal(engine:compact({
+        render = 0,
+    }), {
+        render = 0,
+    })
+    -- the memory is taken again by the next render
+    assert.equal(engine:render('page'), html)
+    assert.equal(engine:memory().render, held)
+end
+
+function testcase.compact_in_a_render_leaves_its_memory_in_use()
+    local engine
+    engine = new_engine({
+        helpers = {
+            squeeze = function()
+                engine:compact({
+                    render = 0,
+                })
+                return 'squeezed'
+            end,
+        },
+    })
+    assert(engine:compile('page', string.rep('<p>abcdefgh</p>', 1024) ..
+                              '<p x-text="squeeze()"></p>'))
+    assert.equal(engine:render('page'),
+                 string.rep('<p>abcdefgh</p>', 1024) .. '<p>squeezed</p>')
+end
+
+function testcase.compact_rejects_invalid_sizes()
+    local engine = new_engine()
+    for _, sizes in ipairs({
+        5,
+        {
+            compile = 0,
+        },
+        {
+            render = -1,
+        },
+        {
+            render = 1.5,
+        },
+    }) do
+        local memory, err = engine:compact(sizes)
+        assert.is_nil(memory)
+        assert.rawequal(errorlib.typeof(err), reflow_error.EREFLOW)
+        assert.equal(err.op, 'reflow.engine.compact')
+    end
+end
+
 function testcase.templates_lists_names_in_registration_order()
     local engine = engine_with({
         {

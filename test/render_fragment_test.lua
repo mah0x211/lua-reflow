@@ -23,8 +23,8 @@ local function fragment(sources, name, source, data, max_include_depth, helpers)
         templates[k] = assert(compile(k, html, 'x-', helper_names(helpers)))
     end
     local sel = assert(selector.compile(source))
-    return interpret.render(name, templates[name], data, helpers, templates,
-                            max_include_depth, sel)
+    return interpret():render(name, templates[name], data, helpers, templates,
+                              max_include_depth, sel)
 end
 
 local function assert_fragment(expected, ...)
@@ -854,13 +854,13 @@ end
 
 function testcase.selector_argument_must_be_a_compiled_selector()
     local ir = assert(compile('t', '<p></p>', 'x-', {}))
-    local out, err = interpret.render('t', ir, nil, nil, nil, nil, 'p')
+    local out, err = interpret():render('t', ir, nil, nil, nil, nil, 'p')
     assert.is_nil(out)
     assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
     assert.equal(err.message.message,
                  'selector must be a compiled selector or nil')
     -- nil renders the whole template
-    assert.equal(interpret.render('t', ir, nil, nil, nil, nil, nil), '<p></p>')
+    assert.equal(interpret():render('t', ir, nil, nil, nil, nil, nil), '<p></p>')
 end
 
 -- With only :first-child and :nth-child(n) conditions, the children of a
@@ -930,6 +930,7 @@ function testcase.partial_render_reports_out_of_memory()
         local errors = require('reflow.error')
         local compile = require('reflow.compile')
         local interpret = require('reflow.interpret')
+        local renderer = interpret()
         local selector = require('reflow.selector')
         local html = '<ul>' .. string.rep('<li class="a">x</li>', 32) ..
                      '<li class="t" x-each="u in $.us" x-text=".u"></li></ul>'
@@ -942,7 +943,7 @@ function testcase.partial_render_reports_out_of_memory()
             collectgarbage('collect')
             local used = memlimit.used()
             memlimit.maxsize(math.max(used, memlimit.minsize()) + extra)
-            local called, out, err = pcall(interpret.render, 't', ir, data,
+            local called, out, err = pcall(renderer.render, renderer, 't', ir, data,
                                            nil, nil, nil, sel)
             memlimit.maxsize(0)
             if not called then

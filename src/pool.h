@@ -128,6 +128,15 @@ void *pool_realloc(pool_t *pool, void *mem, size_t size);
  */
 int pool_free(pool_t *pool, void *mem);
 
+/**
+ * @brief Release every block of the pool at once.
+ * The chunks go back to the pool's arena, where the next blocks reuse them,
+ * and the large blocks are released.  Every pointer into the pool becomes
+ * invalid.  A NULL or deleted pool is a no-op.
+ * @param pool Target pool.
+ */
+void pool_reset(pool_t *pool);
+
 /*
  * Memory held
  * ===========

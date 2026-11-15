@@ -65,7 +65,7 @@ end
 local function render(html, data, helpers)
     helpers = helpers or HELPERS
     local ir = assert(compile('page', html, 'x-', helper_names(helpers)))
-    return interpret.render('page', ir, data, helpers)
+    return interpret():render('page', ir, data, helpers)
 end
 
 -- Return JavaScript null as rendering sees it.
@@ -1234,10 +1234,10 @@ function testcase.render_formats_numbers_like_javascript()
     local ir = assert(compile('page', '<p x-text="$.v"></p>', 'x-', {}))
     for _, s in ipairs(cases) do
         local v = tonumber(s) * 1.0
-        assert.equal(interpret.render('page', ir, {
+        assert.equal(interpret():render('page', ir, {
             v = v,
         }), '<p>' .. s .. '</p>', s)
-        assert.equal(interpret.render('page', ir, {
+        assert.equal(interpret():render('page', ir, {
             v = -v,
         }),
                      '<p>' ..
@@ -1248,23 +1248,23 @@ function testcase.render_formats_numbers_like_javascript()
         [1 / 0] = 'Infinity',
         [-1 / 0] = '-Infinity',
     }) do
-        assert.equal(interpret.render('page', ir, {
+        assert.equal(interpret():render('page', ir, {
             v = v,
         }), '<p>' .. s .. '</p>')
     end
-    assert.equal(interpret.render('page', ir, {
+    assert.equal(interpret():render('page', ir, {
         v = 0 / 0,
     }), '<p>NaN</p>')
-    assert.equal(interpret.render('page', ir, {
+    assert.equal(interpret():render('page', ir, {
         v = -0.0,
     }), '<p>0</p>')
 
     -- A Lua integer is written exactly.
     if math.type then
-        assert.equal(interpret.render('page', ir, {
+        assert.equal(interpret():render('page', ir, {
             v = math.maxinteger,
         }), '<p>' .. tostring(math.maxinteger) .. '</p>')
-        assert.equal(interpret.render('page', ir, {
+        assert.equal(interpret():render('page', ir, {
             v = -7,
         }), '<p>-7</p>')
     end
@@ -1361,7 +1361,7 @@ function testcase.render_checks_the_helpers_argument()
     local ir = assert(compile('page', '<p x-text="f()"></p>', 'x-', {
         f = true,
     }))
-    local out, err = interpret.render('page', ir, nil, 1)
+    local out, err = interpret():render('page', ir, nil, 1)
     assert.is_nil(out)
     assert.equal(err.message.message, 'helpers must be a table or nil')
 
@@ -1373,7 +1373,7 @@ function testcase.render_checks_the_helpers_argument()
             f = 'not a function',
         },
     }) do
-        out, err = interpret.render('page', ir, nil, helpers or nil)
+        out, err = interpret():render('page', ir, nil, helpers or nil)
         assert.is_nil(out)
         assert.equal(err.message.message, 'helper "f" is not registered')
     end
@@ -1435,6 +1435,7 @@ function testcase.render_reports_out_of_memory_while_evaluating()
         local errors = require('reflow.error')
         local compile = require('reflow.compile')
         local interpret = require('reflow.interpret')
+        local renderer = interpret()
         local ir = assert(compile('oom',
             '<div x-data="a: {b: [1, {c: null}], d: \'v\'}">' ..
             '<p x-text="pick({k: [.a.b, 3], [.a.d]: .a.b}).x ?? .a.d"></p></div>',
@@ -1449,7 +1450,7 @@ function testcase.render_reports_out_of_memory_while_evaluating()
             collectgarbage('collect')
             local used = memlimit.used()
             memlimit.maxsize(math.max(used, memlimit.minsize()) + extra)
-            local called, out, err = pcall(interpret.render, 'oom', ir, nil,
+            local called, out, err = pcall(renderer.render, renderer, 'oom', ir, nil,
                                            helpers)
             memlimit.maxsize(0)
             if not called then

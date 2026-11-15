@@ -537,6 +537,29 @@ int pool_free(pool_t *pool, void *mem)
     return 0;
 }
 
+void pool_reset(pool_t *pool)
+{
+    size_t k = 0;
+
+    if (pool == NULL || pool->deleted) {
+        return;
+    }
+    while (pool->chunks != NULL) {
+        pool_chunk_t *chunk = pool->chunks;
+
+        pool->chunks = chunk->next;
+        arena_chunk_release(pool->arena, chunk);
+    }
+    /* The large blocks are the only allocations of the arena besides the
+     * chunks it lends. */
+    arena_reset(pool->arena);
+    pool->current = NULL;
+    for (k = 0; k < POOL_CLASSES; k++) {
+        pool->free[k] = NULL;
+    }
+    pool->used = 0;
+}
+
 /* -------------------------------------------------------------------------- */
 /* Memory held                                                                */
 /* -------------------------------------------------------------------------- */
