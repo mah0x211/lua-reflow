@@ -338,80 +338,92 @@ static void sel_context_free(pool_t *pool, sel_context_t *sel)
     if (sel == NULL) {
         return;
     }
-    if (sel->parents != NULL && sel->marks != NULL) {
+    if (sel->parents != NULL) {
         for (i = 0; i < sel->marks_count; i++) {
             (void)pool_free(pool, (void *)sel->parents[i].tags);
         }
     }
     (void)pool_free(pool, (void *)sel->root.tags);
-    (void)pool_free(pool, (void *)sel->parents);
-    (void)pool_free(pool, (void *)sel->candidates);
-    (void)pool_free(pool, sel->marks);
+    /* The arrays are in the block of the context. */
     (void)pool_free(pool, sel);
 }
 
-/* Build the selection of ir. A selector whose positional condition is on a
- * part other than the rightmost one is rejected when it matches, as a Lua
- * error noted in the context. */
+#define SEL_ROUND(n) (((n) + 15) & ~(size_t)15)
+
+/* Build the selection of ir. The context and its arrays by document order
+ * are one block: the static match writes its candidates in place. A
+ * selector whose positional condition is on a part other than the rightmost
+ * raises the unsupported error. */
 static int sel_context_new(render_ctx_t *ctx, const ir_t *ir,
                            sel_context_t **out)
 {
     pool_t *pool                      = ctx->pool;
     const ir_dom_index_t *index       = ir->index;
     size_t nelements                  = index->elements.count;
-    selector_candidates_t cands       = {0};
     const selector_pseudo_t *ancestor = NULL;
     sel_context_t *sel                = NULL;
-    size_t i                          = 0;
+    char *block                       = NULL;
+    size_t per_element = 1 + sizeof(*sel->candidates) + sizeof(*sel->parents);
+    size_t head        = SEL_ROUND(sizeof(*sel));
+    size_t count       = 0;
+    size_t i           = 0;
 
-    if (selector_exec_resolve(pool, index, ctx->selector, &cands, &ancestor) !=
-        0) {
-        if (errno == EINVAL) {
-            ctx->ancestor = ancestor;
-            lua_pushliteral(ctx->L, "unsupported selector");
-            return lua_error(ctx->L);
-        }
+    if (nelements > (SIZE_MAX - head - 32) / per_element) {
+        errno = ENOMEM;
         return -1;
     }
-    sel = (sel_context_t *)pool_calloc(pool, 1, sizeof(*sel));
-    if (sel == NULL) {
-        goto failed;
-    } else if (cands.count == 0 && index->includes.count == 0) {
-        *out = sel;
-        return 0;
+    block = (char *)pool_calloc(
+        pool, 1, head + SEL_ROUND(nelements) + 16 + nelements * per_element);
+    if (block == NULL) {
+        return -1;
     }
+    sel              = (sel_context_t *)(void *)block;
     sel->marks_count = nelements;
-    sel->marks       = (unsigned char *)pool_calloc(pool, nelements, 1);
-    if (sel->marks == NULL) {
-        goto failed;
-    } else if (cands.count == 0) {
-        /* Search the templates included from here. */
-        sel->search = 1;
-        for (i = 0; i < index->includes.count; i++) {
-            const ir_element_t *element = index->includes.items[i];
+    sel->marks       = (unsigned char *)(block + head);
+    sel->candidates =
+        (const selector_complex_t **)(void *)(block + head +
+                                              SEL_ROUND(nelements));
+    sel->parents =
+        (sel_parent_t *)(void *)(block + head + SEL_ROUND(nelements) +
+                                 SEL_ROUND(nelements *
+                                           sizeof(*sel->candidates)));
+    if (selector_exec_match(index, ctx->selector, sel->candidates, &count,
+                            &ancestor) != 0) {
+        (void)pool_free(pool, sel);
+        ctx->ancestor = ancestor;
+        lua_pushliteral(ctx->L, "unsupported selector");
+        return lua_error(ctx->L);
+    } else if (count == 0) {
+        sel->candidates = NULL;
+        sel->parents    = NULL;
+        if (index->includes.count == 0) {
+            /* Nothing to search: the template is not executed. */
+            sel->marks = NULL;
+        } else {
+            /* Search the templates included from here. */
+            sel->search = 1;
+            for (i = 0; i < index->includes.count; i++) {
+                const ir_element_t *element = index->includes.items[i];
 
-            sel->marks[element->structure.order] |= SEL_INCLUDE;
-            sel_mark_relevant(sel, element);
+                sel->marks[element->structure.order] |= SEL_INCLUDE;
+                sel_mark_relevant(sel, element);
+            }
         }
         *out = sel;
         return 0;
     }
-    sel->candidates = (const selector_complex_t **)pool_calloc(
-        pool, nelements, sizeof(*sel->candidates));
-    sel->parents =
-        (sel_parent_t *)pool_calloc(pool, nelements, sizeof(*sel->parents));
-    if (sel->candidates == NULL || sel->parents == NULL) {
-        goto failed;
-    }
-    for (i = 0; i < cands.count; i++) {
-        const ir_element_t *element = cands.items[i].element;
-        const ir_element_t *parent  = element->structure.parent;
+    for (i = 0; i < nelements; i++) {
+        const selector_complex_t *complex = sel->candidates[i];
+        const ir_element_t *element       = index->elements.items[i];
+        const ir_element_t *parent        = NULL;
+        const selector_compound_t *last   = NULL;
+        sel_parent_t *record              = NULL;
 
-        const selector_compound_t *last =
-            selector_exec_rightmost(cands.items[i].complex);
-        sel_parent_t *record = NULL;
-
-        sel->candidates[element->structure.order] = cands.items[i].complex;
+        if (complex == NULL) {
+            continue;
+        }
+        parent = element->structure.parent;
+        last   = selector_exec_rightmost(complex);
         sel_mark_relevant(sel, parent);
         if (last->npseudos == 0) {
             continue;
@@ -422,19 +434,14 @@ static int sel_context_new(render_ctx_t *ctx, const ir_t *ir,
             record = &sel->parents[parent->structure.order];
         }
         if (sel_add_tag(pool, record, &element->tag_name) != 0) {
-            goto failed;
+            sel_context_free(pool, sel);
+            errno = ENOMEM;
+            return -1;
         }
         sel_add_bound(record, last);
     }
-    (void)pool_free(pool, cands.items);
     *out = sel;
     return 0;
-
-failed:
-    (void)pool_free(pool, cands.items);
-    sel_context_free(pool, sel);
-    errno = ENOMEM;
-    return -1;
 }
 
 /* Start counting the children of a parent of positional candidates. */

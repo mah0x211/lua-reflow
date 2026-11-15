@@ -276,6 +276,37 @@ ancestor_pseudo(const selector_complex_t *complex)
     return NULL;
 }
 
+int selector_exec_match(const ir_dom_index_t *index, const selector_t *selector,
+                        const selector_complex_t **matched, size_t *count,
+                        const selector_pseudo_t **ancestor)
+{
+    size_t n = 0;
+    size_t i = 0;
+    size_t j = 0;
+
+    for (i = 0; i < selector->ncomplexes; i++) {
+        const selector_complex_t *complex = &selector->complexes[i];
+        const ir_element_list_t *seeds    = seed(index, complex);
+
+        for (j = 0; seeds != NULL && j < seeds->count; j++) {
+            const ir_element_t *element = seeds->items[j];
+            size_t order                = element->structure.order;
+
+            if (!match_complex(element, complex)) {
+                continue;
+            } else if ((*ancestor = ancestor_pseudo(complex)) != NULL) {
+                errno = EINVAL;
+                return -1;
+            } else if (matched[order] == NULL) {
+                matched[order] = complex;
+                n++;
+            }
+        }
+    }
+    *count = n;
+    return 0;
+}
+
 int selector_exec_resolve(pool_t *pool, const ir_dom_index_t *index,
                           const selector_t *selector,
                           selector_candidates_t *out,
@@ -297,26 +328,11 @@ int selector_exec_resolve(pool_t *pool, const ir_dom_index_t *index,
                                                        sizeof(*matched));
     if (matched == NULL) {
         return -1;
-    }
-    for (i = 0; i < selector->ncomplexes; i++) {
-        const selector_complex_t *complex = &selector->complexes[i];
-        const ir_element_list_t *seeds    = seed(index, complex);
-
-        for (j = 0; seeds != NULL && j < seeds->count; j++) {
-            const ir_element_t *element = seeds->items[j];
-            size_t order                = element->structure.order;
-
-            if (!match_complex(element, complex)) {
-                continue;
-            } else if ((*ancestor = ancestor_pseudo(complex)) != NULL) {
-                pool_free(pool, (void *)matched);
-                errno = EINVAL;
-                return -1;
-            } else if (matched[order] == NULL) {
-                matched[order] = complex;
-                count++;
-            }
-        }
+    } else if (selector_exec_match(index, selector, matched, &count,
+                                   ancestor) != 0) {
+        pool_free(pool, (void *)matched);
+        errno = EINVAL;
+        return -1;
     }
     if (count > 0) {
         items =

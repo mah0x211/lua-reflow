@@ -74,4 +74,18 @@ int selector_exec_resolve(pool_t *pool, const ir_dom_index_t *index,
                           selector_candidates_t *out,
                           const selector_pseudo_t **ancestor);
 
+/**
+ * Match the static conditions of a selector as selector_exec_resolve does,
+ * writing into matched, which has an entry per element of the index, set to
+ * NULL, the complex selector each element matched.  Nothing is allocated.
+ *
+ * @param count    Set to the number of elements matched.
+ * @param ancestor Set as selector_exec_resolve sets it.
+ * @return 0 on success, or -1 with errno set to EINVAL as
+ *         selector_exec_resolve fails with it.
+ */
+int selector_exec_match(const ir_dom_index_t *index, const selector_t *selector,
+                        const selector_complex_t **matched, size_t *count,
+                        const selector_pseudo_t **ancestor);
+
 #endif /* REFLOW_SELECTOR_EXEC_H */
