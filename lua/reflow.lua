@@ -142,6 +142,42 @@ function Engine:render(name, data, sel)
                                     sel)
 end
 
+--- drop the memory the engine keeps for reuse, for each target named in
+--- sizes, while it exceeds the size given; render is the memory of the
+--- renders.  A target not named is left as is.  The memory returns when the
+--- collector runs.
+--- @param sizes table<string, integer>
+--- @return table<string, integer>? memory the memory held afterwards
+--- @return any err
+function Engine:compact(sizes)
+    if type(sizes) ~= 'table' then
+        return nil, errors.new('reflow.engine.compact', 'sizes must be a table')
+    end
+    for target, size in pairs(sizes) do
+        if target ~= 'render' then
+            return nil, errors.new('reflow.engine.compact', format(
+                                       'unknown memory target "%s"',
+                                       tostring(target)))
+        elseif not is_non_negative_integer(size) then
+            return nil, errors.new('reflow.engine.compact', format(
+                                       'size of "%s" must be a non-negative integer',
+                                       target))
+        end
+    end
+    if sizes.render then
+        self._interpreter:compact(sizes.render)
+    end
+    return self:memory()
+end
+
+--- the memory the engine keeps for reuse, by target.
+--- @return table<string, integer>
+function Engine:memory()
+    return {
+        render = self._interpreter:retained(),
+    }
+end
+
 --- remove the template name, or every template when name is nil.
 --- @param name string?
 --- @return string[] removed names

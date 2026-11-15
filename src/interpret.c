@@ -2116,6 +2116,51 @@ static int render_lua(lua_State *L)
     return 1;
 }
 
+/* instance:retained(): the memory the pools of the instance hold. */
+static int retained_lua(lua_State *L)
+{
+    interpret_t *instance =
+        (interpret_t *)luaL_checkudata(L, 1, INTERPRET_METATABLE);
+    size_t total = 0;
+    size_t i     = 0;
+
+    for (i = 0; i < instance->npools; i++) {
+        total += pool_retained(instance->pools[i]);
+    }
+    lua_pushinteger(L, (lua_Integer)total);
+    return 1;
+}
+
+/* instance:compact(size): drop the chunks the idle pools do not use while
+ * the memory the pools hold exceeds size.  A pool in use by a render is left
+ * as is.  Returns the memory held afterwards. */
+static int compact_lua(lua_State *L)
+{
+    interpret_t *instance =
+        (interpret_t *)luaL_checkudata(L, 1, INTERPRET_METATABLE);
+    lua_Integer limit = luaL_checkinteger(L, 2);
+    size_t size       = 0;
+    size_t total      = 0;
+    size_t i          = 0;
+
+    if (limit < 0) {
+        return luaL_argerror(L, 2, "size must be non-negative");
+    }
+    size = (size_t)limit;
+    for (i = 0; i < instance->npools; i++) {
+        total += pool_retained(instance->pools[i]);
+    }
+    for (i = 0; i < instance->nidle && total > size; i++) {
+        pool_t *pool = instance->idle[i];
+        size_t own   = pool_retained(pool);
+        size_t other = total - own;
+
+        total = other + pool_compact(pool, size > other ? size - other : 0);
+    }
+    lua_pushinteger(L, (lua_Integer)total);
+    return 1;
+}
+
 static int instance_gc_lua(lua_State *L)
 {
     interpret_t *instance = (interpret_t *)lua_touserdata(L, 1);
@@ -2153,8 +2198,10 @@ static int new_lua(lua_State *L)
 LUALIB_API int luaopen_reflow_interpret(lua_State *L)
 {
     struct luaL_Reg methods[] = {
-        {"render", render_lua},
-        {NULL,     NULL      },
+        {"render",   render_lua  },
+        {"compact",  compact_lua },
+        {"retained", retained_lua},
+        {NULL,       NULL        },
     };
     reflow_error_require(L, "reflow.error");
     lua_pop(L, 1);
