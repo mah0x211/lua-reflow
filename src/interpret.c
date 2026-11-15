@@ -46,6 +46,12 @@
 #define INTERPRET_INITIAL_FRAMES 16
 #define INTERPRET_OOM_MESSAGE    "out of memory while rendering"
 #define INTERPRET_INCLUDE_DEPTH  50
+#define INTERPRET_METATABLE      "reflow.interpret"
+/* The pools an instance keeps for renders, nested ones included; a render
+ * nested deeper uses a pool of its own. */
+#define INTERPRET_POOL_CACHE     8
+/* The slot of the owner table that holds render_body on Lua 5.1. */
+#define INTERPRET_BODY_SLOT      (INTERPRET_POOL_CACHE + 1)
 
 /* Stack positions inside the protected body. */
 #define INTERPRET_CTX_IDX       1
@@ -196,6 +202,16 @@ typedef struct {
 } render_ctx_t;
 
 static const ir_t *to_ir(lua_State *L, int idx);
+
+/* An instance of the renderer.  It keeps the pools of its renders in its
+ * owner table, slots 1 to npools, so that a render takes an idle pool
+ * instead of creating one, and empties it when it ends. */
+typedef struct {
+    pool_t *pools[INTERPRET_POOL_CACHE];
+    pool_t *idle[INTERPRET_POOL_CACHE];
+    size_t npools;
+    size_t nidle;
+} interpret_t;
 
 /* HTML void elements never have an end tag. The list is the one used by the
  * JavaScript version and by Lexbor when the template is compiled. */
@@ -1925,12 +1941,77 @@ static int return_selector_error(lua_State *L, const render_ctx_t *ctx,
     return 2;
 }
 
+/* Take an idle pool of the instance at instance_idx, or create one, kept in
+ * the owner table while the cache has room.  A pool beyond the cache is left
+ * on the stack, and *temporary is set. */
+static pool_t *take_pool(lua_State *L, interpret_t *instance, int instance_idx,
+                         int *temporary)
+{
+    pool_t *pool = NULL;
+
+    *temporary = 0;
+    if (instance->nidle > 0) {
+        return instance->idle[--instance->nidle];
+    }
+    pool = pool_new(L, 0);
+    if (pool == NULL) {
+        return NULL;
+    } else if (instance->npools == INTERPRET_POOL_CACHE) {
+        *temporary = 1;
+        return pool;
+    }
+    /* The array part of the owner table was sized when the instance was
+     * created, so storing the pool does not allocate. */
+    reflow_getuservalue(L, instance_idx);
+    lua_insert(L, -2);
+    lua_rawseti(L, -2, (int)instance->npools + 1);
+    lua_pop(L, 1);
+    instance->pools[instance->npools++] = pool;
+    return pool;
+}
+
+/* Empty the pool of a render and give it back to the instance. */
+static void give_back_pool(lua_State *L, interpret_t *instance, pool_t *pool,
+                           int temporary)
+{
+    if (temporary) {
+        pool_delete(L, pool);
+        return;
+    }
+    pool_reset(pool);
+    instance->idle[instance->nidle++] = pool;
+}
+
+/* Push render_body without allocating on Lua 5.1 and LuaJIT, where
+ * lua_pushcfunction creates a closure every time. */
+static void push_render_body(lua_State *L, int instance_idx)
+{
+#if LUA_VERSION_NUM < 502
+    reflow_getuservalue(L, instance_idx);
+    lua_rawgeti(L, -1, INTERPRET_BODY_SLOT);
+    lua_remove(L, -2);
+#else
+    (void)instance_idx;
+    lua_pushcfunction(L, render_body);
+#endif
+}
+
+/* instance:render(name, ir, data, helpers, templates, max_include_depth,
+ * selector).  The arguments are moved down by one, and the instance to
+ * slot 8. */
 static int render_lua(lua_State *L)
 {
+    interpret_t *instance =
+        (interpret_t *)luaL_checkudata(L, 1, INTERPRET_METATABLE);
     error_site_t site = {0};
     render_ctx_t ctx  = {0};
     int status        = LUA_OK;
     int base          = 0;
+    int temporary     = 0;
+
+    lua_settop(L, 8);
+    lua_pushvalue(L, 1);
+    lua_remove(L, 1);
 
     if (lua_type(L, 1) != LUA_TSTRING || value_lua_raw_length(L, 1) == 0) {
         return return_runtime_error(L, "name must be a non-empty string", NULL,
@@ -1939,7 +2020,7 @@ static int render_lua(lua_State *L)
     /* The history of template names starts with the entry. It is created
      * outside the protected call, so that it still names the template that
      * failed after the call. */
-    lua_settop(L, 7);
+    lua_settop(L, 8);
     lua_createtable(L, 1, 1);
     lua_pushvalue(L, 1);
     lua_rawseti(L, -2, 1);
@@ -1975,14 +2056,15 @@ static int render_lua(lua_State *L)
     }
     base = lua_gettop(L);
 
-    lua_pushcfunction(L, render_body);
-    ctx.pool = pool_new(L, 0);
+    push_render_body(L, 8);
+    ctx.pool = take_pool(L, instance, 8, &temporary);
     if (ctx.pool == NULL) {
         lua_settop(L, base);
         return return_runtime_error(L, INTERPRET_OOM_MESSAGE, &site, 0);
+    } else if (temporary) {
+        /* Keep the pool below the protected call so it stays reachable. */
+        lua_insert(L, -2);
     }
-    /* Keep the pool below the protected call so it stays reachable. */
-    lua_insert(L, -2);
     ctx.L        = L;
     ctx.out.pool = ctx.pool;
     lua_pushlightuserdata(L, &ctx);
@@ -1991,8 +2073,10 @@ static int render_lua(lua_State *L)
     lua_pushvalue(L, 5);
     lua_pushvalue(L, site.history_idx);
     status = lua_pcall(L, 5, 1, 0);
-    pool_delete(L, ctx.pool);
-    lua_remove(L, base + 1);
+    give_back_pool(L, instance, ctx.pool, temporary);
+    if (temporary) {
+        lua_remove(L, base + 1);
+    }
 
     if (status == LUA_ERRRUN && ctx.ancestor != NULL) {
         return return_selector_error(L, &ctx, 1);
@@ -2032,15 +2116,57 @@ static int render_lua(lua_State *L)
     return 1;
 }
 
+static int instance_gc_lua(lua_State *L)
+{
+    interpret_t *instance = (interpret_t *)lua_touserdata(L, 1);
+    size_t i              = 0;
+
+    for (i = 0; instance != NULL && i < instance->npools; i++) {
+        pool_delete(L, instance->pools[i]);
+    }
+    if (instance != NULL) {
+        instance->npools = instance->nidle = 0;
+    }
+    return 0;
+}
+
+/* require('reflow.interpret')(): an instance whose renders reuse their
+ * pools. */
+static int new_lua(lua_State *L)
+{
+    interpret_t *instance = NULL;
+
+    lua_settop(L, 0);
+    instance  = (interpret_t *)lua_newuserdata(L, sizeof(*instance));
+    *instance = (interpret_t){0};
+    lua_createtable(L, INTERPRET_BODY_SLOT, 0);
+#if LUA_VERSION_NUM < 502
+    lua_pushcfunction(L, render_body);
+    lua_rawseti(L, -2, INTERPRET_BODY_SLOT);
+#endif
+    reflow_setuservalue(L, 1);
+    luaL_getmetatable(L, INTERPRET_METATABLE);
+    lua_setmetatable(L, 1);
+    return 1;
+}
+
 LUALIB_API int luaopen_reflow_interpret(lua_State *L)
 {
-    struct luaL_Reg funcs[] = {
+    struct luaL_Reg methods[] = {
         {"render", render_lua},
         {NULL,     NULL      },
     };
-
     reflow_error_require(L, "reflow.error");
     lua_pop(L, 1);
-    luaL_newlib(L, funcs);
+    if (luaL_newmetatable(L, INTERPRET_METATABLE)) {
+        lua_pushcfunction(L, instance_gc_lua);
+        lua_setfield(L, -2, "__gc");
+        lua_pushliteral(L, INTERPRET_METATABLE);
+        lua_setfield(L, -2, "__metatable");
+        luaL_newlib(L, methods);
+        lua_setfield(L, -2, "__index");
+    }
+    lua_pop(L, 1);
+    lua_pushcfunction(L, new_lua);
     return 1;
 }

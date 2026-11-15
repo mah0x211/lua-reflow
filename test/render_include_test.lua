@@ -34,8 +34,8 @@ local function render(sources, data, max_include_depth, helpers)
         templates[name] = assert(
                               compile(name, html, 'x-', helper_names(helpers)))
     end
-    return interpret.render('main', templates.main, data, helpers, templates,
-                            max_include_depth)
+    return interpret():render('main', templates.main, data, helpers, templates,
+                              max_include_depth)
 end
 
 -- JavaScript null as rendering sees it.
@@ -473,8 +473,8 @@ function testcase.render_checks_the_include_arguments()
             'max_include_depth must be a non-negative integer or nil',
         },
     }) do
-        local out, err =
-            interpret.render('main', ir, nil, nil, case[1], case[2])
+        local out, err = interpret():render('main', ir, nil, nil, case[1],
+                                            case[2])
         assert.is_nil(out)
         assert.equal(err.message.message, case[3])
         assert.equal(err.meta.template_name, 'main')
@@ -482,12 +482,12 @@ function testcase.render_checks_the_include_arguments()
 
     -- Without a registry, every include is not found.
     ir = assert(compile('main', '<p x-include="\'a\'"></p>', 'x-', {}))
-    local out, err = interpret.render('main', ir)
+    local out, err = interpret():render('main', ir)
     assert.is_nil(out)
     assert.equal(err.meta.reason, 'not_found')
 
     -- A registry entry that is not a compiled template is not found either.
-    out, err = interpret.render('main', ir, nil, nil, {
+    out, err = interpret():render('main', ir, nil, nil, {
         a = '<p></p>',
     })
     assert.is_nil(out)
@@ -523,6 +523,7 @@ function testcase.render_reports_out_of_memory_in_includes()
         local errors = require('reflow.error')
         local compile = require('reflow.compile')
         local interpret = require('reflow.interpret')
+        local renderer = interpret()
         local templates = {
             main = assert(compile('main',
                 '<ul><li x-each="v in $.a" x-with="v = {x: .v}" ' ..
@@ -545,7 +546,7 @@ function testcase.render_reports_out_of_memory_in_includes()
             collectgarbage('collect')
             local used = memlimit.used()
             memlimit.maxsize(math.max(used, memlimit.minsize()) + extra)
-            local called, out, err = pcall(interpret.render, 'main',
+            local called, out, err = pcall(renderer.render, renderer, 'main',
                                            templates.main, data, nil,
                                            templates)
             memlimit.maxsize(0)

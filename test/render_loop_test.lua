@@ -58,7 +58,7 @@ end
 local function render(html, data, helpers)
     helpers = helpers or HELPERS
     local ir = assert(compile('page', html, 'x-', helper_names(helpers)))
-    return interpret.render('page', ir, data, helpers)
+    return interpret():render('page', ir, data, helpers)
 end
 
 -- JavaScript null as rendering sees it.
@@ -673,6 +673,7 @@ function testcase.render_reports_out_of_memory_in_loops()
         local errors = require('reflow.error')
         local compile = require('reflow.compile')
         local interpret = require('reflow.interpret')
+        local renderer = interpret()
         local ir = assert(compile('oom',
             '<ul><li x-each="v, k in $.m" x-with="w = {x: .v}">' ..
             '<b x-for="n = 1, 3" x-text="@w.x"></b>' ..
@@ -689,7 +690,7 @@ function testcase.render_reports_out_of_memory_in_loops()
             collectgarbage('collect')
             local used = memlimit.used()
             memlimit.maxsize(math.max(used, memlimit.minsize()) + extra)
-            local called, out, err = pcall(interpret.render, 'oom', ir, data)
+            local called, out, err = pcall(renderer.render, renderer, 'oom', ir, data)
             memlimit.maxsize(0)
             if not called then
                 assert(tostring(out):find('not enough memory', 1, true),

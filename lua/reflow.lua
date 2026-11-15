@@ -55,6 +55,8 @@ end
 --- @field _templates table<string, userdata> registered compiled templates
 --- @field _order string[] registered names in registration order
 --- @field _selector_cache reflow.selector_cache
+--- @field _interpreter userdata the renderer instance, which reuses the memory
+---   of its renders
 local Engine = {}
 Engine.__index = Engine
 Engine.__metatable = 'reflow.engine'
@@ -135,8 +137,9 @@ function Engine:render(name, data, sel)
             return nil, err
         end
     end
-    return interpret.render(name, ir, data, self._helpers, self._templates,
-                            self._max_include_depth, sel)
+    return self._interpreter:render(name, ir, data, self._helpers,
+                                    self._templates, self._max_include_depth,
+                                    sel)
 end
 
 --- remove the template name, or every template when name is nil.
@@ -238,6 +241,7 @@ local function new(config)
         _templates = {},
         _order = {},
         _selector_cache = cache,
+        _interpreter = interpret(),
     }, Engine)
 end
 

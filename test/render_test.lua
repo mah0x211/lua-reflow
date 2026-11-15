@@ -10,7 +10,7 @@ local newstate = require('newstate')
 local function render(html, data)
     local ir, err = compile('page', html, 'x-', {})
     assert.not_nil(ir, err)
-    local out, rerr = interpret.render('page', ir, data)
+    local out, rerr = interpret():render('page', ir, data)
     assert.not_nil(out, rerr)
     return out
 end
@@ -31,15 +31,11 @@ local function assert_runtime_error(err, message, template_name)
     end
 end
 
-function testcase.module_exposes_only_render()
-    local names = {}
-    for name, value in pairs(interpret) do
-        names[#names + 1] = name
-        assert.equal(type(value), 'function')
-    end
-    assert.equal(names, {
-        'render',
-    })
+function testcase.module_creates_a_renderer()
+    assert.equal(type(interpret), 'function')
+    local renderer = interpret()
+    assert.equal(getmetatable(renderer), 'reflow.interpret')
+    assert.equal(type(renderer.render), 'function')
 end
 
 function testcase.render_matches_the_javascript_version_without_directives()
@@ -114,16 +110,85 @@ function testcase.render_walks_deep_trees_without_c_recursion()
     assert.equal(render(html), html)
 end
 
+function testcase.renders_nested_in_helpers_share_the_instance()
+    -- Each nested render takes a pool of its own, beyond the pools the
+    -- instance keeps too.
+    local renderer = interpret()
+    local ir = assert(compile('t', '<p x-html="nest($.n)"></p>', 'x-', {
+        nest = true,
+    }))
+    local helpers = {}
+    function helpers.nest(n)
+        if n == 0 then
+            return 'end'
+        end
+        return assert(renderer:render('t', ir, {
+            n = n - 1,
+        }, helpers))
+    end
+    local out = assert(renderer:render('t', ir, {
+        n = 12,
+    }, helpers))
+    assert.equal(out, string.rep('<p>', 13) .. 'end' .. string.rep('</p>', 13))
+    assert.equal(renderer:render('t', ir, {
+        n = 0,
+    }, helpers), '<p>end</p>')
+end
+
+function testcase.failed_render_leaves_the_instance_usable()
+    local renderer = interpret()
+    local ir = assert(compile('t', '<p x-text="boom()"></p>', 'x-', {
+        boom = true,
+    }))
+    for _ = 1, 3 do
+        local out, err = renderer:render('t', ir, nil, {
+            boom = function()
+                error('boom')
+            end,
+        })
+        assert.is_nil(out)
+        assert.rawequal(errorlib.typeof(err), reflow_error.ERUNTIME)
+        assert.equal(renderer:render('t', ir, nil, {
+            boom = function()
+                return 'ok'
+            end,
+        }), '<p>ok</p>')
+    end
+end
+
+function testcase.instance_and_its_pools_are_collected_when_unreachable()
+    local ok, held, released = newstate.new():dostring([[
+        local memlimit = require('memlimit')
+        local compile = require('reflow.compile')
+        local interpret = require('reflow.interpret')
+        local ir = assert(compile('t', string.rep('<p>abcdefgh</p>', 16384),
+                                  'x-', {}))
+        local refs = setmetatable({}, { __mode = 'v' })
+        collectgarbage('collect')
+        local before = memlimit.used()
+        do
+            local renderer = interpret()
+            assert(renderer:render('t', ir))
+            refs[1] = renderer
+        end
+        collectgarbage('collect')
+        collectgarbage('collect')
+        return before, refs[1] == nil and memlimit.used() - before < 64 * 1024
+    ]])
+    assert.is_true(ok, held)
+    assert.is_true(released)
+end
+
 function testcase.render_accepts_a_table_or_nil_as_data_and_repeats()
     local ir = assert(compile('page', '<p a="1">t</p>', 'x-', {}))
     local values = {
-        interpret.render('page', ir),
+        interpret():render('page', ir),
     }
     assert.equal(values, {
         '<p a="1">t</p>',
     })
-    assert.equal(interpret.render('page', ir, nil), '<p a="1">t</p>')
-    assert.equal(interpret.render('page', ir, {
+    assert.equal(interpret():render('page', ir, nil), '<p a="1">t</p>')
+    assert.equal(interpret():render('page', ir, {
         a = 1,
     }), '<p a="1">t</p>')
 end
@@ -181,7 +246,7 @@ function testcase.render_returns_runtime_errors_for_invalid_arguments()
     }
     for _, case in ipairs(cases) do
         local values = {
-            interpret.render(case.args[1], case.args[2], case.args[3]),
+            interpret():render(case.args[1], case.args[2], case.args[3]),
         }
         assert.equal(#values, 2)
         assert.is_nil(values[1])
@@ -196,6 +261,7 @@ function testcase.render_reports_out_of_memory_and_recovers()
         local errors = require('reflow.error')
         local compile = require('reflow.compile')
         local interpret = require('reflow.interpret')
+        local renderer = interpret()
         local ir = assert(compile('oom', string.rep('<p>abcdefgh</p>', 16384),
                                   'x-', {}))
         local kinds = {}
@@ -205,7 +271,7 @@ function testcase.render_reports_out_of_memory_and_recovers()
             collectgarbage('collect')
             local used = memlimit.used()
             memlimit.maxsize(math.max(used, memlimit.minsize()) + extra)
-            local called, out, err = pcall(interpret.render, 'oom', ir)
+            local called, out, err = pcall(renderer.render, renderer, 'oom', ir)
             memlimit.maxsize(0)
             if not called then
                 assert(tostring(out):find('not enough memory', 1, true),
@@ -221,7 +287,7 @@ function testcase.render_reports_out_of_memory_and_recovers()
             end
         end
         collectgarbage('collect')
-        return kinds, interpret.render('oom', ir) ==
+        return kinds, interpret():render('oom', ir) ==
                    string.rep('<p>abcdefgh</p>', 16384)
     ]])
     assert.is_true(ok, kinds)
